@@ -49,11 +49,16 @@ function render() {
     info.append(el("div", "source-title", source.label || "Media source"), el("div", "kind", source.kind || "Media"));
     head.append(info);
     card.append(head);
+    if (source.kind === "DASH manifest") {
+      card.append(el("div", "quality-empty", "DASH detected · downloading is not available yet."));
+      sourceList.append(card);
+      continue;
+    }
     const actions = el("div", "source-actions");
     const download = el("button", "primary", "Download");
     download.addEventListener("click", () => quickDownload(source, card, download));
     actions.append(download);
-    if (source.kind === "HLS playlist" || source.kind === "DASH manifest") {
+    if (source.kind === "HLS playlist") {
       const more = el("button", "secondary", "Other qualities");
       more.addEventListener("click", () => {
         const current = card.querySelector(".quality-list");
