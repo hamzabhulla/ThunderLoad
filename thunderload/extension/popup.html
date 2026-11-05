@@ -9,17 +9,17 @@
 <body>
   <main class="shell">
     <header class="topbar">
-      <div class="brand"><span class="brand-mark">T</span><div><strong>ThunderLoad</strong><small>Download manager</small></div></div>
+      <div class="brand"><span class="brand-mark">↯</span><div><strong>ThunderLoad</strong><small>Download manager</small></div></div>
       <span class="status" id="engineStatus">Checking engine</span>
     </header>
     <section class="hero">
-      <div><p class="eyebrow">SMART MEDIA SCAN</p><h1>Downloads, without the noise.</h1><p class="muted">Scan this page on demand. No banners or injected video buttons.</p></div>
+      <div><p class="eyebrow">CURRENT TAB</p><h1>Downloads</h1><p class="muted">One-click downloads. Quality choices only when available.</p></div>
       <button class="secondary" id="rescanBtn">Rescan</button>
     </section>
     <section class="section-head"><div><h2>Detected media</h2><span class="muted" id="scanMeta">Scanning active tab…</span></div><span class="count" id="sourceCount">0</span></section>
     <div id="sourceList" class="source-list"><div class="empty">Looking for media sources…</div></div>
-    <div class="footer-note">Only media URLs exposed by the page are listed. DRM-protected streams are not bypassed.</div>
-    <div id="toast" class="toast" role="status"></div>
+    <div class="footer-note">The small in-player Download control appears only on hover after you open this extension. Protected or hidden streams are not bypassed.</div>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
   </main>
   <script src="popup.js"></script>
 </body>

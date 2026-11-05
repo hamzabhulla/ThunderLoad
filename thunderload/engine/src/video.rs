@@ -28,42 +28,156 @@ fn client() -> Result<Client> {
 }
 
 pub async fn inspect_video(url: &str, referer: Option<&str>) -> Result<Vec<VideoVariant>> {
-    let parsed = Url::parse(url).context("Invalid video URL")?;
+    let parsed = Url::parse(url).context("Invalid media URL")?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(anyhow!("Only HTTP and HTTPS media URLs can be inspected"));
     }
     let lower = parsed.path().to_ascii_lowercase();
+
     if lower.ends_with(".m3u8") {
-        let client = client()?;
-        let mut request = client.get(url);
-        if let Some(referrer) = referer { request = request.header(reqwest::header::REFERER, referrer); }
-        let body = request.send().await?.error_for_status()?.text().await?;
-        let variants = parse_hls_master(&body, &parsed)?;
-        if !variants.is_empty() { return Ok(variants); }
+        let body = fetch_text(url, referer).await?;
+        let mut variants = parse_hls_master(&body, &parsed)?;
+        if !variants.is_empty() {
+            annotate_hls_variants(&mut variants, referer).await;
+            return Ok(variants);
+        }
+        let reason = unsupported_hls_reason(&body);
         return Ok(vec![VideoVariant {
-            kind: "hls".into(), quality: "Playlist / adaptive".into(), width: None, height: None,
-            bandwidth: None, url: url.to_string(), downloadable: true,
-            note: Some("ThunderLoad can download unencrypted HLS playlists".into()),
+            kind: "hls".into(), quality: "Adaptive playlist".into(), width: None, height: None,
+            bandwidth: None, url: url.to_string(), downloadable: reason.is_none(),
+            note: reason.or_else(|| Some("Unencrypted HLS playlist".into())),
         }]);
     }
     if lower.ends_with(".mpd") {
-        let client = client()?;
-        let mut request = client.get(url);
-        if let Some(referrer) = referer { request = request.header(reqwest::header::REFERER, referrer); }
-        let body = request.send().await?.error_for_status()?.text().await?;
+        let body = fetch_text(url, referer).await?;
         let reps = parse_dash_representations(&body, url);
         if reps.is_empty() {
-            return Ok(vec![VideoVariant { kind: "dash".into(), quality: "Adaptive DASH".into(), width: None,
+            return Ok(vec![VideoVariant {
+                kind: "dash".into(), quality: "Adaptive DASH".into(), width: None,
                 height: None, bandwidth: None, url: url.into(), downloadable: false,
-                note: Some("DASH manifest found; segmented DASH download is not enabled in this starter".into()) }]);
+                note: Some("DASH manifest detected; DASH segment assembly is not available".into())
+            }]);
         }
         return Ok(reps);
     }
-    Ok(vec![VideoVariant {
+
+    // Never label an arbitrary webpage (for example a YouTube watch page) as a file.
+    // Known media extensions are accepted; extensionless URLs must identify as media
+    // or an attachment from the server's response headers.
+    if is_direct_media_path(&lower) {
+        return Ok(vec![direct_variant(url)]);
+    }
+
+    let client = client()?;
+    let mut request = client.head(url);
+    if let Some(referrer) = referer { request = request.header(reqwest::header::REFERER, referrer); }
+    let response = request.send().await.context("Could not inspect the URL response headers")?;
+    let content_type = response.headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+
+    if content_type.contains("mpegurl") || content_type.contains("vnd.apple.mpegurl") {
+        let body = fetch_text(url, referer).await?;
+        let mut variants = parse_hls_master(&body, &parsed)?;
+        if !variants.is_empty() {
+            annotate_hls_variants(&mut variants, referer).await;
+            return Ok(variants);
+        }
+        let reason = unsupported_hls_reason(&body);
+        return Ok(vec![VideoVariant {
+            kind: "hls".into(), quality: "Adaptive playlist".into(), width: None, height: None,
+            bandwidth: None, url: url.to_string(), downloadable: reason.is_none(),
+            note: reason.or_else(|| Some("Unencrypted HLS playlist".into())),
+        }]);
+    }
+    if content_type.contains("dash+xml") {
+        let body = fetch_text(url, referer).await?;
+        return Ok(parse_dash_representations(&body, url));
+    }
+    if content_type.starts_with("video/") || content_type.starts_with("audio/")
+        || content_type == "application/octet-stream" || content_type == "application/zip"
+        || content_type == "application/pdf" {
+        return Ok(vec![direct_variant(url)]);
+    }
+
+    Err(anyhow!(
+        "This URL is a webpage, not a direct media file. Paste an MP4/audio URL or an HLS playlist. Page extraction is not available for this source."
+    ))
+}
+
+async fn fetch_text(url: &str, referer: Option<&str>) -> Result<String> {
+    let client = client()?;
+    let mut request = client.get(url);
+    if let Some(referrer) = referer { request = request.header(reqwest::header::REFERER, referrer); }
+    Ok(request.send().await?.error_for_status()?.text().await?)
+}
+
+fn unsupported_hls_reason(body: &str) -> Option<String> {
+    for line in body.lines().map(str::trim) {
+        if let Some(attributes) = line.strip_prefix("#EXT-X-KEY:") {
+            let method = attr(attributes, "METHOD").unwrap_or_default();
+            if !method.eq_ignore_ascii_case("NONE") {
+                return Some("Encrypted HLS stream is not supported".into());
+            }
+        }
+        if line.starts_with("#EXT-X-BYTERANGE:") {
+            return Some("HLS byte-range segments are not supported".into());
+        }
+    }
+    None
+}
+
+async fn annotate_hls_variants(variants: &mut [VideoVariant], referer: Option<&str>) {
+    for variant in variants.iter_mut().filter(|item| item.kind == "hls") {
+        match fetch_text(&variant.url, referer).await {
+            Ok(body) => {
+                if let Some(reason) = unsupported_hls_reason(&body) {
+                    variant.downloadable = false;
+                    variant.note = Some(reason);
+                }
+            }
+            Err(_) => {
+                variant.downloadable = false;
+                variant.note = Some("Could not read this quality playlist".into());
+            }
+        }
+    }
+}
+
+fn direct_variant(url: &str) -> VideoVariant {
+    VideoVariant {
         kind: "direct".into(), quality: "Original file".into(), width: None, height: None,
         bandwidth: None, url: url.into(), downloadable: true,
-        note: Some("Direct media file".into()),
-    }])
+        note: Some("Direct media or file URL".into()),
+    }
+}
+
+fn is_direct_media_path(path: &str) -> bool {
+    [
+        ".mp4", ".m4v", ".mov", ".webm", ".mkv", ".avi", ".mp3", ".m4a",
+        ".aac", ".wav", ".ogg", ".flac", ".zip", ".pdf", ".7z", ".rar"
+    ].iter().any(|extension| path.ends_with(extension))
+}
+
+#[cfg(test)]
+mod inspect_tests {
+    use super::is_direct_media_path;
+
+    #[test]
+    fn recognizes_common_file_extensions() {
+        assert!(is_direct_media_path("/movie.mp4"));
+        assert!(is_direct_media_path("/audio.m4a"));
+        assert!(is_direct_media_path("/archive.zip"));
+    }
+
+    #[test]
+    fn does_not_treat_web_pages_as_media_files() {
+        assert!(!is_direct_media_path("/watch"));
+        assert!(!is_direct_media_path("/video/12345"));
+        assert!(!is_direct_media_path("/index.html"));
+    }
 }
 
 fn parse_hls_master(body: &str, base: &Url) -> Result<Vec<VideoVariant>> {
@@ -163,9 +277,11 @@ pub async fn download_hls(
             init_segment = attr(v, "URI").and_then(|u| media_base.join(&u).ok()).map(|u| u.to_string());
         } else if let Some(key) = line.strip_prefix("#EXT-X-KEY:") {
             let method = attr(key, "METHOD").unwrap_or_default();
-            if method != "NONE" {
+            if !method.eq_ignore_ascii_case("NONE") {
                 return Err(anyhow!("This HLS playlist is encrypted. ThunderLoad does not decrypt protected streams."));
             }
+        } else if line.starts_with("#EXT-X-BYTERANGE:") {
+            return Err(anyhow!("HLS byte-range segments are not supported by this build"));
         } else if line.starts_with('#') {
             continue;
         } else {

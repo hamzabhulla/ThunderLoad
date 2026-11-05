@@ -6,10 +6,10 @@
 - Rust HTTP/HTTPS downloader with parallel byte-range transfers (up to 16 connections) when the server explicitly supports ranges, with sequential fallback.
 - Direct browser downloads through the browser downloads API.
 - On-demand scan of media URLs visible in the active tab. It starts only when the user opens the popup or uses its shortcut.
-- No injected page banners, floating video buttons, or automatic scans of every visited site.
+- A compact, hover-only in-player Download control for supported video elements; no banners or automatic scans of every visited site.
 - HLS master-playlist quality discovery and unencrypted HLS segment download through the optional desktop native host.
 - DASH Representation quality detection only; DASH segment download/remux is not implemented.
-- React + Tauri desktop starter with a Windows NSIS installer configuration.
+- Minimal React + Tauri desktop workspace with Downloads, Queue, Video Grabber and Settings pages, plus a Windows NSIS installer configuration.
 - Native messaging is optional; ordinary direct downloads do not need the desktop app.
 
 ## Browser package matrix
@@ -42,7 +42,7 @@ NSIS setup output: `target/release/bundle/nsis/`. GitHub Actions can build the i
 
 ## Browser packages
 
-Run `.scriptspackage-extensions.ps1` in PowerShell. Outputs go to `dist/extensions/`:
+Run `scripts/package-extensions.ps1` in PowerShell. Outputs go to `dist/extensions/`:
 - `ThunderLoad-Chromium.zip`
 - `ThunderLoad-Firefox.zip`
 
@@ -70,7 +70,7 @@ HLS qualities are listed only when exposed by the site. Unencrypted HLS segments
 - Persistent job database; reliable pause/resume checkpoints, cancellation and crash recovery.
 - DASH segment/template/list assembly and tested MP4 remuxing.
 - Explicit, secure cookie/header handoff for user-authorized sessions.
-- Speed limiter, queue, scheduler and settings persistence wired to engine.
+- Transfer cancellation, speed limiting and scheduled downloads; current queue concurrency and local settings are implemented in the desktop UI.
 - Desktop queue integration for extension-started jobs.
 - Code signing, update strategy, uninstall cleanup, Windows VM testing and accessibility QA.
 - Current-version Firefox/Chromium testing, AMO/Chrome/Edge store review; separate Safari wrapper if Safari is advertised.

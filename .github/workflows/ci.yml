@@ -22,10 +22,21 @@ jobs:
       - name: Validate extension
         shell: pwsh
         run: |
-          node --check thunderload/extension/background.js
-          node --check thunderload/extension/content.js
-          node --check thunderload/extension/popup.js
+          $checks = @(
+            "thunderload/extension/background.js",
+            "thunderload/extension/content.js",
+            "thunderload/extension/popup.js"
+          )
+          foreach ($file in $checks) {
+            node --check $file
+            if ($LASTEXITCODE -ne 0) {
+              throw "JavaScript syntax validation failed: $file"
+            }
+          }
           node thunderload/scripts/validate-extension.mjs
+          if ($LASTEXITCODE -ne 0) {
+            throw "Extension manifest validation failed"
+          }
       - name: Build native host required by Tauri resources
         working-directory: thunderload
         run: cargo build --release -p thunderload-host
