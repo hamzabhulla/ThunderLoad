@@ -155,7 +155,7 @@ export default function App() {
   }
   function retry(item: Item) { add(item.url, item.name, item.kind); }
   function clearFinished() {
-    setItems((current) => current.filter((item) => item.status === "Downloading" || item.status === "Queued"));
+    setItems((current) => current.filter((item) => item.status !== "Completed"));
   }
   async function inspect() {
     const clean = videoUrl.trim();
