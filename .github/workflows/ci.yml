@@ -41,3 +41,19 @@ jobs:
       - name: Build desktop frontend
         working-directory: thunderload/desktop
         run: npm run build
+      - name: Build Windows NSIS installer
+        working-directory: thunderload/desktop
+        run: npm run tauri -- build
+      - name: Package browser extensions
+        shell: pwsh
+        run: .\thunderload\scripts\package-extensions.ps1
+      - name: Upload preview build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ThunderLoad-preview-${{ github.sha }}
+          path: |
+            thunderload/target/release/bundle/nsis/*.exe
+            thunderload/target/release/thunderload-host.exe
+            thunderload/dist/extensions/*.zip
+          if-no-files-found: error
+          retention-days: 14
