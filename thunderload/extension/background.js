@@ -61,6 +61,43 @@ function safeFilenameFromUrl(url, fallback = "download.bin") {
   } catch (_) { return fallback; }
 }
 
+async function quickDownloadMedia({ url, kind, pageUrl, filename }) {
+  const name = filename || safeFilenameFromUrl(url, kind === "HLS playlist" ? "video.mp4" : "download.bin");
+  const nativePermission = await hasNativePermission();
+  if (nativePermission) {
+    const inspected = await requestNative("video.inspect", { url, referer: pageUrl || "" });
+    if (inspected?.ok) {
+      const variants = Array.isArray(inspected.data?.variants) ? inspected.data.variants : [];
+      const downloadable = variants.filter((item) => item?.downloadable && item?.url);
+      downloadable.sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bandwidth || 0) - (a.bandwidth || 0));
+      const selected = downloadable[0];
+      if (selected) {
+        const action = selected.kind === "hls" ? "video.download" : "download.start";
+        const result = await requestNative(action, {
+          url: selected.url,
+          filename: selected.kind === "hls" ? (name.replace(/\.[^.]+$/, "") + ".mp4") : name,
+          referer: pageUrl || ""
+        });
+        if (result?.ok) return { ok: true, message: selected.quality && variants.length > 1 ? "Downloading " + selected.quality + " in ThunderLoad." : "Download started in ThunderLoad." };
+        return { ok: false, error: result?.error || "ThunderLoad could not start this download." };
+      }
+      const reason = variants[0]?.note || "No downloadable stream was exposed by this page.";
+      return { ok: false, error: reason };
+    }
+    if (kind !== "Direct media") return { ok: false, error: inspected?.error || "Could not inspect this media source." };
+  }
+  if (kind === "Direct media") {
+    try {
+      await browserDownload(url, name);
+      return { ok: true, message: "Download started in your browser." };
+    } catch (error) { return { ok: false, error: error?.message || String(error) }; }
+  }
+  return {
+    ok: false,
+    error: "Adaptive video needs the ThunderLoad desktop companion. Open the extension and choose Download to connect it."
+  };
+}
+
 api.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "VIDEO_SOURCES_FOUND") {
     const tabId = sender.tab?.id;
@@ -79,7 +116,7 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
         if (!tab?.id) return sendResponse({ ok: false, error: "No active tab" });
         await api.scripting.executeScript({ target: { tabId: tab.id }, files: ["content.js"] });
         await api.tabs.sendMessage(tab.id, { type: "SCAN_NOW" }).catch(() => {});
-        await new Promise((resolve) => setTimeout(resolve, 350));
+        await new Promise((resolve) => setTimeout(resolve, 250));
         sendResponse({ ok: true, tabId: tab.id, sources: sourcesByTab.get(tab.id) || [], pageUrl: tab.url || "" });
       } catch (error) {
         sendResponse({ ok: false, error: error?.message || "This page does not allow extension scanning" });
@@ -89,6 +126,10 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message?.type === "NATIVE_REQUEST") {
     requestNative(message.action, message.payload || {}).then(sendResponse);
+    return true;
+  }
+  if (message?.type === "QUICK_DOWNLOAD_MEDIA") {
+    quickDownloadMedia(message).then(sendResponse).catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
     return true;
   }
   if (message?.type === "BROWSER_DOWNLOAD") {
