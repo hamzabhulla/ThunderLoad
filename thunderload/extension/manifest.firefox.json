@@ -1,0 +1,10 @@
+{
+  "manifest_version": 3,
+  "name": "ThunderLoad Download Manager",
+  "version": "0.1.0",
+  "description": "A quiet, privacy-first companion for fast downloads and supported video streams.",
+  "permissions": ["activeTab", "scripting", "tabs", "storage", "nativeMessaging", "contextMenus"],
+  "background": { "scripts": ["background.js"] },
+  "action": { "default_title": "Scan page with ThunderLoad", "default_popup": "popup.html" },
+  "browser_specific_settings": { "gecko": { "id": "thunderload@example.com", "strict_min_version": "109.0" } }
+}
