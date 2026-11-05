@@ -32,7 +32,10 @@
       const kind = classify(url);
       if (kind) return { url, kind };
     }
-    return null;
+    // MSE players often expose blob: as currentSrc while a single HLS
+    // manifest remains visible in the page resource list.
+    const hls = Array.from(found.values()).filter((item) => item.kind === "HLS playlist");
+    return hls.length === 1 ? { url: hls[0].url, kind: hls[0].kind } : null;
   }
 
   function add(url, label) {
