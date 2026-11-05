@@ -21,7 +21,7 @@ ThunderLoad lets you save direct links using your browser's own download manager
 - Start a download from a link's right-click menu.
 - Scan the active tab for media sources only when you open the extension or use its shortcut.
 - View HLS qualities when the page exposes a readable HLS master playlist and the optional desktop companion is installed.
-- Keep video playback clean: no injected buttons, overlays, banners or automatic popups.
+- Keep playback unobtrusive: a compact in-player Download action appears only while hovering a supported video after the user activates the page scanner. No banners or automatic popups.
 - Use browser-native downloading without installing the desktop app for ordinary direct links.
 
 Limits: transfer speed depends on the server and network; DASH quality detection is available but DASH downloading/remux is not implemented; DRM-protected or access-controlled streams are not decrypted or bypassed; adaptive HLS inspection/download needs the desktop native host.

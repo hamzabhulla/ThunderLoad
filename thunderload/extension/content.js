@@ -203,6 +203,27 @@
     attributes: true,
     attributeFilter: ["src"]
   });
+  try {
+    const resourceObserver = new PerformanceObserver((list) => {
+      for (const entry of list.getEntries()) {
+        const kind = classify(entry.name);
+        if (kind) add(entry.name, kind);
+      }
+      const hovered = activeVideo || Array.from(document.querySelectorAll("video")).find((video) => video.matches(":hover"));
+      if (hovered && !activeVideo) {
+        const source = sourceFor(hovered);
+        if (source && source.kind !== "DASH manifest") {
+          activeVideo = hovered;
+          ensureOverlay();
+          clearTimeout(hideTimer);
+          positionOverlay(hovered);
+        }
+      }
+    });
+    resourceObserver.observe({ type: "resource", buffered: true });
+  } catch (_) {
+    // Resource observation is optional; direct video URLs remain detectable.
+  }
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") scheduleScan();
   });
