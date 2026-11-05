@@ -32,8 +32,8 @@
       const kind = classify(url);
       if (kind) return { url, kind };
     }
-    // MSE players often expose blob: as currentSrc while a single HLS
-    // manifest remains visible in the page resource list.
+    // MSE players may expose blob: as currentSrc while one HLS manifest
+    // remains visible in the page's resource list.
     const hls = Array.from(found.values()).filter((item) => item.kind === "HLS playlist");
     return hls.length === 1 ? { url: hls[0].url, kind: hls[0].kind } : null;
   }
@@ -52,15 +52,15 @@
     buttonHost.style.cssText = "all:initial;position:fixed;inset:0;z-index:2147483646;pointer-events:none;";
     overlayRoot = buttonHost.attachShadow({ mode: "closed" });
     const style = document.createElement("style");
-    style.textContent = \`
-      .wrap{position:fixed;display:none;pointer-events:none;z-index:2147483647}
-      button{pointer-events:auto;display:inline-flex;align-items:center;justify-content:center;gap:6px;height:29px;padding:0 10px;border:1px solid rgba(205,220,238,.27);border-radius:6px;background:rgba(20,29,40,.88);color:#e8f1fc;font:600 11px/1 system-ui,-apple-system,"Segoe UI",sans-serif;letter-spacing:.1px;box-shadow:0 2px 10px rgba(0,0,0,.18);backdrop-filter:blur(8px);opacity:.78;cursor:pointer;transition:opacity .14s ease,background .14s ease,border-color .14s ease}
-      button:hover,button:focus-visible{opacity:1;background:rgba(35,52,72,.96);border-color:rgba(165,201,242,.62);outline:none}
-      button svg{width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
-      .message{display:none;position:absolute;top:34px;right:0;max-width:210px;padding:6px 8px;border:1px solid rgba(205,220,238,.2);border-radius:5px;background:rgba(17,25,35,.94);color:#e4edf8;font:10px/1.35 system-ui,-apple-system,"Segoe UI",sans-serif;white-space:normal;box-shadow:0 2px 10px rgba(0,0,0,.2)}
-      .message.show{display:block}
-      @media(prefers-reduced-motion:reduce){button{transition:none}}
-    \`;
+    style.textContent = [
+      '.wrap{position:fixed;display:none;pointer-events:none;z-index:2147483647}',
+      'button{pointer-events:auto;display:inline-flex;align-items:center;justify-content:center;gap:6px;height:29px;padding:0 10px;border:1px solid rgba(205,220,238,.27);border-radius:6px;background:rgba(20,29,40,.88);color:#e8f1fc;font:600 11px/1 system-ui,-apple-system,"Segoe UI",sans-serif;letter-spacing:.1px;box-shadow:0 2px 10px rgba(0,0,0,.18);backdrop-filter:blur(8px);opacity:.78;cursor:pointer;transition:opacity .14s ease,background .14s ease,border-color .14s ease}',
+      'button:hover,button:focus-visible{opacity:1;background:rgba(35,52,72,.96);border-color:rgba(165,201,242,.62);outline:none}',
+      'button svg{width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}',
+      '.message{display:none;position:absolute;top:34px;right:0;max-width:210px;padding:6px 8px;border:1px solid rgba(205,220,238,.2);border-radius:5px;background:rgba(17,25,35,.94);color:#e4edf8;font:10px/1.35 system-ui,-apple-system,"Segoe UI",sans-serif;white-space:normal;box-shadow:0 2px 10px rgba(0,0,0,.2)}',
+      '.message.show{display:block}',
+      '@media(prefers-reduced-motion:reduce){button{transition:none}}'
+    ].join("\n");
     const wrap = document.createElement("div");
     wrap.className = "wrap";
     button = document.createElement("button");
