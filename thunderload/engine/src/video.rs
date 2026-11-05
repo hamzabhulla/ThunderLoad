@@ -36,12 +36,16 @@ pub async fn inspect_video(url: &str, referer: Option<&str>) -> Result<Vec<Video
 
     if lower.ends_with(".m3u8") {
         let body = fetch_text(url, referer).await?;
-        let variants = parse_hls_master(&body, &parsed)?;
-        if !variants.is_empty() { return Ok(variants); }
+        let mut variants = parse_hls_master(&body, &parsed)?;
+        if !variants.is_empty() {
+            annotate_hls_variants(&mut variants, referer).await;
+            return Ok(variants);
+        }
+        let reason = unsupported_hls_reason(&body);
         return Ok(vec![VideoVariant {
             kind: "hls".into(), quality: "Adaptive playlist".into(), width: None, height: None,
-            bandwidth: None, url: url.to_string(), downloadable: true,
-            note: Some("Unencrypted HLS playlist".into()),
+            bandwidth: None, url: url.to_string(), downloadable: reason.is_none(),
+            note: reason.or_else(|| Some("Unencrypted HLS playlist".into())),
         }]);
     }
     if lower.ends_with(".mpd") {
@@ -76,12 +80,16 @@ pub async fn inspect_video(url: &str, referer: Option<&str>) -> Result<Vec<Video
 
     if content_type.contains("mpegurl") || content_type.contains("vnd.apple.mpegurl") {
         let body = fetch_text(url, referer).await?;
-        let variants = parse_hls_master(&body, &parsed)?;
-        if !variants.is_empty() { return Ok(variants); }
+        let mut variants = parse_hls_master(&body, &parsed)?;
+        if !variants.is_empty() {
+            annotate_hls_variants(&mut variants, referer).await;
+            return Ok(variants);
+        }
+        let reason = unsupported_hls_reason(&body);
         return Ok(vec![VideoVariant {
             kind: "hls".into(), quality: "Adaptive playlist".into(), width: None, height: None,
-            bandwidth: None, url: url.to_string(), downloadable: true,
-            note: Some("Unencrypted HLS playlist".into()),
+            bandwidth: None, url: url.to_string(), downloadable: reason.is_none(),
+            note: reason.or_else(|| Some("Unencrypted HLS playlist".into())),
         }]);
     }
     if content_type.contains("dash+xml") {
@@ -104,6 +112,38 @@ async fn fetch_text(url: &str, referer: Option<&str>) -> Result<String> {
     let mut request = client.get(url);
     if let Some(referrer) = referer { request = request.header(reqwest::header::REFERER, referrer); }
     Ok(request.send().await?.error_for_status()?.text().await?)
+}
+
+fn unsupported_hls_reason(body: &str) -> Option<String> {
+    for line in body.lines().map(str::trim) {
+        if let Some(attributes) = line.strip_prefix("#EXT-X-KEY:") {
+            let method = attr(attributes, "METHOD").unwrap_or_default();
+            if !method.eq_ignore_ascii_case("NONE") {
+                return Some("Encrypted HLS stream is not supported".into());
+            }
+        }
+        if line.starts_with("#EXT-X-BYTERANGE:") {
+            return Some("HLS byte-range segments are not supported".into());
+        }
+    }
+    None
+}
+
+async fn annotate_hls_variants(variants: &mut [VideoVariant], referer: Option<&str>) {
+    for variant in variants.iter_mut().filter(|item| item.kind == "hls") {
+        match fetch_text(&variant.url, referer).await {
+            Ok(body) => {
+                if let Some(reason) = unsupported_hls_reason(&body) {
+                    variant.downloadable = false;
+                    variant.note = Some(reason);
+                }
+            }
+            Err(_) => {
+                variant.downloadable = false;
+                variant.note = Some("Could not read this quality playlist".into());
+            }
+        }
+    }
 }
 
 fn direct_variant(url: &str) -> VideoVariant {
@@ -237,9 +277,11 @@ pub async fn download_hls(
             init_segment = attr(v, "URI").and_then(|u| media_base.join(&u).ok()).map(|u| u.to_string());
         } else if let Some(key) = line.strip_prefix("#EXT-X-KEY:") {
             let method = attr(key, "METHOD").unwrap_or_default();
-            if method != "NONE" {
+            if !method.eq_ignore_ascii_case("NONE") {
                 return Err(anyhow!("This HLS playlist is encrypted. ThunderLoad does not decrypt protected streams."));
             }
+        } else if line.starts_with("#EXT-X-BYTERANGE:") {
+            return Err(anyhow!("HLS byte-range segments are not supported by this build"));
         } else if line.starts_with('#') {
             continue;
         } else {
