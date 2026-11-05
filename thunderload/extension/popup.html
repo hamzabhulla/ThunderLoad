@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ThunderLoad</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark">T</span><div><strong>ThunderLoad</strong><small>Download manager</small></div></div>
+      <span class="status" id="engineStatus">Checking engine</span>
+    </header>
+    <section class="hero">
+      <div><p class="eyebrow">SMART MEDIA SCAN</p><h1>Downloads, without the noise.</h1><p class="muted">Scan this page on demand. No banners or injected video buttons.</p></div>
+      <button class="secondary" id="rescanBtn">Rescan</button>
+    </section>
+    <section class="section-head"><div><h2>Detected media</h2><span class="muted" id="scanMeta">Scanning active tab…</span></div><span class="count" id="sourceCount">0</span></section>
+    <div id="sourceList" class="source-list"><div class="empty">Looking for media sources…</div></div>
+    <div class="footer-note">Only media URLs exposed by the page are listed. DRM-protected streams are not bypassed.</div>
+    <div id="toast" class="toast" role="status"></div>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>
