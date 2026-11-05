@@ -1,0 +1,73 @@
+name: ThunderLoad Windows release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  windows-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: thunderload -> target
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Validate extension source
+        shell: pwsh
+        run: |
+          node --check thunderload/extension/background.js
+          node --check thunderload/extension/content.js
+          node --check thunderload/extension/popup.js
+          node thunderload/scripts/validate-extension.mjs
+      - name: Build native host required by the installer
+        working-directory: thunderload
+        run: cargo build --release -p thunderload-host
+      - name: Test Rust workspace
+        working-directory: thunderload
+        run: cargo test --workspace
+      - name: Install desktop dependencies
+        working-directory: thunderload/desktop
+        run: npm install
+      - name: Build desktop frontend
+        working-directory: thunderload/desktop
+        run: npm run build
+      - name: Build Windows NSIS installer
+        working-directory: thunderload/desktop
+        run: npm run tauri -- build
+      - name: Prepare release packages
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $Out = Join-Path $PWD "release-assets"
+          New-Item -ItemType Directory -Force -Path $Out | Out-Null
+          $Installer = Get-ChildItem "thunderload/target/release/bundle/nsis" -Filter "*-setup.exe" -Recurse | Select-Object -First 1
+          if (!$Installer) { throw "Tauri NSIS setup executable was not produced." }
+          Copy-Item $Installer.FullName (Join-Path $Out "ThunderLoad-Setup.exe")
+          $HostExe = "thunderload/target/release/thunderload-host.exe"
+          if (!(Test-Path $HostExe)) { throw "Native host executable missing." }
+          $NativeDir = Join-Path $env:RUNNER_TEMP "ThunderLoad-NativeHost"
+          New-Item -ItemType Directory -Force -Path $NativeDir | Out-Null
+          Copy-Item $HostExe (Join-Path $NativeDir "thunderload-host.exe")
+          Copy-Item "thunderload/native-host/register-native-host.ps1" $NativeDir
+          Copy-Item "thunderload/native-host/unregister-native-host.ps1" $NativeDir
+          Compress-Archive -Path (Join-Path $NativeDir "*") -DestinationPath (Join-Path $Out "ThunderLoad-NativeHost-Setup.zip") -Force
+          & "thunderload/scripts/package-extensions.ps1"
+          Copy-Item "thunderload/dist/extensions/ThunderLoad-Chromium.zip" $Out
+          Copy-Item "thunderload/dist/extensions/ThunderLoad-Firefox.zip" $Out
+          $Checksums = Join-Path $Out "SHA256SUMS.txt"
+          Get-ChildItem $Out -File | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)" | Add-Content $Checksums
+          }
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') }}

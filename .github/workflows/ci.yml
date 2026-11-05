@@ -1,0 +1,43 @@
+name: ThunderLoad CI
+on:
+  push:
+    branches: [main]
+    paths: ["thunderload/**", ".github/workflows/ci.yml"]
+  pull_request:
+    paths: ["thunderload/**", ".github/workflows/ci.yml"]
+permissions:
+  contents: read
+jobs:
+  windows-checks:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: thunderload -> target
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Validate extension
+        shell: pwsh
+        run: |
+          node --check thunderload/extension/background.js
+          node --check thunderload/extension/content.js
+          node --check thunderload/extension/popup.js
+          node thunderload/scripts/validate-extension.mjs
+      - name: Build native host required by Tauri resources
+        working-directory: thunderload
+        run: cargo build --release -p thunderload-host
+      - name: Check Rust workspace
+        working-directory: thunderload
+        run: cargo check --workspace
+      - name: Test Rust workspace
+        working-directory: thunderload
+        run: cargo test --workspace
+      - name: Install desktop dependencies
+        working-directory: thunderload/desktop
+        run: npm install
+      - name: Build desktop frontend
+        working-directory: thunderload/desktop
+        run: npm run build

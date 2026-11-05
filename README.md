@@ -1,25 +1,24 @@
 # ThunderLoad
 
-A Windows-first, lightweight download manager starter with a Rust download engine, Tauri desktop UI, and browser-extension integration.
+ThunderLoad is a Windows-first download manager project with a Rust transfer engine, a Tauri desktop client, and browser-specific extensions.
 
-## Source code
+## Project layout
+- thunderload/engine — Rust HTTP range downloader and HLS/DASH inspection.
+- thunderload/desktop — Tauri + React desktop client and Windows NSIS configuration.
+- thunderload/extension — Chromium and Firefox extension source.
+- thunderload/native-host — optional local Native Messaging bridge.
+- thunderload/docs — browser distribution, store submission and privacy notes.
 
-The starter project lives in the thunderload/ directory.
+## Status
+This is an active release-candidate starter, not a production-ready IDM replacement. HLS is limited to exposed, unencrypted playlists. DASH quality detection exists, but DASH downloading/remuxing is not implemented. Pause/resume persistence, queue persistence, code signing and live browser testing remain release blockers.
 
-- Project setup and build instructions: thunderload/README.md
-- Rust download engine: thunderload/engine/
-- Browser extension: thunderload/extension/
-- Native messaging host: thunderload/native-host/
-- Desktop application: thunderload/desktop/
+## Build and release
+See thunderload/README.md. GitHub Actions checks source on pushes and pull requests; tags beginning with v build a Windows NSIS setup executable and Chromium/Firefox extension packages.
 
-## Current scope
+## Browser distribution
+- Chromium package: Chrome, Edge, Brave, Opera and Vivaldi starting point.
+- Firefox: separate manifest build; Mozilla AMO signing is required for release/beta Firefox.
+- Safari: separate macOS/Xcode wrapper not included.
 
-- Rust HTTP downloader with parallel range requests where supported
-- HLS playlist quality discovery and unencrypted segment download support
-- DASH representation/quality detection (DASH downloading is not yet implemented)
-- User-triggered browser media scan without page overlays or playback interruptions
-- Tauri + React desktop UI starter
-
-## Important
-
-This is an early starter, not a production-ready IDM replacement. Real-world compatibility, Firefox packaging, pause/resume, DASH downloading/remuxing, and full native-host/desktop queue integration still need implementation and end-to-end testing. It does not bypass DRM or access controls. Parallel downloads cannot guarantee a fixed speed multiplier; results depend on server support and available bandwidth.
+## Privacy
+See the draft privacy policy at thunderload/docs/PRIVACY.md. Before store submission, publish it at a public URL and replace its contact placeholder with a monitored support address.

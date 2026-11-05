@@ -1,10 +1,25 @@
 {
   "manifest_version": 3,
   "name": "ThunderLoad Download Manager",
-  "version": "0.1.0",
-  "description": "A quiet, privacy-first companion for fast downloads and supported video streams.",
-  "permissions": ["activeTab", "scripting", "tabs", "storage", "nativeMessaging", "contextMenus"],
+  "short_name": "ThunderLoad",
+  "version": "0.2.0",
+  "description": "A quiet, lightweight download companion with on-demand media detection and optional desktop acceleration.",
+  "permissions": ["activeTab", "scripting", "downloads", "contextMenus"],
+  "optional_permissions": ["nativeMessaging"],
   "background": { "scripts": ["background.js"] },
-  "action": { "default_title": "Scan page with ThunderLoad", "default_popup": "popup.html" },
-  "browser_specific_settings": { "gecko": { "id": "thunderload@example.com", "strict_min_version": "109.0" } }
+  "action": {
+    "default_title": "Scan page with ThunderLoad",
+    "default_popup": "popup.html",
+    "default_icon": { "16": "icons/16.png", "32": "icons/32.png", "48": "icons/48.png", "128": "icons/128.png" }
+  },
+  "icons": { "16": "icons/16.png", "32": "icons/32.png", "48": "icons/48.png", "128": "icons/128.png" },
+  "browser_specific_settings": {
+    "gecko": { "id": "thunderload@example.com", "strict_min_version": "128.0" }
+  },
+  "commands": {
+    "scan-media": {
+      "suggested_key": { "default": "Alt+Shift+D" },
+      "description": "Scan the current tab for downloadable media"
+    }
+  }
 }

@@ -1,3 +1,4 @@
+const api = globalThis.browser ?? chrome;
 const sourceList = document.getElementById("sourceList");
 const scanMeta = document.getElementById("scanMeta");
 const sourceCount = document.getElementById("sourceCount");
@@ -12,14 +13,27 @@ function showToast(text) {
   window.clearTimeout(showToast.timer);
   showToast.timer = window.setTimeout(() => toast.classList.remove("show"), 4200);
 }
-function requestNative(action, payload) {
-  return chrome.runtime.sendMessage({ type: "NATIVE_REQUEST", action, payload });
+async function requestNative(action, payload, askPermission = false) {
+  if (askPermission) {
+    const has = await api.permissions.contains({ permissions: ["nativeMessaging"] });
+    if (!has) {
+      const granted = await api.permissions.request({ permissions: ["nativeMessaging"] });
+      if (!granted) throw new Error("Desktop engine permission was not granted.");
+    }
+  }
+  return api.runtime.sendMessage({ type: "NATIVE_REQUEST", action, payload });
 }
 function el(tag, className, text) {
   const node = document.createElement(tag);
   if (className) node.className = className;
   if (text !== undefined) node.textContent = text;
   return node;
+}
+function filenameFromUrl(url, fallback) {
+  try {
+    const name = decodeURIComponent(new URL(url).pathname.split("/").pop() || fallback);
+    return name.replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_").slice(0, 180) || fallback;
+  } catch (_) { return fallback; }
 }
 function render() {
   sourceCount.textContent = String(sources.length);
@@ -32,8 +46,7 @@ function render() {
     const card = el("article", "source-card");
     const head = el("div", "source-head");
     const info = el("div");
-    info.append(el("div", "source-title", source.label || "Media source"));
-    info.append(el("div", "kind", source.kind || "Media"));
+    info.append(el("div", "source-title", source.label || "Media source"), el("div", "kind", source.kind || "Media"));
     head.append(info);
     card.append(head, el("div", "url", source.url));
     const actions = el("div", "source-actions");
@@ -53,8 +66,8 @@ async function inspectSource(source, card, button) {
   button.disabled = true;
   button.textContent = "Inspecting…";
   try {
-    const result = await requestNative("video.inspect", { url: source.url, referer: pageUrl });
-    if (!result?.ok) throw new Error(result?.error || "Could not inspect this source");
+    const result = await requestNative("video.inspect", { url: source.url, referer: pageUrl }, true);
+    if (!result?.ok) throw new Error(result?.error || "Install the ThunderLoad desktop companion to inspect adaptive stream qualities.");
     const qualityList = el("div", "quality-list");
     for (const variant of result.data?.variants || []) {
       const item = el("div", "quality");
@@ -76,63 +89,52 @@ async function inspectSource(source, card, button) {
     card.querySelector(".quality-list")?.remove();
     card.append(qualityList);
     if (!qualityList.children.length) throw new Error("No quality variants were returned");
-  } catch (error) {
-    showToast(error.message || String(error));
-  } finally {
-    button.disabled = false;
-    button.textContent = "Inspect qualities";
-  }
+  } catch (error) { showToast(error.message || String(error)); }
+  finally { button.disabled = false; button.textContent = "Inspect qualities"; }
 }
 async function startDirectDownload(source) {
-  const result = await requestNative("download.start", {
-    url: source.url, filename: filenameFromUrl(source.url, "download.bin"), referer: pageUrl
-  });
-  if (result?.ok) showToast("Download started in ThunderLoad. Check the desktop app for progress.");
-  else showToast(result?.error || "Desktop engine is not available. Install the native host first.");
+  const filename = filenameFromUrl(source.url, "download.bin");
+  try {
+    const native = await requestNative("download.start", { url: source.url, filename, referer: pageUrl });
+    if (native?.ok) { showToast("Download started in ThunderLoad."); return; }
+  } catch (_) { /* Use browser downloads as the no-companion fallback. */ }
+  const result = await api.runtime.sendMessage({ type: "BROWSER_DOWNLOAD", url: source.url, filename });
+  if (result?.ok) showToast("Download started in your browser's download manager.");
+  else showToast(result?.error || "Could not start this download.");
 }
 async function startVideoDownload(variant, source) {
   if (!variant.downloadable) return;
   const action = variant.kind === "hls" ? "video.download" : "download.start";
-  const result = await requestNative(action, {
-    url: variant.url, referer: pageUrl, filename: filenameFromUrl(source.url, "video")
-  });
-  if (result?.ok) showToast("Video download started. The engine is working in the background.");
-  else showToast(result?.error || "Could not start this download");
-}
-function filenameFromUrl(url, fallback) {
-  try {
-    const name = new URL(url).pathname.split("/").pop();
-    return decodeURIComponent(name || fallback).slice(0, 120) || fallback;
-  } catch (_) { return fallback; }
+  const result = await requestNative(action, { url: variant.url, referer: pageUrl, filename: filenameFromUrl(source.url, "video") });
+  if (result?.ok) showToast("Video download started in ThunderLoad.");
+  else showToast(result?.error || "Install the ThunderLoad desktop companion to download this stream.");
 }
 async function scanActiveTab() {
   sourceList.replaceChildren(el("div", "empty", "Scanning this tab…"));
   scanMeta.textContent = "Scanning active tab…";
   try {
-    const result = await chrome.runtime.sendMessage({ type: "GET_ACTIVE_SOURCES" });
+    const result = await api.runtime.sendMessage({ type: "GET_ACTIVE_SOURCES" });
     if (!result?.ok) throw new Error(result?.error || "Cannot scan this page");
     pageUrl = result.pageUrl || "";
     sources = result.sources || [];
     scanMeta.textContent = sources.length ? "Page scanned locally" : "No media detected yet";
     render();
   } catch (error) {
-    sources = [];
-    scanMeta.textContent = "Scan unavailable";
-    render();
+    sources = []; scanMeta.textContent = "Scan unavailable"; render();
     showToast(error.message || String(error));
   }
 }
 async function checkEngine() {
   try {
+    const hasPermission = await api.permissions.contains({ permissions: ["nativeMessaging"] });
+    if (!hasPermission) { engineStatus.textContent = "Browser mode"; return; }
     const result = await requestNative("ping", {});
-    if (result?.ok) {
-      engineStatus.textContent = "Engine connected";
-      engineStatus.classList.add("ready");
-    } else engineStatus.textContent = "Engine not installed";
-  } catch (_) { engineStatus.textContent = "Engine not installed"; }
+    if (result?.ok) { engineStatus.textContent = "Engine connected"; engineStatus.classList.add("ready"); }
+    else engineStatus.textContent = "Browser mode";
+  } catch (_) { engineStatus.textContent = "Browser mode"; }
 }
 document.getElementById("rescanBtn").addEventListener("click", scanActiveTab);
-chrome.runtime.onMessage.addListener((message) => {
+api.runtime.onMessage.addListener((message) => {
   if (message?.type === "NATIVE_EVENT") {
     const event = message.event;
     if (event?.event === "download.complete") showToast("Download complete: " + event.path);
@@ -142,6 +144,7 @@ chrome.runtime.onMessage.addListener((message) => {
     engineStatus.textContent = "Engine disconnected";
     engineStatus.classList.remove("ready");
   }
+  if (message?.type === "CONTEXT_DOWNLOAD_RESULT" && !message.result?.ok) showToast(message.result?.error || "Download failed");
 });
 checkEngine();
 scanActiveTab();
