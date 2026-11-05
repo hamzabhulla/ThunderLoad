@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "ThunderLoad Download Manager",
+  "version": "0.1.0",
+  "description": "A quiet, privacy-first companion for fast downloads and supported video streams.",
+  "permissions": ["activeTab", "scripting", "storage", "nativeMessaging", "contextMenus", "tabs"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_title": "Scan page with ThunderLoad", "default_popup": "popup.html" },
+  "commands": {
+    "scan-media": { "suggested_key": { "default": "Alt+Shift+D" }, "description": "Scan the current tab for downloadable media" }
+  }
+}
