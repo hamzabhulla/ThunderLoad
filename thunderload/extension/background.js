@@ -5,14 +5,24 @@ let nextRequestId = 1;
 const pendingRequests = new Map();
 const sourcesByTab = new Map();
 
-function browserDownload(url, filename) {
-  return new Promise((resolve, reject) => {
-    api.downloads.download({ url, filename: filename || undefined, saveAs: false, conflictAction: "uniquify" }, (downloadId) => {
-      const error = api.runtime.lastError;
-      if (error) reject(new Error(error.message));
-      else resolve({ ok: true, browserDownloadId: downloadId });
+async function browserDownload(url, filename) {
+  const options = { url, filename: filename || undefined, saveAs: false, conflictAction: "uniquify" };
+  try {
+    if (globalThis.browser && typeof globalThis.browser.downloads?.download === "function") {
+      const downloadId = await globalThis.browser.downloads.download(options);
+      return { ok: true, browserDownloadId: downloadId };
+    }
+    const downloadId = await new Promise((resolve, reject) => {
+      api.downloads.download(options, (id) => {
+        const error = api.runtime.lastError;
+        if (error) reject(new Error(error.message));
+        else resolve(id);
+      });
     });
-  });
+    return { ok: true, browserDownloadId: downloadId };
+  } catch (error) {
+    return { ok: false, error: error?.message || String(error) };
+  }
 }
 async function hasNativePermission() {
   try { return await api.permissions.contains({ permissions: ["nativeMessaging"] }); }

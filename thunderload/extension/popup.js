@@ -52,13 +52,16 @@ function render() {
     const actions = el("div", "source-actions");
     const download = el("button", "primary", "Download");
     download.addEventListener("click", () => quickDownload(source, card, download));
-    const more = el("button", "secondary", "Other qualities");
-    more.addEventListener("click", () => {
-      const current = card.querySelector(".quality-list");
-      if (current) { current.remove(); more.textContent = "Other qualities"; return; }
-      inspectSource(source, card, more);
-    });
-    actions.append(download, more);
+    actions.append(download);
+    if (source.kind === "HLS playlist" || source.kind === "DASH manifest") {
+      const more = el("button", "secondary", "Other qualities");
+      more.addEventListener("click", () => {
+        const current = card.querySelector(".quality-list");
+        if (current) { current.remove(); more.textContent = "Other qualities"; return; }
+        inspectSource(source, card, more);
+      });
+      actions.append(more);
+    }
     card.append(actions);
     sourceList.append(card);
   }

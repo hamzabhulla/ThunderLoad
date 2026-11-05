@@ -138,7 +138,7 @@
     video.dataset.thunderLoadAttached = "1";
     const show = () => {
       const source = sourceFor(video);
-      if (!source) return;
+      if (!source || source.kind === "DASH manifest") return;
       activeVideo = video;
       add(source.url, "Video " + (index + 1));
       ensureOverlay();
@@ -148,6 +148,7 @@
     video.addEventListener("pointerenter", show, { passive: true });
     video.addEventListener("pointermove", () => {
       if (activeVideo === video) positionOverlay(video);
+      else if (video.matches(":hover")) show();
     }, { passive: true });
     video.addEventListener("loadedmetadata", () => {
       const source = sourceFor(video);
