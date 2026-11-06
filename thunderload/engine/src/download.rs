@@ -14,18 +14,31 @@ pub struct DownloadProgress {
     pub phase: String,
 }
 
+// Reserve the destination atomically so two simultaneous jobs cannot select
+// the same filename and overwrite one another.
 async fn next_available_path(path: &Path) -> Result<PathBuf> {
-    if !fs::try_exists(path).await.unwrap_or(false) { return Ok(path.to_path_buf()); }
     let parent = path.parent().ok_or_else(|| anyhow!("Target path has no parent folder"))?;
+    fs::create_dir_all(parent).await.with_context(|| format!("Cannot create {}", parent.display()))?;
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("download");
     let extension = path.extension().and_then(|s| s.to_str());
-    for index in 1..10_000_u32 {
-        let name = match extension {
-            Some(ext) => format!("{stem} ({index}).{ext}"),
-            None => format!("{stem} ({index})"),
+    for index in 0..10_000_u32 {
+        let candidate = if index == 0 {
+            path.to_path_buf()
+        } else {
+            let name = match extension {
+                Some(ext) => format!("{stem} ({index}).{ext}"),
+                None => format!("{stem} ({index})"),
+            };
+            parent.join(name)
         };
-        let candidate = parent.join(name);
-        if !fs::try_exists(&candidate).await.unwrap_or(true) { return Ok(candidate); }
+        match fs::OpenOptions::new().write(true).create_new(true).open(&candidate).await {
+            Ok(file) => {
+                drop(file);
+                return Ok(candidate);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error).with_context(|| format!("Cannot reserve {}", candidate.display())),
+        }
     }
     Err(anyhow!("Could not find a free filename in the download folder"))
 }
@@ -46,33 +59,42 @@ pub async fn download_url(
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
 ) -> Result<PathBuf> {
     let target = next_available_path(target).await?;
-    let connections = connections.clamp(1, 16);
-    let client = client()?;
-    let mut head_request = client.head(url);
-    if let Some(referrer) = referer { head_request = head_request.header(header::REFERER, referrer); }
-    let head = head_request.send().await.ok();
-    let total = head.as_ref().and_then(|r| r.content_length());
-    let supports_ranges = head.as_ref().map(|r| {
-        r.headers().get(header::ACCEPT_RANGES)
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.eq_ignore_ascii_case("bytes"))
-            .unwrap_or(false)
-    }).unwrap_or(false);
+    let result = async {
+        let connections = connections.clamp(1, 16);
+        let client = client()?;
+        let mut head_request = client.head(url);
+        if let Some(referrer) = referer { head_request = head_request.header(header::REFERER, referrer); }
+        let head = head_request.send().await.ok();
+        let total = head.as_ref().filter(|response| response.status().is_success())
+            .and_then(|response| response.content_length());
+        let supports_ranges = head.as_ref().filter(|response| response.status().is_success()).map(|response| {
+            response.headers().get(header::ACCEPT_RANGES)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.eq_ignore_ascii_case("bytes"))
+                .unwrap_or(false)
+        }).unwrap_or(false);
 
-    if supports_ranges && total.unwrap_or(0) >= 2 * 1024 * 1024 && connections > 1 {
-        match download_segmented(&client, url, &target, total.unwrap(), connections.min(16), referer, progress_tx.clone()).await {
-            Ok(path) => return Ok(path),
-            Err(_) => {
-                // Some servers advertise ranges but reject or rewrite them. Restart cleanly.
-                let _ = progress_tx.send(DownloadProgress {
-                    downloaded: 0, total, percent: Some(0.0), phase: "fallback".into()
-                });
+        if supports_ranges && total.unwrap_or(0) >= 2 * 1024 * 1024 && connections > 1 {
+            match download_segmented(&client, url, &target, total.unwrap(), connections.min(16), referer, progress_tx.clone()).await {
+                Ok(path) => return Ok(path),
+                Err(_) => {
+                    // Some servers advertise byte ranges but return invalid ranges.
+                    // Restart sequentially rather than leave a potentially corrupt file.
+                    let _ = progress_tx.send(DownloadProgress {
+                        downloaded: 0, total, percent: Some(0.0), phase: "fallback".into()
+                    });
+                }
             }
         }
-    }
-    download_sequential(&client, url, &target, total, referer, progress_tx).await
-}
+        download_sequential(&client, url, &target, total, referer, progress_tx).await
+    }.await;
 
+    if result.is_err() {
+        // The destination is an empty reservation until the transfer commits.
+        let _ = fs::remove_file(&target).await;
+    }
+    result
+}
 async fn prepare_parent(target: &Path) -> Result<()> {
     let parent = target.parent().ok_or_else(|| anyhow!("Target path has no parent folder"))?;
     fs::create_dir_all(parent).await.with_context(|| format!("Cannot create {}", parent.display()))?;
@@ -93,31 +115,42 @@ async fn download_sequential(
     if let Some(referrer) = referer { request = request.header(header::REFERER, referrer); }
     let response = request.send().await?.error_for_status()?;
     let actual_total = response.content_length().or(total);
-    let mut stream = response.bytes_stream();
-    let mut file = fs::File::create(&temp).await?;
-    let mut downloaded = 0_u64;
-    let mut last_report = Instant::now();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        file.write_all(&chunk).await?;
-        downloaded += chunk.len() as u64;
-        let percent = actual_total.filter(|n| *n > 0).map(|n| downloaded as f64 * 100.0 / n as f64);
-        if last_report.elapsed() >= std::time::Duration::from_millis(180) {
-            let _ = progress_tx.send(DownloadProgress {
-                downloaded, total: actual_total, percent, phase: "downloading".into()
-            });
-            last_report = Instant::now();
+
+    let transfer_result = async {
+        let mut stream = response.bytes_stream();
+        let mut file = fs::File::create(&temp).await?;
+        let mut downloaded = 0_u64;
+        let mut last_report = Instant::now();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            file.write_all(&chunk).await?;
+            downloaded += chunk.len() as u64;
+            let percent = actual_total.filter(|size| *size > 0)
+                .map(|size| downloaded as f64 * 100.0 / size as f64);
+            if last_report.elapsed() >= std::time::Duration::from_millis(180) {
+                let _ = progress_tx.send(DownloadProgress {
+                    downloaded, total: actual_total, percent, phase: "downloading".into()
+                });
+                last_report = Instant::now();
+            }
         }
-    }
-    file.flush().await?;
-    drop(file);
+        file.flush().await?;
+        Ok::<u64, anyhow::Error>(downloaded)
+    }.await;
+
+    let downloaded = match transfer_result {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = fs::remove_file(&temp).await;
+            return Err(error).context("Sequential download failed; incomplete temporary file removed");
+        }
+    };
     replace_file(&temp, target).await?;
     let _ = progress_tx.send(DownloadProgress {
         downloaded, total: actual_total.or(Some(downloaded)), percent: Some(100.0), phase: "complete".into()
     });
     Ok(target.to_path_buf())
 }
-
 async fn download_segmented(
     client: &Client,
     url: &str,
@@ -152,6 +185,16 @@ async fn download_segmented(
             let response = request.send().await?;
             if response.status() != StatusCode::PARTIAL_CONTENT {
                 return Err(anyhow!("Server did not honor byte range"));
+            }
+            let expected_range = format!("bytes {start}-{end}/{total}");
+            let actual_range = response.headers().get(header::CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| anyhow!("Server omitted the Content-Range header"))?;
+            if actual_range != expected_range {
+                return Err(anyhow!("Server returned an unexpected range: {actual_range}"));
+            }
+            if response.content_length().is_some_and(|length| length != end - start + 1) {
+                return Err(anyhow!("Server returned a range with an unexpected content length"));
             }
             let mut stream = response.bytes_stream();
             let mut file = fs::File::create(&part_path).await?;
