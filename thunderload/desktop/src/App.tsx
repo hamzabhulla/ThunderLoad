@@ -106,6 +106,7 @@ export default function App() {
           id: string; name?: string; url?: string; kind?: string; status?: string;
           percent?: number; downloaded?: number; total?: number | null; detail?: string;
           error?: string; createdAt?: number; targetPath?: string;
+          representationId?: string; audioRepresentationId?: string;
         }>>("get_native_downloads");
         if (disposed) return;
         const external: Item[] = jobs.map((job) => ({
@@ -121,6 +122,8 @@ export default function App() {
           error: job.error,
           createdAt: job.createdAt || Date.now(),
           targetPath: job.targetPath,
+          representationId: job.representationId,
+          audioRepresentationId: job.audioRepresentationId,
           source: "native"
         }));
         setItems((current) => {
