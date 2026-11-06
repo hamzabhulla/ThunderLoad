@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{path::{Path, PathBuf}, sync::{atomic::{AtomicUsize, Ordering}, Arc}};
 use tokio::{fs, io::AsyncWriteExt, process::Command as TokioCommand, sync::mpsc};
 use quick_xml::{events::Event, Reader};
-use std::{collections::HashMap, process::Command};
+use std::collections::HashMap;
 use url::Url;
 use uuid::Uuid;
 use crate::download::{default_download_dir, safe_filename, DownloadProgress};
@@ -60,6 +60,7 @@ pub async fn inspect_video(url: &str, referer: Option<&str>) -> Result<Vec<Video
             kind: "hls".into(), quality: "Adaptive playlist".into(), width: None, height: None,
             bandwidth: None, url: url.to_string(), downloadable: reason.is_none(),
             note: reason.or_else(|| Some("Unencrypted HLS playlist".into())),
+            representation_id: None, audio_representation_id: None, audio_only: None,
         }]);
     }
     if lower.ends_with(".mpd") {
@@ -71,7 +72,7 @@ pub async fn inspect_video(url: &str, referer: Option<&str>) -> Result<Vec<Video
                 kind: "dash".into(), quality: "Adaptive DASH".into(), width: None,
                 height: None, bandwidth: None, url: url.into(), downloadable: false,
                 note: Some("DASH manifest detected, but no supported static segment layout was found".into()),
-                representation_id: None, audio_representation_id: None,
+                representation_id: None, audio_representation_id: None, audio_only: None,
             }]);
         }
         return Ok(reps);
@@ -214,6 +215,7 @@ fn direct_variant(url: &str) -> VideoVariant {
         kind: "direct".into(), quality: "Original file".into(), width: None, height: None,
         bandwidth: None, url: url.into(), downloadable: true,
         note: Some("Direct media or file URL".into()),
+        representation_id: None, audio_representation_id: None, audio_only: None,
     }
 }
 
@@ -260,7 +262,8 @@ fn parse_hls_master(body: &str, base: &Url) -> Result<Vec<VideoVariant>> {
                 let resolved = base.join(line)?.to_string();
                 let quality = height.map(|h| format!("{h}p")).unwrap_or_else(|| "Adaptive".into());
                 out.push(VideoVariant { kind: "hls".into(), quality, width, height, bandwidth,
-                    url: resolved, downloadable: true, note: Some("HLS variant".into()) });
+                    url: resolved, downloadable: true, note: Some("HLS variant".into()),
+                    representation_id: None, audio_representation_id: None, audio_only: None });
             }
         }
     }
