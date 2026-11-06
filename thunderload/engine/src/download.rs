@@ -3,7 +3,7 @@ use futures_util::StreamExt;
 use reqwest::{header, Client, StatusCode};
 use serde::Serialize;
 use std::{path::{Path, PathBuf}, sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex}, time::Instant};
-use tokio::{fs, io::AsyncWriteExt, sync::mpsc};
+use tokio::{fs, io::AsyncWriteExt, sync::{mpsc, Mutex as AsyncMutex}};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize)]
@@ -328,6 +328,52 @@ mod tests {
 }
 
 
+/// Shared token scheduler used by every active direct transfer. This
+/// enforces one aggregate cap instead of granting each job the full limit.
+pub struct GlobalRateLimiter {
+    limit: AtomicU64,
+    state: AsyncMutex<RateLimitState>,
+}
+
+struct RateLimitState {
+    limit: u64,
+    epoch: Instant,
+    reserved: u64,
+}
+
+impl GlobalRateLimiter {
+    pub fn new() -> Self {
+        Self {
+            limit: AtomicU64::new(0),
+            state: AsyncMutex::new(RateLimitState { limit: 0, epoch: Instant::now(), reserved: 0 }),
+        }
+    }
+
+    pub fn set_limit(&self, bytes_per_second: u64) {
+        self.limit.store(bytes_per_second.min(1_073_741_824), Ordering::Relaxed);
+    }
+
+    /// Reserves bytes in the aggregate transfer timeline and returns the delay
+    /// required before writing/consuming them without exceeding the global cap.
+    pub async fn reserve(&self, bytes: u64) -> std::time::Duration {
+        let limit = self.limit.load(Ordering::Relaxed);
+        let mut state = self.state.lock().await;
+        if state.limit != limit {
+            state.limit = limit;
+            state.epoch = Instant::now();
+            state.reserved = 0;
+        }
+        if limit == 0 || bytes == 0 { return std::time::Duration::ZERO; }
+        state.reserved = state.reserved.saturating_add(bytes);
+        let target = state.epoch + std::time::Duration::from_secs_f64(state.reserved as f64 / limit as f64);
+        target.saturating_duration_since(Instant::now())
+    }
+}
+
+impl Default for GlobalRateLimiter {
+    fn default() -> Self { Self::new() }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DownloadControl {
     Running,
@@ -380,7 +426,7 @@ pub async fn download_url_resumable(
     target: &Path,
     referer: Option<&str>,
     mut control: tokio::sync::watch::Receiver<DownloadControl>,
-    speed_limit: Arc<AtomicU64>,
+    rate_limiter: Arc<GlobalRateLimiter>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
 ) -> Result<DownloadOutcome> {
     if !matches!(url::Url::parse(url)?.scheme(), "http" | "https") {
@@ -445,7 +491,6 @@ pub async fn download_url_resumable(
     if append { options.append(true); } else { options.truncate(true); }
     let mut file = options.open(&part).await?;
     let mut stream = response.bytes_stream();
-    let started = Instant::now();
     let mut downloaded = start_offset;
     let mut last_report = Instant::now();
 
@@ -484,15 +529,11 @@ pub async fn download_url_resumable(
         file.write_all(&chunk).await?;
         downloaded = downloaded.saturating_add(chunk.len() as u64);
 
-        let limit = speed_limit.load(Ordering::Relaxed);
-        if limit > 0 {
-            let expected = std::time::Duration::from_secs_f64(downloaded.saturating_sub(start_offset) as f64 / limit as f64);
-            let wait = expected.saturating_sub(started.elapsed());
-            if !wait.is_zero() {
-                tokio::select! {
-                    _ = tokio::time::sleep(wait) => {},
-                    changed = control.changed() => { if changed.is_err() { /* host is shutting down */ } }
-                }
+        let wait = rate_limiter.reserve(chunk.len() as u64).await;
+        if !wait.is_zero() {
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {},
+                changed = control.changed() => { if changed.is_err() { /* host is shutting down */ } }
             }
         }
 
@@ -539,5 +580,23 @@ mod resumable_tests {
         let target = std::path::Path::new("movie.mp4");
         assert_eq!(partial_download_path(target), std::path::PathBuf::from("movie.mp4.thunderload.part"));
         assert_eq!(partial_download_path(target), partial_download_path(target));
+    }
+}
+
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::GlobalRateLimiter;
+
+    #[tokio::test]
+    async fn global_limiter_reserves_all_downloads_on_one_timeline() {
+        let limiter = GlobalRateLimiter::new();
+        limiter.set_limit(1_000_000);
+        let first = limiter.reserve(500_000).await;
+        let second = limiter.reserve(500_000).await;
+        assert!(first.as_millis() >= 400);
+        assert!(second > first);
+        limiter.set_limit(0);
+        assert_eq!(limiter.reserve(1_000_000).await, std::time::Duration::ZERO);
     }
 }
