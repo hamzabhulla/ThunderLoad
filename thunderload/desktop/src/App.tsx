@@ -175,16 +175,51 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     const item: Item = {
       id: crypto.randomUUID(), name: (saveAs || "").trim() || (kind === "hls" ? "video.mp4" : suggested),
       url: clean, kind, status: "Queued", percent: 0, downloaded: 0,
-      detail: "Waiting in queue", createdAt: Date.now()
+      detail: scheduleAt && new Date(scheduleAt).getTime() > Date.now()
+        ? "Scheduled for " + new Date(scheduleAt).toLocaleString()
+        : "Waiting in queue",
+      createdAt: Date.now(),
+      scheduledAt: scheduleAt ? new Date(scheduleAt).getTime() : undefined
     };
     setItems((current) => [item, ...current]);
     setNotice("Added to queue.");
-    setUrl(""); setFilename("");
+    setUrl(""); setFilename(""); setScheduleAt("");
   }
-  function remove(id: string) {
-    setItems((current) => current.filter((item) => item.id !== id || item.status === "Downloading"));
+  async function pause(item: Item) {
+    try {
+      await invoke("pause_download", { jobId: item.id });
+      setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, status: "Pausing", detail: "Pausing · saving checkpoint…" } : entry));
+    } catch (error) { setNotice(String(error)); }
   }
-  function retry(item: Item) { add(item.url, item.name, item.kind); }
+  function resume(item: Item) {
+    if (item.kind !== "direct") { retry(item); return; }
+    setItems((current) => current.map((entry) => entry.id === item.id
+      ? { ...entry, status: "Queued", error: undefined, detail: "Resume queued from saved checkpoint" }
+      : entry));
+  }
+  async function cancel(item: Item) {
+    if (item.kind !== "direct" || !item.targetPath) {
+      setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, status: "Cancelled", detail: "Cancelled" } : entry));
+      return;
+    }
+    try {
+      await invoke("cancel_download", { jobId: item.id, targetPath: item.targetPath });
+      setItems((current) => current.map((entry) => entry.id === item.id
+        ? { ...entry, status: "Cancelling", detail: "Cancelling and deleting partial file…" }
+        : entry));
+    } catch (error) { setNotice(String(error)); }
+  }
+  async function remove(id: string) {
+    const item = items.find((entry) => entry.id === id);
+    if (item?.targetPath && item.kind === "direct" && item.status !== "Completed") {
+      await invoke("cancel_download", { jobId: item.id, targetPath: item.targetPath }).catch(() => {});
+    }
+    setItems((current) => current.filter((entry) => entry.id !== id || entry.status === "Downloading" || entry.status === "Pausing"));
+  }
+  function retry(item: Item) {
+    if (item.kind === "direct" && item.targetPath) { resume(item); return; }
+    add(item.url, item.name, item.kind);
+  }
   function clearFinished() {
     setItems((current) => current.filter((item) => item.status !== "Completed"));
   }
@@ -231,8 +266,11 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
         {item.error && <div className="error-text">{item.error}</div>}
       </div>
       <div className="transfer-actions">
-        {(item.status === "Failed" || item.status === "Interrupted") && <button className="quiet-button" onClick={() => retry(item)}>Retry</button>}
-        {item.status !== "Downloading" && <button className="remove-button" title="Remove" aria-label="Remove" onClick={() => remove(item.id)}>×</button>}
+        {item.status === "Downloading" && item.kind === "direct" && <button className="quiet-button transfer-control" onClick={() => void pause(item)}>Pause</button>}
+        {item.status === "Paused" && <button className="quiet-button transfer-control" onClick={() => resume(item)}>Resume</button>}
+        {(item.status === "Failed" || item.status === "Interrupted") && <button className="quiet-button transfer-control" onClick={() => retry(item)}>{item.kind === "direct" && item.targetPath ? "Resume" : "Retry"}</button>}
+        {(item.status === "Downloading" || item.status === "Pausing" || item.status === "Paused" || item.status === "Failed" || item.status === "Interrupted" || item.status === "Queued") && item.kind === "direct" && <button className="quiet-button transfer-control" onClick={() => void cancel(item)}>Cancel</button>}
+        {item.status !== "Downloading" && item.status !== "Pausing" && item.status !== "Cancelling" && <button className="remove-button" title="Remove" aria-label="Remove" onClick={() => void remove(item.id)}>×</button>}
       </div>
     </article>)}</div>;
   }
@@ -268,6 +306,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
               <label htmlFor="download-url">Download URL</label>
               <input id="download-url" className="field" value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://example.com/archive.zip" />
               <div className="add-actions"><div className="filename-field"><label htmlFor="download-name">Save as <small>OPTIONAL</small></label><input id="download-name" className="field" value={filename} onChange={(event) => setFilename(event.target.value)} placeholder="Use original filename" /></div><button type="submit" className="primary-button">Add to queue ↗</button></div>
+              <div className="schedule-row"><label htmlFor="schedule-at">Start later <small>OPTIONAL</small></label><input id="schedule-at" type="datetime-local" className="field schedule-field" min={new Date(clock - new Date(clock).getTimezoneOffset() * 60000).toISOString().slice(0, 16)} value={scheduleAt} onChange={(event) => setScheduleAt(event.target.value)} /></div>
             </form>
             <div className="notice">{notice}</div>
             {url.trim() && <button className="text-link" onClick={() => { setVideoUrl(url.trim()); setPage("video"); }}>Inspect media qualities instead →</button>}
@@ -283,7 +322,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           <div className="summary queue-summary"><div><strong>{active}</strong><span>Active</span></div><div><strong>{queued}</strong><span>Waiting</span></div><div><strong>{done}</strong><span>Completed</span></div><div><strong>{attention}</strong><span>Failed</span></div></div>
           <div className="panel-heading"><div><h2>All transfers</h2><p>Jobs start automatically, up to your active transfer limit.</p></div><button className="quiet-button" onClick={clearFinished}>Clear finished</button></div>
           {transferList(ordered)}
-          <p className="footnote">Downloads that are interrupted by closing the app can be retried. Resuming partial files is not available in this build.</p>
+          <p className="footnote">Direct HTTP downloads keep a partial file on disk. Pause saves a checkpoint, Resume continues with HTTP Range when the server permits it, and startup automatically recovers saved direct-download checkpoints. Scheduled jobs start at their selected local time.</p>
         </section>}
 
         {page === "video" && <section className="panel video-panel">
@@ -307,6 +346,9 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           <div className="settings-section"><div><h2>Transfer behaviour</h2><p>Saved locally. Applies to new downloads.</p></div>
             <label className="setting-row"><span><strong>Connections per file</strong><small>Used when the server supports byte-range requests.</small></span><select className="select-field" value={connections} onChange={(event) => setConnections(Number(event.target.value))}>{[1, 2, 4, 8, 12, 16].map((n) => <option key={n} value={n}>{n} {n === 1 ? "connection" : "connections"}</option>)}</select></label>
             <label className="setting-row"><span><strong>Simultaneous downloads</strong><small>Maximum number of active queue items.</small></span><select className="select-field" value={parallel} onChange={(event) => setParallel(Number(event.target.value))}>{[1, 2, 3, 4].map((n) => <option key={n} value={n}>{n} {n === 1 ? "download" : "downloads"}</option>)}</select></label>
+            <label className="setting-row"><span><strong>Speed limit</strong><small>Applies to direct HTTP transfers, including active jobs. Zero means unlimited.</small></span><select className="select-field" value={speedLimit} onChange={(event) => setSpeedLimit(Number(event.target.value))}>
+              <option value={0}>Unlimited</option><option value={262144}>256 KB/s</option><option value={524288}>512 KB/s</option><option value={1048576}>1 MB/s</option><option value={2097152}>2 MB/s</option><option value={5242880}>5 MB/s</option><option value={10485760}>10 MB/s</option>
+            </select></label>
           </div>
           <div className="rule" />
           <div className="settings-section"><div><h2>Storage</h2><p>ThunderLoad uses a dedicated folder in your system Downloads directory.</p></div><div className="storage-row"><span>Downloads / ThunderLoad</span><button className="secondary-button" onClick={openFolder}>Open folder ↗</button></div></div>
@@ -330,7 +372,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
             <p className="footnote">Copy the ID from the browser's Extensions page. After registration, restart the browser and allow Native messaging in the ThunderLoad extension.</p>
           </div>
           <div className="rule" />
-          <div className="settings-section"><div><h2>About</h2><p>Local desktop transfer engine · Version 0.2.0</p></div><div className="about-line"><span>Supported media</span><strong>Direct files · HLS</strong></div><div className="about-line"><span>Not available yet</span><strong>Resume · DASH remux · Speed limit</strong></div></div>
+          <div className="settings-section"><div><h2>About</h2><p>Local desktop transfer engine · Version 0.2.0</p></div><div className="about-line"><span>Supported media</span><strong>Direct files · HLS</strong></div><div className="about-line"><span>Direct downloads</span><strong>Pause · Resume · Cancel · Speed limit · Schedule</strong></div><div className="about-line"><span>Still in development</span><strong>DASH remux · Multi-connection resume · HLS pause</strong></div></div>
         </section>}
 
         <footer className="app-footer"><span>ThunderLoad</span><span>Downloads stay on this device.</span></footer>
