@@ -10,4 +10,5 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["fs", "io-util", "io-std", "macros", "rt-multi-thread", "sync", "time"] }
 url = "2"
+quick-xml = "0.38.4"
 uuid = { version = "1", features = ["v4"] }
