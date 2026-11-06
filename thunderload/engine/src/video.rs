@@ -712,6 +712,21 @@ fn expand_dash_template(
     Ok(output)
 }
 
+fn join_dash_resource(base: &Url, reference: &str) -> Result<Url> {
+    let mut resolved = base.join(reference)?;
+    // Relative SegmentTemplate URLs commonly inherit auth tokens carried by
+    // a BaseURL query string. RFC-style path joining drops the base query, so
+    // propagate it only when the child resource did not provide its own query.
+    if reference.split('#').next().unwrap_or(reference).contains('?') == false {
+        if resolved.query().is_none() {
+            if let Some(query) = base.query() {
+                resolved.set_query(Some(query));
+            }
+        }
+    }
+    Ok(resolved)
+}
+
 fn resolve_dash_track(
     document: &DashDocument,
     adaptation: &DashAdaptation,
@@ -773,12 +788,12 @@ fn resolve_dash_track(
     let initialization_url = template.initialization.as_deref()
         .map(|value| expand_dash_template(value, representation, template.start_number.max(1), 0))
         .transpose()?
-        .map(|value| base.join(&value).map(|url| url.to_string()))
+        .map(|value| join_dash_resource(&base, &value).map(|url| url.to_string()))
         .transpose()?;
     let mut segment_urls = Vec::with_capacity(sequence.len());
     for (number, time) in sequence {
         let resolved = expand_dash_template(media_template, representation, number, time)?;
-        segment_urls.push(base.join(&resolved)?.to_string());
+        segment_urls.push(join_dash_resource(&base, &resolved)?.to_string());
     }
     Ok(DashResolvedTrack {
         mime_type: if representation.mime_type.is_empty() { adaptation.mime_type.clone() } else { representation.mime_type.clone() },
@@ -1336,7 +1351,7 @@ mod tests {
         let representation = &adaptation.representations[0];
         let track = resolve_dash_track(&document, adaptation, representation, manifest_url, false).unwrap();
         assert_eq!(track.segment_urls.len(), 2);
-        assert!(track.segment_urls[0].contains("token=a&quality=1/chunk-5.m4s"));
+        assert!(track.segment_urls[0].contains("/vod/chunk-5.m4s?token=a&quality=1"));
         assert!(track.initialization_url.unwrap().ends_with("init-main.mp4"));
     }
 
