@@ -73,6 +73,7 @@ async fn start_download(
     let job_for_task = job_id.clone();
     let app_for_task = app.clone();
     let limit = rate_limiter();
+    let task_target = target.clone();
     tauri::async_runtime::spawn(async move {
         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
         let progress_app = app_for_task.clone();
@@ -82,14 +83,14 @@ async fn start_download(
                 let _ = progress_app.emit("download-progress", json!({ "jobId": progress_id, "progress": progress }));
             }
         });
-        let result = download_url_resumable(&url, &target, None, control_rx, limit, progress_tx).await;
+        let result = download_url_resumable(&url, &task_target, None, control_rx, limit, progress_tx).await;
         match result {
             Ok(DownloadOutcome::Completed) => {
-                let _ = app_for_task.emit("download-complete", json!({ "jobId": job_for_task, "path": target.to_string_lossy() }));
+                let _ = app_for_task.emit("download-complete", json!({ "jobId": job_for_task, "path": task_target.to_string_lossy() }));
                 if let Ok(mut controls) = job_controls().lock() { controls.remove(&job_for_task); }
             }
             Ok(DownloadOutcome::Paused) => {
-                let _ = app_for_task.emit("download-paused", json!({ "jobId": job_for_task, "targetPath": target.to_string_lossy() }));
+                let _ = app_for_task.emit("download-paused", json!({ "jobId": job_for_task, "targetPath": task_target.to_string_lossy() }));
             }
             Ok(DownloadOutcome::Cancelled) => {
                 let _ = app_for_task.emit("download-cancelled", json!({ "jobId": job_for_task }));
