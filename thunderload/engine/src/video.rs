@@ -71,7 +71,19 @@ pub async fn inspect_video(url: &str, referer: Option<&str>) -> Result<Vec<Video
     let client = client()?;
     let mut request = client.head(url);
     if let Some(referrer) = referer { request = request.header(reqwest::header::REFERER, referrer); }
-    let response = request.send().await.context("Could not inspect the URL response headers")?;
+    // A number of CDNs block HEAD even when normal downloads are allowed.
+    // Retry the metadata probe with a one-byte range GET before rejecting the URL.
+    let response = match request.send().await {
+        Ok(response) if response.status().is_success() => response,
+        _ => {
+            let mut probe = client.get(url).header(reqwest::header::RANGE, "bytes=0-0");
+            if let Some(referrer) = referer { probe = probe.header(reqwest::header::REFERER, referrer); }
+            probe.send().await
+                .context("Could not inspect the URL response headers with HEAD or a one-byte GET")?
+                .error_for_status()
+                .context("The server rejected both media inspection requests")?
+        }
+    };
     let content_type = response.headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
