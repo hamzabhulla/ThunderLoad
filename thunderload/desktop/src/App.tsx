@@ -124,7 +124,7 @@ export default function App() {
           source: "native"
         }));
         setItems((current) => {
-          const merged = new Map(current.map((item) => [item.id, item]));
+          const merged = new Map(current.filter((item) => item.source !== "native").map((item) => [item.id, item]));
           for (const item of external) merged.set(item.id, item);
           return Array.from(merged.values()).sort((a, b) => b.createdAt - a.createdAt);
         });
