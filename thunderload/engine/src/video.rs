@@ -7,6 +7,7 @@ use url::Url;
 use uuid::Uuid;
 use crate::download::{default_download_dir, reserve_download_path, safe_filename, DownloadProgress};
 use crate::managed::{ManagedOutcome, TransferControl};
+use crate::dash::inspect_dash;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -17,6 +18,7 @@ pub struct VideoVariant {
     pub height: Option<u32>,
     pub bandwidth: Option<u64>,
     pub url: String,
+    pub representation_id: Option<String>,
     pub downloadable: bool,
     pub note: Option<String>,
 }
@@ -51,21 +53,12 @@ pub async fn inspect_video(url: &str, referer: Option<&str>) -> Result<Vec<Video
         let reason = unsupported_hls_reason(&body);
         return Ok(vec![VideoVariant {
             kind: "hls".into(), quality: "Adaptive playlist".into(), width: None, height: None,
-            bandwidth: None, url: url.to_string(), downloadable: reason.is_none(),
+            bandwidth: None, url: url.to_string(), representation_id: None, downloadable: reason.is_none(),
             note: reason.or_else(|| Some("Unencrypted HLS playlist".into())),
         }]);
     }
     if lower.ends_with(".mpd") {
-        let body = fetch_text(url, referer).await?;
-        let reps = parse_dash_representations(&body, url);
-        if reps.is_empty() {
-            return Ok(vec![VideoVariant {
-                kind: "dash".into(), quality: "Adaptive DASH".into(), width: None,
-                height: None, bandwidth: None, url: url.into(), downloadable: false,
-                note: Some("DASH manifest detected; DASH segment assembly is not available".into())
-            }]);
-        }
-        return Ok(reps);
+        return dash_variants(url, referer).await;
     }
 
     // Never label an arbitrary webpage (for example a YouTube watch page) as a file.
@@ -113,13 +106,12 @@ pub async fn inspect_video(url: &str, referer: Option<&str>) -> Result<Vec<Video
         let reason = unsupported_hls_reason(&body);
         return Ok(vec![VideoVariant {
             kind: "hls".into(), quality: "Adaptive playlist".into(), width: None, height: None,
-            bandwidth: None, url: url.to_string(), downloadable: reason.is_none(),
+            bandwidth: None, url: url.to_string(), representation_id: None, downloadable: reason.is_none(),
             note: reason.or_else(|| Some("Unencrypted HLS playlist".into())),
         }]);
     }
     if content_type.contains("dash+xml") {
-        let body = fetch_text(url, referer).await?;
-        return Ok(parse_dash_representations(&body, url));
+        return dash_variants(url, referer).await;
     }
     if content_type.starts_with("video/") || content_type.starts_with("audio/")
         || content_type == "application/octet-stream" || content_type == "application/zip"
@@ -130,6 +122,21 @@ pub async fn inspect_video(url: &str, referer: Option<&str>) -> Result<Vec<Video
     Err(anyhow!(
         "This URL is a webpage, not a direct media file. Paste an MP4/audio URL or an HLS playlist. Page extraction is not available for this source."
     ))
+}
+
+async fn dash_variants(url: &str, referer: Option<&str>) -> Result<Vec<VideoVariant>> {
+    let parsed = inspect_dash(url, referer).await?;
+    Ok(parsed.into_iter().map(|variant| VideoVariant {
+        kind: "dash".into(),
+        quality: variant.quality,
+        width: variant.width,
+        height: variant.height,
+        bandwidth: variant.bandwidth,
+        url: url.to_string(),
+        representation_id: Some(variant.id),
+        downloadable: variant.downloadable,
+        note: variant.note,
+    }).collect())
 }
 
 async fn fetch_text(url: &str, referer: Option<&str>) -> Result<String> {
@@ -201,7 +208,7 @@ async fn annotate_hls_variants(variants: &mut [VideoVariant], referer: Option<&s
 fn direct_variant(url: &str) -> VideoVariant {
     VideoVariant {
         kind: "direct".into(), quality: "Original file".into(), width: None, height: None,
-        bandwidth: None, url: url.into(), downloadable: true,
+        bandwidth: None, url: url.into(), representation_id: None, downloadable: true,
         note: Some("Direct media or file URL".into()),
     }
 }
@@ -249,7 +256,7 @@ fn parse_hls_master(body: &str, base: &Url) -> Result<Vec<VideoVariant>> {
                 let resolved = base.join(line)?.to_string();
                 let quality = height.map(|h| format!("{h}p")).unwrap_or_else(|| "Adaptive".into());
                 out.push(VideoVariant { kind: "hls".into(), quality, width, height, bandwidth,
-                    url: resolved, downloadable: true, note: Some("HLS variant".into()) });
+                    url: resolved, representation_id: None, downloadable: true, note: Some("HLS variant".into()) });
             }
         }
     }
@@ -277,7 +284,7 @@ fn parse_dash_representations(body: &str, manifest_url: &str) -> Vec<VideoVarian
         let bandwidth = xml_attr(attrs, "bandwidth").and_then(|v| v.parse().ok());
         let quality = height.map(|h| format!("{h}p")).unwrap_or_else(|| id.clone());
         out.push(VideoVariant { kind: "dash".into(), quality, width, height, bandwidth,
-            url: manifest_url.to_string(), downloadable: false,
+            url: manifest_url.to_string(), representation_id: Some(id.clone()), downloadable: false,
             note: Some("Quality detected; DASH segment assembly is not enabled yet".into()) });
     }
     out.sort_by(|a, b| b.height.unwrap_or(0).cmp(&a.height.unwrap_or(0)));

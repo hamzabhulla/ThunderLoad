@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::mpsc;
 use thunderload_engine::{
-    create_transfer_control, default_download_dir, download_hls_managed, managed_download,
+    create_transfer_control, default_download_dir, download_dash_managed, download_hls_managed, managed_download,
     reserve_download_path, ManagedOutcome, TransferControlHandle,
 };
 
@@ -36,6 +36,7 @@ pub struct JobRecord {
     pub created_at: u64,
     pub updated_at: u64,
     pub scheduled_at: Option<u64>,
+    pub representation_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -126,6 +127,7 @@ pub async fn enqueue_download(
     kind: String,
     connections: usize,
     scheduled_at: Option<u64>,
+    representation_id: Option<String>,
 ) -> Result<JobRecord, String> {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err("Only HTTP and HTTPS download URLs are supported".into());
@@ -134,10 +136,10 @@ pub async fn enqueue_download(
     if id.is_empty() {
         return Err("Invalid job ID".into());
     }
-    if !matches!(kind.as_str(), "direct" | "hls") {
+    if !matches!(kind.as_str(), "direct" | "hls" | "dash") {
         return Err("Unsupported download type".into());
     }
-    let name = thunderload_engine::safe_filename(&filename, if kind == "hls" { "video.ts" } else { "download.bin" });
+    let name = thunderload_engine::safe_filename(&filename, if kind == "hls" { "video.ts" } else if kind == "dash" { "video.mp4" } else { "download.bin" });
     let directory = default_download_dir();
     let target = reserve_download_path(&directory.join(&name)).await.map_err(|error| error.to_string())?;
     let timestamp = now_ms();
@@ -157,6 +159,7 @@ pub async fn enqueue_download(
         created_at: timestamp,
         updated_at: timestamp,
         scheduled_at,
+        representation_id,
     };
     {
         let mut jobs = state.jobs.lock().map_err(|_| "Job store is unavailable".to_string())?;
@@ -336,25 +339,17 @@ fn spawn_worker(app: AppHandle, state: JobState, mut job: JobRecord) {
             }
         });
 
-        let result = if job.kind == "hls" {
-            download_hls_managed(
-                &job.url,
-                Path::new(&job.target_path),
-                &job.id,
-                None,
-                control,
-                progress_tx,
-            ).await
-        } else {
-            managed_download(
-                &job.url,
-                Path::new(&job.target_path),
-                &job.id,
-                job.connections,
-                None,
-                control,
-                progress_tx,
-            ).await
+        let result = match job.kind.as_str() {
+            "hls" => download_hls_managed(
+                &job.url, Path::new(&job.target_path), &job.id, None, control, progress_tx,
+            ).await,
+            "dash" => download_dash_managed(
+                &job.url, Path::new(&job.target_path), &job.id,
+                job.representation_id.as_deref(), None, control, progress_tx,
+            ).await,
+            _ => managed_download(
+                &job.url, Path::new(&job.target_path), &job.id, job.connections, None, control, progress_tx,
+            ).await,
         };
         let _ = progress_task.await;
 
@@ -442,6 +437,7 @@ pub async fn enqueue_download_command(
     kind: String,
     connections: usize,
     scheduled_at: Option<u64>,
+    representation_id: Option<String>,
 ) -> Result<JobRecord, String> {
     enqueue_download(app, state, job_id, url, filename, kind, connections, scheduled_at).await
 }
