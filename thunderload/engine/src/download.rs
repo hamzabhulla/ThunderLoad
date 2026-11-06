@@ -326,3 +326,196 @@ mod tests {
         assert_eq!(safe_filename("   ", "fallback"), "fallback");
     }
 }
+
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadControl {
+    Running,
+    Paused,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadOutcome {
+    Completed,
+    Paused,
+    Cancelled,
+}
+
+/// Atomically reserves a final filename. The empty file acts as a reservation
+/// until the completed .part file is atomically moved into place.
+pub async fn reserve_download_path(path: &Path) -> Result<PathBuf> {
+    next_available_path(path).await
+}
+
+/// Stable sidecar used by the desktop queue across process restarts.
+pub fn partial_download_path(target: &Path) -> PathBuf {
+    let extension = target.extension().and_then(|value| value.to_str()).unwrap_or("file");
+    target.with_extension(format!("{extension}.thunderload.part"))
+}
+
+fn parse_resume_content_range(value: &str, expected_start: u64) -> Result<Option<u64>> {
+    let range = value.strip_prefix("bytes ")
+        .ok_or_else(|| anyhow!("Server returned an invalid Content-Range header"))?;
+    let (span, total) = range.split_once('/')
+        .ok_or_else(|| anyhow!("Server returned an invalid Content-Range header"))?;
+    let (start, end) = span.split_once('-')
+        .ok_or_else(|| anyhow!("Server returned an invalid Content-Range header"))?;
+    let start: u64 = start.parse().context("Invalid Content-Range start")?;
+    let end: u64 = end.parse().context("Invalid Content-Range end")?;
+    if start != expected_start || end < start {
+        return Err(anyhow!("Server resumed at an unexpected byte offset"));
+    }
+    if total == "*" { return Ok(None); }
+    let total: u64 = total.parse().context("Invalid Content-Range total")?;
+    if end >= total { return Err(anyhow!("Content-Range exceeds the resource length")); }
+    Ok(Some(total))
+}
+
+/// Sequential, checkpointed transfer used by the desktop queue. Unlike the
+/// parallel fast path, this writes one stable partial file so pause/resume is
+/// deterministic, including after an application restart.
+pub async fn download_url_resumable(
+    url: &str,
+    target: &Path,
+    referer: Option<&str>,
+    mut control: tokio::sync::watch::Receiver<DownloadControl>,
+    speed_limit: Arc<AtomicU64>,
+    progress_tx: mpsc::UnboundedSender<DownloadProgress>,
+) -> Result<DownloadOutcome> {
+    if !matches!(url::Url::parse(url)?.scheme(), "http" | "https") {
+        return Err(anyhow!("Only HTTP and HTTPS download URLs are supported"));
+    }
+    prepare_parent(target).await?;
+    let part = partial_download_path(target);
+    let offset = fs::metadata(&part).await.map(|meta| meta.len()).unwrap_or(0);
+
+    if *control.borrow() == DownloadControl::Cancelled {
+        let _ = fs::remove_file(&part).await;
+        let _ = fs::remove_file(target).await;
+        return Ok(DownloadOutcome::Cancelled);
+    }
+    if *control.borrow() == DownloadControl::Paused {
+        return Ok(DownloadOutcome::Paused);
+    }
+
+    let client = client()?;
+    let mut head = client.head(url);
+    if let Some(referrer) = referer { head = head.header(header::REFERER, referrer); }
+    let head_response = head.send().await.ok();
+    let server_total = head_response.as_ref()
+        .filter(|response| response.status().is_success())
+        .and_then(|response| response.content_length());
+
+    let mut request = client.get(url);
+    if offset > 0 { request = request.header(header::RANGE, format!("bytes={offset}-")); }
+    if let Some(referrer) = referer { request = request.header(header::REFERER, referrer); }
+    let response = request.send().await.context("Could not connect to the download server")?;
+    if !response.status().is_success() && response.status() != StatusCode::PARTIAL_CONTENT {
+        return Err(anyhow!("Download server returned HTTP {}", response.status()));
+    }
+
+    let append = if offset > 0 && response.status() == StatusCode::PARTIAL_CONTENT {
+        let range = response.headers().get(header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| anyhow!("Server omitted Content-Range while resuming"))?;
+        parse_resume_content_range(range, offset)?;
+        true
+    } else {
+        // The server ignored Range or no checkpoint exists. Restart from byte 0
+        // using this same response rather than appending a full copy to the part.
+        false
+    };
+
+    let start_offset = if append { offset } else { 0 };
+    if !append && offset > 0 {
+        let _ = fs::remove_file(&part).await;
+    }
+    let total = if append {
+        response.headers().get(header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| parse_resume_content_range(value, offset).ok().flatten())
+            .or(server_total)
+    } else {
+        response.content_length().or(server_total)
+    };
+
+    let mut options = fs::OpenOptions::new();
+    options.create(true).write(true);
+    if append { options.append(true); } else { options.truncate(true); }
+    let mut file = options.open(&part).await?;
+    let mut stream = response.bytes_stream();
+    let started = Instant::now();
+    let mut downloaded = start_offset;
+    let mut last_report = Instant::now();
+
+    loop {
+        if *control.borrow() == DownloadControl::Paused {
+            file.flush().await?;
+            let _ = progress_tx.send(DownloadProgress {
+                downloaded, total, percent: total.map(|size| if size == 0 { 0.0 } else { downloaded as f64 * 100.0 / size as f64 }),
+                phase: "paused".into()
+            });
+            return Ok(DownloadOutcome::Paused);
+        }
+        if *control.borrow() == DownloadControl::Cancelled {
+            file.flush().await?;
+            drop(file);
+            let _ = fs::remove_file(&part).await;
+            let _ = fs::remove_file(target).await;
+            return Ok(DownloadOutcome::Cancelled);
+        }
+
+        let next = tokio::select! {
+            value = stream.next() => value,
+            changed = control.changed() => {
+                if changed.is_ok() { continue; }
+                None
+            }
+        };
+        let Some(chunk_result) = next else { break; };
+        let chunk = match chunk_result {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                let _ = file.flush().await;
+                return Err(error).context("Network interrupted; partial file has been preserved for Resume");
+            }
+        };
+        file.write_all(&chunk).await?;
+        downloaded = downloaded.saturating_add(chunk.len() as u64);
+
+        let limit = speed_limit.load(Ordering::Relaxed);
+        if limit > 0 {
+            let expected = std::time::Duration::from_secs_f64(downloaded.saturating_sub(start_offset) as f64 / limit as f64);
+            let wait = expected.saturating_sub(started.elapsed());
+            if !wait.is_zero() {
+                tokio::select! {
+                    _ = tokio::time::sleep(wait) => {},
+                    changed = control.changed() => { if changed.is_err() { /* host is shutting down */ } }
+                }
+            }
+        }
+
+        if last_report.elapsed() >= std::time::Duration::from_millis(160) {
+            let percent = total.filter(|size| *size > 0)
+                .map(|size| downloaded as f64 * 100.0 / size as f64);
+            let _ = progress_tx.send(DownloadProgress {
+                downloaded, total, percent, phase: "downloading".into()
+            });
+            last_report = Instant::now();
+        }
+    }
+
+    file.flush().await?;
+    drop(file);
+    if let Some(expected_total) = total {
+        if downloaded != expected_total {
+            return Err(anyhow!("Download ended at {downloaded} bytes, but the server reported {expected_total}. Partial data is preserved; Resume can retry."));
+        }
+    }
+    replace_file(&part, target).await?;
+    let _ = progress_tx.send(DownloadProgress {
+        downloaded, total: total.or(Some(downloaded)), percent: Some(100.0), phase: "complete".into()
+    });
+    Ok(DownloadOutcome::Completed)
+}
