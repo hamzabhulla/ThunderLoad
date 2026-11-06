@@ -7,5 +7,5 @@ edition = "2021"
 anyhow = "1"
 serde_json = "1"
 thunderload-engine = { path = "../engine" }
-tokio = { version = "1", features = ["io-util", "io-std", "macros", "rt-multi-thread", "sync", "fs"] }
+tokio = { version = "1", features = ["io-util", "io-std", "macros", "rt-multi-thread", "sync", "fs", "time"] }
 uuid = { version = "1", features = ["v4"] }
