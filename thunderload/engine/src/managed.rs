@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use reqwest::{header, Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::{
