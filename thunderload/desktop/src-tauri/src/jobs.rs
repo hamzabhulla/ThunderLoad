@@ -9,7 +9,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, State};
 use tokio::sync::mpsc;
 use thunderload_engine::{
     create_transfer_control, default_download_dir, download_hls_managed, managed_download,
@@ -304,7 +304,7 @@ fn spawn_worker(app: AppHandle, state: JobState, mut job: JobRecord) {
     }
 
     tauri::async_runtime::spawn(async move {
-        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<thunderload_engine::DownloadProgress>();
         let progress_app = app.clone();
         let progress_state = state.clone();
         let progress_id = id.clone();

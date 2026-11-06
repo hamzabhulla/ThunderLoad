@@ -1,6 +1,6 @@
 use std::{path::PathBuf, process::Command};
 use serde_json::json;
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 use thunderload_engine::{default_download_dir, inspect_video};
 mod jobs;
 use jobs::JobState;
