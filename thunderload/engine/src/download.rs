@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;
 use reqwest::{header, Client, StatusCode};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{path::{Path, PathBuf}, sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex}, time::Instant};
 use tokio::{fs, io::AsyncWriteExt, sync::{mpsc, Mutex as AsyncMutex}};
 use uuid::Uuid;
@@ -400,6 +400,67 @@ pub fn partial_download_path(target: &Path) -> PathBuf {
     target.with_extension(format!("{extension}.thunderload.part"))
 }
 
+pub fn partial_download_metadata_path(target: &Path) -> PathBuf {
+    let extension = target.extension().and_then(|value| value.to_str()).unwrap_or("file");
+    target.with_extension(format!("{extension}.thunderload.part.meta.json"))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ResumeMetadata {
+    url: String,
+    etag: Option<String>,
+    last_modified: Option<String>,
+    total: Option<u64>,
+}
+
+fn header_string(response: &reqwest::Response, name: header::HeaderName) -> Option<String> {
+    response.headers().get(name).and_then(|value| value.to_str().ok()).map(str::to_owned)
+}
+
+fn resume_identity_matches(
+    saved: &ResumeMetadata,
+    url: &str,
+    etag: Option<&str>,
+    last_modified: Option<&str>,
+    total: Option<u64>,
+) -> bool {
+    if saved.url != url { return false; }
+    if let Some(old) = saved.etag.as_deref() {
+        if etag != Some(old) { return false; }
+    } else if let Some(old) = saved.last_modified.as_deref() {
+        if last_modified != Some(old) { return false; }
+    } else {
+        return false;
+    }
+    match (saved.total, total) {
+        (Some(old), Some(current)) => old == current,
+        _ => true,
+    }
+}
+
+async fn read_resume_metadata(path: &Path) -> Option<ResumeMetadata> {
+    let bytes = fs::read(path).await.ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+async fn write_resume_metadata(path: &Path, metadata: &ResumeMetadata) -> Result<()> {
+    let temporary = path.with_extension("meta.tmp");
+    let bytes = serde_json::to_vec(metadata)?;
+    fs::write(&temporary, bytes).await?;
+    if fs::try_exists(path).await.unwrap_or(false) {
+        fs::remove_file(path).await?;
+    }
+    fs::rename(&temporary, path).await
+        .with_context(|| format!("Could not save resume metadata at {}", path.display()))?;
+    Ok(())
+}
+
+async fn remove_resume_files(part: &Path, metadata: &Path, target: &Path) {
+    let _ = fs::remove_file(part).await;
+    let _ = fs::remove_file(metadata).await;
+    let _ = fs::remove_file(target).await;
+}
+
 fn parse_resume_content_range(value: &str, expected_start: u64) -> Result<Option<u64>> {
     let range = value.strip_prefix("bytes ")
         .ok_or_else(|| anyhow!("Server returned an invalid Content-Range header"))?;
@@ -434,15 +495,34 @@ pub async fn download_url_resumable(
     }
     prepare_parent(target).await?;
     let part = partial_download_path(target);
-    let offset = fs::metadata(&part).await.map(|meta| meta.len()).unwrap_or(0);
+    let metadata_path = partial_download_metadata_path(target);
+    let mut offset = fs::metadata(&part).await.map(|meta| meta.len()).unwrap_or(0);
 
     if *control.borrow() == DownloadControl::Cancelled {
-        let _ = fs::remove_file(&part).await;
-        let _ = fs::remove_file(target).await;
+        remove_resume_files(&part, &metadata_path, target).await;
         return Ok(DownloadOutcome::Cancelled);
     }
     if *control.borrow() == DownloadControl::Paused {
         return Ok(DownloadOutcome::Paused);
+    }
+
+    let mut saved_metadata = if offset > 0 {
+        read_resume_metadata(&metadata_path).await
+    } else {
+        None
+    };
+    // A partial file without a matching strong validator is unsafe to append:
+    // the remote object may have changed since the checkpoint was written.
+    if offset > 0 {
+        let valid_checkpoint = saved_metadata.as_ref().is_some_and(|saved| {
+            saved.url == url && (saved.etag.is_some() || saved.last_modified.is_some())
+        });
+        if !valid_checkpoint {
+            let _ = fs::remove_file(&part).await;
+            let _ = fs::remove_file(&metadata_path).await;
+            offset = 0;
+            saved_metadata = None;
+        }
     }
 
     let client = client()?;
@@ -452,31 +532,69 @@ pub async fn download_url_resumable(
     let server_total = head_response.as_ref()
         .filter(|response| response.status().is_success())
         .and_then(|response| response.content_length());
+    let head_etag = head_response.as_ref()
+        .and_then(|response| response.headers().get(header::ETAG))
+        .and_then(|value| value.to_str().ok()).map(str::to_owned);
+    let head_modified = head_response.as_ref()
+        .and_then(|response| response.headers().get(header::LAST_MODIFIED))
+        .and_then(|value| value.to_str().ok()).map(str::to_owned);
 
     let mut request = client.get(url);
-    if offset > 0 { request = request.header(header::RANGE, format!("bytes={offset}-")); }
+    if offset > 0 {
+        request = request.header(header::RANGE, format!("bytes={offset}-"));
+        if let Some(saved) = &saved_metadata {
+            if let Some(etag) = saved.etag.as_deref() {
+                request = request.header(header::IF_RANGE, etag);
+            } else if let Some(last_modified) = saved.last_modified.as_deref() {
+                request = request.header(header::IF_RANGE, last_modified);
+            }
+        }
+    }
     if let Some(referrer) = referer { request = request.header(header::REFERER, referrer); }
-    let response = request.send().await.context("Could not connect to the download server")?;
+    let mut response = request.send().await.context("Could not connect to the download server")?;
     if !response.status().is_success() && response.status() != StatusCode::PARTIAL_CONTENT {
         return Err(anyhow!("Download server returned HTTP {}", response.status()));
     }
 
-    let append = if offset > 0 && response.status() == StatusCode::PARTIAL_CONTENT {
+    let mut append = offset > 0 && response.status() == StatusCode::PARTIAL_CONTENT;
+    if append {
         let range = response.headers().get(header::CONTENT_RANGE)
             .and_then(|value| value.to_str().ok())
             .ok_or_else(|| anyhow!("Server omitted Content-Range while resuming"))?;
         parse_resume_content_range(range, offset)?;
-        true
-    } else {
-        // The server ignored Range or no checkpoint exists. Restart from byte 0
-        // using this same response rather than appending a full copy to the part.
-        false
-    };
+        let response_etag = response.headers().get(header::ETAG)
+            .and_then(|value| value.to_str().ok());
+        let response_modified = response.headers().get(header::LAST_MODIFIED)
+            .and_then(|value| value.to_str().ok());
+        let response_total = response.headers().get(header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| parse_resume_content_range(value, offset).ok().flatten());
+        let still_same_resource = saved_metadata.as_ref().is_some_and(|saved| {
+            resume_identity_matches(saved, url, response_etag, response_modified, response_total)
+        });
+        if !still_same_resource {
+            // If-Range should make a changed resource return 200. Be defensive:
+            // if a server nevertheless returns a mismatched 206, discard the
+            // old prefix and issue a fresh full GET instead of joining versions.
+            let mut restart = client.get(url);
+            if let Some(referrer) = referer { restart = restart.header(header::REFERER, referrer); }
+            response = restart.send().await.context("Could not restart a changed download")?.error_for_status()?;
+            append = false;
+            let _ = fs::remove_file(&part).await;
+        }
+    } else if offset > 0 {
+        // Server ignored Range or If-Range failed because the object changed.
+        // Restart from byte zero using this full response.
+        let _ = fs::remove_file(&part).await;
+    } else if response.status() == StatusCode::PARTIAL_CONTENT {
+        return Err(anyhow!("Server returned partial content without a requested byte range"));
+    }
 
     let start_offset = if append { offset } else { 0 };
-    if !append && offset > 0 {
-        let _ = fs::remove_file(&part).await;
-    }
+    let response_etag = response.headers().get(header::ETAG)
+        .and_then(|value| value.to_str().ok()).map(str::to_owned).or(head_etag);
+    let response_modified = response.headers().get(header::LAST_MODIFIED)
+        .and_then(|value| value.to_str().ok()).map(str::to_owned).or(head_modified);
     let total = if append {
         response.headers().get(header::CONTENT_RANGE)
             .and_then(|value| value.to_str().ok())
@@ -485,6 +603,15 @@ pub async fn download_url_resumable(
     } else {
         response.content_length().or(server_total)
     };
+
+    let current_metadata = ResumeMetadata {
+        url: url.to_owned(),
+        etag: response_etag,
+        last_modified: response_modified,
+        total,
+    };
+    write_resume_metadata(&metadata_path, &current_metadata).await?;
+    saved_metadata = Some(current_metadata);
 
     let mut options = fs::OpenOptions::new();
     options.create(true).write(true);
@@ -506,8 +633,7 @@ pub async fn download_url_resumable(
         if *control.borrow() == DownloadControl::Cancelled {
             file.flush().await?;
             drop(file);
-            let _ = fs::remove_file(&part).await;
-            let _ = fs::remove_file(target).await;
+            remove_resume_files(&part, &metadata_path, target).await;
             return Ok(DownloadOutcome::Cancelled);
         }
 
@@ -555,12 +681,13 @@ pub async fn download_url_resumable(
         }
     }
     replace_file(&part, target).await?;
+    let _ = fs::remove_file(&metadata_path).await;
     let _ = progress_tx.send(DownloadProgress {
         downloaded, total: total.or(Some(downloaded)), percent: Some(100.0), phase: "complete".into()
     });
+    let _ = saved_metadata;
     Ok(DownloadOutcome::Completed)
 }
-
 
 #[cfg(test)]
 mod resumable_tests {
@@ -598,5 +725,38 @@ mod rate_limit_tests {
         assert!(second > first);
         limiter.set_limit(0);
         assert_eq!(limiter.reserve(1_000_000).await, std::time::Duration::ZERO);
+    }
+}
+
+
+
+#[cfg(test)]
+mod resume_metadata_tests {
+    use super::{resume_identity_matches, ResumeMetadata};
+
+    #[test]
+    fn resume_refuses_a_changed_url_or_etag() {
+        let saved = ResumeMetadata {
+            url: "https://example.test/file.bin".into(),
+            etag: Some("\"v1\"".into()),
+            last_modified: None,
+            total: Some(1000),
+        };
+        assert!(resume_identity_matches(&saved, "https://example.test/file.bin", Some("\"v1\""), None, Some(1000)));
+        assert!(!resume_identity_matches(&saved, "https://example.test/other.bin", Some("\"v1\""), None, Some(1000)));
+        assert!(!resume_identity_matches(&saved, "https://example.test/file.bin", Some("\"v2\""), None, Some(1000)));
+        assert!(!resume_identity_matches(&saved, "https://example.test/file.bin", Some("\"v1\""), None, Some(1200)));
+    }
+
+    #[test]
+    fn last_modified_is_accepted_when_etag_is_not_available() {
+        let saved = ResumeMetadata {
+            url: "https://example.test/file.bin".into(),
+            etag: None,
+            last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".into()),
+            total: None,
+        };
+        assert!(resume_identity_matches(&saved, "https://example.test/file.bin", None, Some("Wed, 21 Oct 2015 07:28:00 GMT"), None));
+        assert!(!resume_identity_matches(&saved, "https://example.test/file.bin", None, Some("Thu, 22 Oct 2015 07:28:00 GMT"), None));
     }
 }
