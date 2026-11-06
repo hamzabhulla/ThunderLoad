@@ -1,5 +1,5 @@
 use std::{collections::HashMap, path::PathBuf, process::Command, sync::{Arc, Mutex, OnceLock}};
-use serde_json::json;
+use serde_json::{json, Value};
 use tauri::{Emitter, Manager};
 use thunderload_engine::{default_download_dir, download_hls, download_url_resumable, inspect_video, partial_download_path, reserve_download_path, safe_filename, DownloadControl, DownloadOutcome, GlobalRateLimiter};
 use tokio::sync::{mpsc, watch};
@@ -195,6 +195,37 @@ async fn register_native_host(
 }
 
 #[tauri::command]
+async fn get_native_downloads() -> Result<Vec<Value>, String> {
+    let directory = default_download_dir().join(".native-jobs");
+    if !tokio::fs::try_exists(&directory).await.unwrap_or(false) {
+        return Ok(Vec::new());
+    }
+    let mut entries = tokio::fs::read_dir(&directory).await.map_err(|error| error.to_string())?;
+    let mut jobs = Vec::new();
+    while let Some(entry) = entries.next_entry().await.map_err(|error| error.to_string())? {
+        if entry.path().extension().and_then(|value| value.to_str()) != Some("json") { continue; }
+        let content = match tokio::fs::read_to_string(entry.path()).await {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+        if let Ok(job) = serde_json::from_str::<Value>(&content) { jobs.push(job); }
+    }
+    jobs.sort_by_key(|job| std::cmp::Reverse(job.get("createdAt").and_then(Value::as_u64).unwrap_or(0)));
+    Ok(jobs)
+}
+
+#[tauri::command]
+async fn dismiss_native_download(job_id: String) -> Result<(), String> {
+    let id = safe_filename(&job_id, "job");
+    let path = default_download_dir().join(".native-jobs").join(format!("{id}.json"));
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[tauri::command]
 async fn open_download_folder() -> Result<(), String> {
     let folder = default_download_dir();
     std::fs::create_dir_all(&folder).map_err(|error| error.to_string())?;
@@ -209,7 +240,7 @@ async fn open_download_folder() -> Result<(), String> {
 
 fn main() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![inspect_video_url, start_download, pause_download, cancel_download, set_speed_limit, start_hls_download, register_native_host, open_download_folder])
+        .invoke_handler(tauri::generate_handler![inspect_video_url, start_download, pause_download, cancel_download, set_speed_limit, start_hls_download, get_native_downloads, dismiss_native_download, register_native_host, open_download_folder])
         .run(tauri::generate_context!())
         .expect("error while running ThunderLoad desktop app");
 }
