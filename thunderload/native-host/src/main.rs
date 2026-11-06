@@ -113,7 +113,7 @@ async fn main() -> Result<()> {
                 let url = message.get("url").and_then(Value::as_str).unwrap_or("").to_string();
                 let filename = output_name(message.get("filename"), "download.bin");
                 let job_id = uuid::Uuid::new_v4().to_string();
-                let target = default_download_dir().join(filename);
+                let target = default_download_dir().join(&filename);
                 let referer = message.get("referer").and_then(Value::as_str).map(str::to_string);
                 let tx = outgoing_tx.clone();
                 let mut state = native_job_state(&job_id, &filename, &url, "direct");
