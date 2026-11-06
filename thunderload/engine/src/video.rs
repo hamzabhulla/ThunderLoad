@@ -550,6 +550,7 @@ pub async fn download_hls_managed(
     let parent = target.parent().ok_or_else(|| anyhow!("Target path has no parent directory"))?;
     fs::create_dir_all(parent).await?;
     let work_dir = parent.join(format!(".thunderload-hls-job-{safe_id}"));
+    let work_dir_existed = fs::try_exists(&work_dir).await.unwrap_or(false);
     fs::create_dir_all(&work_dir).await?;
     let metadata_path = work_dir.join("hls.json");
     let old_metadata: Option<ManagedHlsMetadata> = fs::read(&metadata_path).await.ok()
@@ -560,7 +561,7 @@ pub async fn download_hls_managed(
             && old.segment_urls == segment_urls
             && old.extension == extension
     });
-    if old_metadata.is_some() && !matching {
+    if work_dir_existed && !matching {
         fs::remove_dir_all(&work_dir).await?;
         fs::create_dir_all(&work_dir).await?;
     }

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::mpsc;
 use thunderload_engine::{
-    create_transfer_control, default_download_dir, download_hls, managed_download,
+    create_transfer_control, default_download_dir, download_hls_managed, managed_download,
     reserve_download_path, ManagedOutcome, TransferControlHandle,
 };
 
@@ -274,7 +274,16 @@ fn cleanup_job_files(job: &JobRecord) {
     let safe_id = safe_job_id(&job.id);
     if let Some(parent) = target.parent() {
         let work = parent.join(format!(".thunderload-job-{safe_id}"));
+        let hls_work = parent.join(format!(".thunderload-hls-job-{safe_id}"));
+        if let Ok(bytes) = std::fs::read(hls_work.join("hls.json")) {
+            if let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                if let Some(path) = metadata.get("targetPath").and_then(serde_json::Value::as_str) {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
         let _ = std::fs::remove_dir_all(work);
+        let _ = std::fs::remove_dir_all(hls_work);
     }
     let _ = std::fs::remove_file(target);
 }
@@ -328,8 +337,14 @@ fn spawn_worker(app: AppHandle, state: JobState, mut job: JobRecord) {
         });
 
         let result = if job.kind == "hls" {
-            download_hls(&job.url, &job.filename, None, progress_tx).await
-                .map(|path| ManagedOutcome::Completed(path))
+            download_hls_managed(
+                &job.url,
+                Path::new(&job.target_path),
+                &job.id,
+                None,
+                control,
+                progress_tx,
+            ).await
         } else {
             managed_download(
                 &job.url,
@@ -350,7 +365,8 @@ fn spawn_worker(app: AppHandle, state: JobState, mut job: JobRecord) {
                 record.detail = format!("Saved · {}", path.display());
                 record.error = None;
             }),
-            Ok(ManagedOutcome::Paused { downloaded, total }) => state.update(&id, |record| {
+            Ok(ManagedOutcome::Paused { path, downloaded, total }) => state.update(&id, |record| {
+                record.target_path = path.to_string_lossy().to_string();
                 record.status = "Paused".into();
                 record.downloaded = downloaded;
                 record.total = total;
@@ -381,7 +397,11 @@ fn spawn_worker(app: AppHandle, state: JobState, mut job: JobRecord) {
         }
         if let Some(job) = final_job {
             let _ = state.persist();
-            let _ = app.emit("download-complete", serde_json::json!({"jobId": id, "path": job.target_path}));
+            if job.status == "Completed" {
+                let _ = app.emit("download-complete", serde_json::json!({"jobId": id, "path": job.target_path}));
+            } else if job.status == "Failed" {
+                let _ = app.emit("download-error", serde_json::json!({"jobId": id, "error": job.error}));
+            }
             state.emit_job(&app, &job);
         }
     });
