@@ -159,7 +159,8 @@ export default function App() {
   }
   function retry(item: Item) { add(item.url, item.name, item.kind); }
   function clearFinished() {
-    setItems((current) => current.filter((item) => item.status !== "Completed"));
+    const finished = items.filter((item) => ["Completed", "Cancelled"].includes(item.status));
+    finished.forEach((item) => { void remove(item.id); });
   }
   async function inspect() {
     const clean = videoUrl.trim();
@@ -200,7 +201,7 @@ export default function App() {
       <div className="transfer-body">
         <div className="transfer-top"><strong title={item.name}>{item.name}</strong><Status value={item.status} /></div>
         <div className="transfer-detail" title={item.url}>{item.detail}</div>
-        {(item.status === "Downloading" || item.status === "Completed") && <div className="progress"><span style={{ width: item.percent + "%" }} /></div>}
+        {(["Downloading", "Pausing", "Paused", "Completed"].includes(item.status)) && <div className="progress"><span style={{ width: item.percent + "%" }} /></div>}
         {item.error && <div className="error-text">{item.error}</div>}
       </div>
       <div className="transfer-actions">
