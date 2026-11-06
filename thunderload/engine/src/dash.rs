@@ -28,6 +28,7 @@ struct DashTrack {
     id: String,
     mime_type: String,
     bandwidth: Option<u64>,
+    width: Option<u32>,
     height: Option<u32>,
     initialization: Option<String>,
     segments: Vec<String>,
@@ -359,6 +360,7 @@ fn parse_representation<'a, 'input>(
     let id = representation.attribute("id").unwrap_or("representation").to_string();
     let bandwidth = representation.attribute("bandwidth").or_else(|| adaptation.attribute("bandwidth"))
         .unwrap_or("0").parse::<u64>()?;
+    let width = representation.attribute("width").and_then(|value| value.parse::<u32>().ok());
     let height = representation.attribute("height").and_then(|value| value.parse::<u32>().ok());
     let mut base = resolve_base(root, mpd_base)?;
     base = resolve_base(period, &base)?;
@@ -367,15 +369,18 @@ fn parse_representation<'a, 'input>(
     let mime = representation.attribute("mimeType").or_else(|| adaptation.attribute("mimeType"))
         .unwrap_or(if height.is_some() { "video/mp4" } else { "application/octet-stream" }).to_string();
     let inheritance = [root, period, adaptation, representation];
+    if nearest_child(&inheritance, "SegmentBase").is_some() {
+        return Err(anyhow!("DASH SegmentBase/index-range manifests are not supported yet"));
+    }
     let (initialization, segments) = if let Some(template) = nearest_child(&inheritance, "SegmentTemplate") {
         expand_template(template, &id, bandwidth, &base, period_duration)?
     } else if let Some(list) = nearest_child(&inheritance, "SegmentList") {
         expand_segment_list(list, &base)?
     } else {
-        (None, vec![base.to_string()])
+        return Err(anyhow!("DASH Representation does not expose a supported SegmentTemplate or SegmentList"));
     };
     if segments.is_empty() { return Err(anyhow!("DASH Representation has no media segments")); }
-    Ok((DashTrack { id, mime_type: mime.clone(), bandwidth: Some(bandwidth), height, initialization, segments }, mime))
+    Ok((DashTrack { id, mime_type: mime.clone(), bandwidth: Some(bandwidth), width, height, initialization, segments }, mime))
 }
 
 fn parse_dash(body: &str, mpd_url: &str) -> Result<DashPlan> {
