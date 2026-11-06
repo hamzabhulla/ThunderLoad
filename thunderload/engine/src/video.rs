@@ -239,11 +239,22 @@ fn xml_attr(input: &str, name: &str) -> Option<String> {
 }
 
 async fn unique_video_path(directory: &Path, stem: &str, extension: &str) -> Result<PathBuf> {
-    let first = directory.join(format!("{stem}.{extension}"));
-    if !fs::try_exists(&first).await.unwrap_or(false) { return Ok(first); }
-    for index in 1..10_000_u32 {
-        let candidate = directory.join(format!("{stem} ({index}).{extension}"));
-        if !fs::try_exists(&candidate).await.unwrap_or(true) { return Ok(candidate); }
+    fs::create_dir_all(directory).await?;
+    for index in 0..10_000_u32 {
+        let filename = if index == 0 {
+            format!("{stem}.{extension}")
+        } else {
+            format!("{stem} ({index}).{extension}")
+        };
+        let candidate = directory.join(filename);
+        match fs::OpenOptions::new().write(true).create_new(true).open(&candidate).await {
+            Ok(file) => {
+                drop(file);
+                return Ok(candidate);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error).with_context(|| format!("Cannot reserve {}", candidate.display())),
+        }
     }
     Err(anyhow!("Could not find a free filename for this video"))
 }
@@ -269,6 +280,11 @@ pub async fn download_hls(
         if let Some(referrer) = referer { r = r.header(reqwest::header::REFERER, referrer); }
         r.send().await?.error_for_status()?.text().await?
     };
+    // The current implementation downloads finite VOD playlists. A live playlist
+    // without ENDLIST would otherwise keep the job running indefinitely.
+    if !media.lines().any(|line| line.trim() == "#EXT-X-ENDLIST") {
+        return Err(anyhow!("This is a live or unfinished HLS playlist. Only completed VOD playlists can be downloaded in this build."));
+    }
 
     let mut init_segment: Option<String> = None;
     let mut segments = Vec::new();
@@ -297,51 +313,61 @@ pub async fn download_hls(
     let stem = Path::new(&safe).file_stem().and_then(|s| s.to_str()).unwrap_or("video");
     let target = unique_video_path(&out_dir, stem, extension).await?;
     let work_dir = out_dir.join(format!(".hls-{}", Uuid::new_v4()));
-    fs::create_dir_all(&work_dir).await?;
+    let download_result = async {
+        fs::create_dir_all(&work_dir).await?;
 
-    let mut all_urls = Vec::new();
-    if let Some(init) = init_segment { all_urls.push(init); }
-    all_urls.extend(segments);
-    let total_segments = all_urls.len();
-    let completed = Arc::new(AtomicUsize::new(0));
-    let mut tasks = tokio::task::JoinSet::new();
-    for (index, segment_url) in all_urls.into_iter().enumerate() {
-        let client = client.clone();
-        let referrer = referer.map(str::to_string);
-        let path = work_dir.join(format!("segment-{index:06}"));
-        let completed = completed.clone();
-        let tx = progress_tx.clone();
-        tasks.spawn(async move {
-            let mut request = client.get(segment_url);
-            if let Some(referrer) = referrer { request = request.header(reqwest::header::REFERER, referrer); }
-            let mut response = request.send().await?.error_for_status()?;
-            let mut file = fs::File::create(&path).await?;
-            while let Some(chunk) = response.chunk().await? { file.write_all(&chunk).await?; }
-            file.flush().await?;
-            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-            let _ = tx.send(DownloadProgress { downloaded: done as u64, total: Some(total_segments as u64),
-                percent: Some(done as f64 * 100.0 / total_segments as f64), phase: "video-segments".into() });
-            Ok::<PathBuf, anyhow::Error>(path)
-        });
-        // Limit concurrent segment requests. Drain in batches to cap memory and sockets.
-        if tasks.len() >= 6 {
-            if let Some(result) = tasks.join_next().await { result??; }
+        let mut all_urls = Vec::new();
+        if let Some(init) = init_segment { all_urls.push(init); }
+        all_urls.extend(segments);
+        let total_segments = all_urls.len();
+        let completed = Arc::new(AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+        for (index, segment_url) in all_urls.into_iter().enumerate() {
+            let client = client.clone();
+            let referrer = referer.map(str::to_string);
+            let path = work_dir.join(format!("segment-{index:06}"));
+            let completed = completed.clone();
+            let tx = progress_tx.clone();
+            tasks.spawn(async move {
+                let mut request = client.get(segment_url);
+                if let Some(referrer) = referrer { request = request.header(reqwest::header::REFERER, referrer); }
+                let mut response = request.send().await?.error_for_status()?;
+                let mut file = fs::File::create(&path).await?;
+                while let Some(chunk) = response.chunk().await? { file.write_all(&chunk).await?; }
+                file.flush().await?;
+                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                let _ = tx.send(DownloadProgress { downloaded: done as u64, total: Some(total_segments as u64),
+                    percent: Some(done as f64 * 100.0 / total_segments as f64), phase: "video-segments".into() });
+                Ok::<PathBuf, anyhow::Error>(path)
+            });
+            // Bound segment concurrency to keep file descriptors and sockets predictable.
+            if tasks.len() >= 6 {
+                if let Some(result) = tasks.join_next().await { result??; }
+            }
         }
-    }
-    while let Some(result) = tasks.join_next().await { result??; }
+        while let Some(result) = tasks.join_next().await { result??; }
 
-    let temp = work_dir.join("assembled.media");
-    let mut output = fs::File::create(&temp).await?;
-    for index in 0..total_segments {
-        let mut input = fs::File::open(work_dir.join(format!("segment-{index:06}"))).await?;
-        tokio::io::copy(&mut input, &mut output).await?;
+        let temp = work_dir.join("assembled.media");
+        let mut output = fs::File::create(&temp).await?;
+        for index in 0..total_segments {
+            let mut input = fs::File::open(work_dir.join(format!("segment-{index:06}"))).await?;
+            tokio::io::copy(&mut input, &mut output).await?;
+        }
+        output.flush().await?;
+        drop(output);
+        // The target was reserved atomically before downloading. Replace only our
+        // empty reservation after every segment has been written successfully.
+        fs::remove_file(&target).await?;
+        fs::rename(&temp, &target).await?;
+        let _ = progress_tx.send(DownloadProgress { downloaded: total_segments as u64, total: Some(total_segments as u64),
+            percent: Some(100.0), phase: "complete".into() });
+        Ok::<PathBuf, anyhow::Error>(target.clone())
+    }.await;
+
+    if download_result.is_err() {
+        let _ = fs::remove_dir_all(&work_dir).await;
+        let _ = fs::remove_file(&target).await;
+    } else {
+        let _ = fs::remove_dir_all(&work_dir).await;
     }
-    output.flush().await?;
-    drop(output);
-    if fs::try_exists(&target).await.unwrap_or(false) { fs::remove_file(&target).await?; }
-    fs::rename(&temp, &target).await?;
-    let _ = fs::remove_dir_all(&work_dir).await;
-    let _ = progress_tx.send(DownloadProgress { downloaded: total_segments as u64, total: Some(total_segments as u64),
-        percent: Some(100.0), phase: "complete".into() });
-    Ok(target)
-}
+    download_result
