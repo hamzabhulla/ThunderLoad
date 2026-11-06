@@ -9,7 +9,12 @@ Do not label a build production-ready until every applicable item is complete.
 - [ ] Installer/native host are signed with a trusted code-signing certificate.
 - [ ] WebView2 bootstrapper tested online/offline.
 - [ ] Uninstaller safely removes registry entries and local host files.
-- [ ] Queue persistence, crash recovery, pause/resume and cancel implemented and tested.
+- [x] Desktop direct-HTTP queue history persists locally.
+- [x] Direct-HTTP checkpoint pause/resume, cancel and startup recovery are implemented; automated tests and Windows CI must pass for each release.
+- [ ] Multi-connection resume and HLS pause/resume/cancel implemented and tested.
+- [ ] Scheduled jobs integrated with Windows Task Scheduler for operation when the app is closed.
+- [ ] Browser-native jobs controllable (pause/resume/cancel) from the desktop queue, not only tracked.
+- [ ] Test checkpoint recovery across server range support changes, ETag changes, disk-full and force-kill scenarios.
 - [ ] Update channel, rollback, checksums and release provenance documented.
 
 ## Browser extension
@@ -27,7 +32,7 @@ Do not label a build production-ready until every applicable item is complete.
 - [ ] Range requests validated against test servers and malformed Content-Range rejected.
 - [ ] Retry, timeout, cancel, partial cleanup and disk-full behavior tested.
 - [ ] HLS byte ranges, discontinuities, live playlists, fMP4, encryption rejection and quality selection tested.
-- [ ] DASH templates/lists, audio/video tracks, timelines and remux completed before claiming DASH downloads.
+- [ ] DASH SegmentTemplate/SegmentList/BaseURL, audio/video tracks, timelines and MP4 remux completed and tested before claiming DASH downloads.
 - [ ] Cookie/custom-header handoff is explicit and local.
 - [ ] No DRM decryption, paywall bypass or unauthorized access.
 
