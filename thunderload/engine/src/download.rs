@@ -519,3 +519,25 @@ pub async fn download_url_resumable(
     });
     Ok(DownloadOutcome::Completed)
 }
+
+
+#[cfg(test)]
+mod resumable_tests {
+    use super::{parse_resume_content_range, partial_download_path};
+
+    #[test]
+    fn resume_content_range_requires_the_exact_checkpoint_offset() {
+        assert_eq!(parse_resume_content_range("bytes 100-199/1000", 100).unwrap(), Some(1000));
+        assert_eq!(parse_resume_content_range("bytes 100-199/*", 100).unwrap(), None);
+        assert!(parse_resume_content_range("bytes 99-199/1000", 100).is_err());
+        assert!(parse_resume_content_range("bytes 100-99/1000", 100).is_err());
+        assert!(parse_resume_content_range("garbage", 100).is_err());
+    }
+
+    #[test]
+    fn checkpoint_path_is_stable_for_a_final_destination() {
+        let target = std::path::Path::new("movie.mp4");
+        assert_eq!(partial_download_path(target), std::path::PathBuf::from("movie.mp4.thunderload.part"));
+        assert_eq!(partial_download_path(target), partial_download_path(target));
+    }
+}
