@@ -97,7 +97,7 @@ async fn start_download(
                 if let Ok(mut controls) = job_controls().lock() { controls.remove(&job_for_task); }
             }
             Err(error) => {
-                let _ = app_for_task.emit("download-error", json!({ "jobId": job_for_task, "error": error.to_string(), "targetPath": target.to_string_lossy() }));
+                let _ = app_for_task.emit("download-error", json!({ "jobId": job_for_task, "error": error.to_string(), "targetPath": task_target.to_string_lossy() }));
                 if let Ok(mut controls) = job_controls().lock() { controls.remove(&job_for_task); }
             }
         }
