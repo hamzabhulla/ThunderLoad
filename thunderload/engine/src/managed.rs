@@ -539,7 +539,7 @@ async fn download_single(
         let Some(chunk) = next else { break; };
         if !control.throttle(chunk.len()).await? {
             file.flush().await?;
-            return Ok(ManagedOutcome::Paused { downloaded, total });
+            return Ok(ManagedOutcome::Paused { path: target.to_path_buf(), downloaded, total });
         }
         file.write_all(&chunk).await?;
         downloaded += chunk.len() as u64;
