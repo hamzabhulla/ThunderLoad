@@ -3,11 +3,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 type Page = "downloads" | "queue" | "video" | "settings";
-type Kind = "direct" | "hls";
+type Kind = "direct" | "hls" | "dash";
 type Status = "Queued" | "Downloading" | "Pausing" | "Paused" | "Cancelling" | "Completed" | "Failed" | "Interrupted" | "Cancelled";
-type Variant = { kind: string; quality: string; width?: number; height?: number; bandwidth?: number; url: string; downloadable: boolean; note?: string };
+type Variant = { kind: string; quality: string; width?: number; height?: number; bandwidth?: number; url: string; downloadable: boolean; note?: string; representationId?: string; audioRepresentationId?: string; audioOnly?: boolean };
 type Progress = { downloaded: number; total?: number; percent?: number; phase: string };
-type Item = { id: string; name: string; url: string; kind: Kind; status: Status; percent: number; downloaded: number; total?: number; detail: string; error?: string; createdAt: number; targetPath?: string; scheduledAt?: number; source?: "native" };
+type Item = { id: string; name: string; url: string; kind: Kind; status: Status; percent: number; downloaded: number; total?: number; detail: string; error?: string; createdAt: number; targetPath?: string; scheduledAt?: number; source?: "native"; representationId?: string; audioRepresentationId?: string };
 
 const HISTORY_KEY = "thunderload.history.v2";
 const CONNECTIONS_KEY = "thunderload.connections.v1";
@@ -112,7 +112,7 @@ export default function App() {
           id: "native-" + job.id,
           name: job.name || "Browser download",
           url: job.url || "",
-          kind: job.kind === "hls" ? "hls" : "direct",
+          kind: job.kind === "hls" ? "hls" : job.kind === "dash" ? "dash" : "direct",
           status: (["Downloading", "Completed", "Failed", "Interrupted"].includes(job.status || "") ? job.status : "Failed") as Status,
           percent: Math.max(0, Math.min(100, job.percent || 0)),
           downloaded: job.downloaded || 0,
@@ -192,6 +192,11 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       try {
         if (item.kind === "hls") {
           await invoke("start_hls_download", { jobId: item.id, url: item.url, filename: item.name });
+        } else if (item.kind === "dash") {
+          await invoke("start_dash_download", {
+            jobId: item.id, url: item.url, representationId: item.representationId,
+            audioRepresentationId: item.audioRepresentationId || null, filename: item.name
+          });
         } else {
           const targetPath = await invoke<string>("start_download", {
             jobId: item.id, url: item.url, filename: item.name, targetPath: item.targetPath || null, connections
@@ -206,17 +211,22 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     });
   }, [items, active, parallel, connections, clock]);
 
-  function add(value: string, saveAs?: string, requestedKind?: Kind) {
+  function add(value: string, saveAs?: string, requestedKind?: Kind, representationId?: string, audioRepresentationId?: string) {
     const clean = value.trim();
     if (!/^https?:\/\//i.test(clean)) { setNotice("Enter a valid HTTP or HTTPS URL."); return; }
     let kind: Kind = requestedKind || "direct";
     try {
-      if (!requestedKind && new URL(clean).pathname.toLowerCase().endsWith(".m3u8")) kind = "hls";
+      if (!requestedKind) {
+        const pathname = new URL(clean).pathname.toLowerCase();
+        if (pathname.endsWith(".m3u8")) kind = "hls";
+        else if (pathname.endsWith(".mpd")) kind = "dash";
+      }
     } catch { setNotice("That URL is not valid."); return; }
     const suggested = nameFromUrl(clean);
     const item: Item = {
-      id: crypto.randomUUID(), name: (saveAs || "").trim() || (kind === "hls" ? "video.mp4" : suggested),
+      id: crypto.randomUUID(), name: (saveAs || "").trim() || (kind === "hls" || kind === "dash" ? "video.mp4" : suggested),
       url: clean, kind, status: "Queued", percent: 0, downloaded: 0,
+      representationId, audioRepresentationId,
       detail: scheduleAt && new Date(scheduleAt).getTime() > Date.now()
         ? "Scheduled for " + new Date(scheduleAt).toLocaleString()
         : "Waiting in queue",
@@ -261,9 +271,9 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     setItems((current) => current.filter((entry) => entry.id !== id || entry.status === "Downloading" || entry.status === "Pausing"));
   }
   function retry(item: Item) {
-    if (item.source === "native") { add(item.url, item.name, item.kind); return; }
+    if (item.source === "native") { add(item.url, item.name, item.kind, item.representationId, item.audioRepresentationId); return; }
     if (item.kind === "direct" && item.targetPath) { resume(item); return; }
-    add(item.url, item.name, item.kind);
+    add(item.url, item.name, item.kind, item.representationId, item.audioRepresentationId);
   }
   async function clearFinished() {
     const finished = items.filter((item) => item.status === "Completed" || item.status === "Cancelled");
@@ -384,10 +394,10 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           {variants.length > 0 && <div className="variants"><div className="variants-heading"><h3>Available streams</h3><span>{variants.length} OPTIONS</span></div>
             {variants.map((variant, index) => <div className="variant" key={variant.url + index}>
               <div><strong>{variant.quality}</strong><small>{variant.kind.toUpperCase()}{variant.width && variant.height ? " · " + variant.width + " × " + variant.height : ""}{variant.bandwidth ? " · " + Math.round(variant.bandwidth / 1000) + " kbps" : ""}</small>{variant.note && <p>{variant.note}</p>}</div>
-              <button className="secondary-button" disabled={!variant.downloadable} onClick={() => add(variant.url, "video.mp4", variant.kind === "hls" ? "hls" : "direct")}>{variant.downloadable ? "Download" : "Unavailable"}</button>
+              <button className="secondary-button" disabled={!variant.downloadable} onClick={() => add(videoUrl, "video.mp4", variant.kind === "hls" ? "hls" : variant.kind === "dash" ? "dash" : "direct", variant.representationId, variant.audioRepresentationId)}>{variant.downloadable ? "Download" : "Unavailable"}</button>
             </div>)}
           </div>}
-          <div className="support-note"><strong>What works</strong><p>Direct media files and unencrypted HLS playlists. DASH quality detection is available, but DASH downloading is not. A YouTube watch page is not a direct media URL; this desktop build does not extract its streams.</p></div>
+          <div className="support-note"><strong>Format support</strong><p>Direct HTTP/HTTPS files use resumable transfers. HLS supports completed unencrypted VOD. DASH supports static MPDs with SegmentTemplate/SegmentTimeline; separate audio/video requires FFmpeg. Live/dynamic MPDs, DRM, SegmentBase/SegmentList and multi-period DASH are not supported. A YouTube watch page is not a direct media URL; page extraction is not available in this build.</p></div>
         </section>}
 
         {page === "settings" && <section className="panel settings-panel">
