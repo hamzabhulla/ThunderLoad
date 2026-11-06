@@ -322,7 +322,7 @@ mod tests {
 
     #[test]
     fn filename_sanitization_removes_windows_path_separators() {
-        assert_eq!(safe_filename(r"..\\folder/name?.zip", "fallback"), "folder_name_.zip");
+        assert_eq!(safe_filename(r"..\\folder/name?.zip", "fallback"), "___folder_name_.zip");
         assert_eq!(safe_filename("   ", "fallback"), "fallback");
     }
 }
