@@ -34,8 +34,8 @@
     }
     // MSE players may expose blob: as currentSrc while one HLS manifest
     // remains visible in the page's resource list.
-    const hls = Array.from(found.values()).filter((item) => item.kind === "HLS playlist");
-    return hls.length === 1 ? { url: hls[0].url, kind: hls[0].kind } : null;
+    const adaptive = Array.from(found.values()).filter((item) => item.kind === "HLS playlist" || item.kind === "DASH manifest");
+    return adaptive.length === 1 ? { url: adaptive[0].url, kind: adaptive[0].kind } : null;
   }
 
   function add(url, label) {
@@ -138,7 +138,7 @@
     video.dataset.thunderLoadAttached = "1";
     const show = () => {
       const source = sourceFor(video);
-      if (!source || source.kind === "DASH manifest") return;
+      if (!source) return;
       activeVideo = video;
       add(source.url, "Video " + (index + 1));
       ensureOverlay();
@@ -212,7 +212,7 @@
       const hovered = activeVideo || Array.from(document.querySelectorAll("video")).find((video) => video.matches(":hover"));
       if (hovered && !activeVideo) {
         const source = sourceFor(hovered);
-        if (source && source.kind !== "DASH manifest") {
+        if (source) {
           activeVideo = hovered;
           ensureOverlay();
           clearTimeout(hideTimer);

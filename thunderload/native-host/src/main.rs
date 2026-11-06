@@ -250,6 +250,8 @@ async fn main() -> Result<()> {
                 let job_id = uuid::Uuid::new_v4().to_string();
                 let tx = outgoing_tx.clone();
                 let mut state = native_job_state(&job_id, &filename, &url, "dash");
+                state["representationId"] = json!(representation_id);
+                state["audioRepresentationId"] = audio_representation_id.clone().map(Value::from).unwrap_or(Value::Null);
                 let _ = save_native_job_state(&state).await;
                 let _ = outgoing_tx.send(json!({"id": id, "ok": true, "data": {"accepted": true, "jobId": job_id}}));
                 tokio::spawn(async move {

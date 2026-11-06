@@ -85,11 +85,13 @@ async function quickDownloadMedia({ url, kind, pageUrl, filename }) {
       downloadable.sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bandwidth || 0) - (a.bandwidth || 0));
       const selected = downloadable[0];
       if (selected) {
-        const action = selected.kind === "hls" ? "video.download" : "download.start";
+        const action = selected.kind === "hls" ? "video.download" : selected.kind === "dash" ? "dash.download" : "download.start";
         const result = await requestNative(action, {
           url: selected.url,
-          filename: selected.kind === "hls" ? (name.replace(/\.[^.]+$/, "") + ".mp4") : name,
-          referer: pageUrl || ""
+          filename: selected.kind === "hls" || selected.kind === "dash" ? (name.replace(/\.[^.]+$/, "") + ".mp4") : name,
+          referer: pageUrl || "",
+          representationId: selected.representationId,
+          audioRepresentationId: selected.audioRepresentationId || ""
         });
         if (result?.ok) {
           return { ok: true, message: selected.quality && variants.length > 1
