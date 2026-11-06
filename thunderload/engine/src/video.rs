@@ -39,6 +39,12 @@ pub async fn inspect_video(url: &str, referer: Option<&str>) -> Result<Vec<Video
         let mut variants = parse_hls_master(&body, &parsed)?;
         if !variants.is_empty() {
             annotate_hls_variants(&mut variants, referer).await;
+            if let Some(reason) = unsupported_hls_master_reason(&body) {
+                for variant in &mut variants {
+                    variant.downloadable = false;
+                    variant.note = Some(reason.clone());
+                }
+            }
             return Ok(variants);
         }
         let reason = unsupported_hls_reason(&body);
@@ -95,6 +101,12 @@ pub async fn inspect_video(url: &str, referer: Option<&str>) -> Result<Vec<Video
         let mut variants = parse_hls_master(&body, &parsed)?;
         if !variants.is_empty() {
             annotate_hls_variants(&mut variants, referer).await;
+            if let Some(reason) = unsupported_hls_master_reason(&body) {
+                for variant in &mut variants {
+                    variant.downloadable = false;
+                    variant.note = Some(reason.clone());
+                }
+            }
             return Ok(variants);
         }
         let reason = unsupported_hls_reason(&body);
@@ -130,6 +142,23 @@ fn is_complete_vod_playlist(body: &str) -> bool {
     body.lines().any(|line| line.trim() == "#EXT-X-ENDLIST")
 }
 
+fn unsupported_hls_master_reason(body: &str) -> Option<String> {
+    for line in body.lines().map(str::trim) {
+        if let Some(attributes) = line.strip_prefix("#EXT-X-SESSION-KEY:") {
+            let method = attr(attributes, "METHOD").unwrap_or_default();
+            if !method.eq_ignore_ascii_case("NONE") {
+                return Some("This HLS master uses an encryption session key; protected streams are not supported".into());
+            }
+        }
+        if let Some(attributes) = line.strip_prefix("#EXT-X-MEDIA:") {
+            if attr(attributes, "TYPE").is_some_and(|kind| kind.eq_ignore_ascii_case("AUDIO")) {
+                return Some("This HLS source has a separate audio rendition. Audio/video muxing is not available in this build".into());
+            }
+        }
+    }
+    None
+}
+
 fn unsupported_hls_reason(body: &str) -> Option<String> {
     for line in body.lines().map(str::trim) {
         if let Some(attributes) = line.strip_prefix("#EXT-X-KEY:") {
@@ -141,6 +170,12 @@ fn unsupported_hls_reason(body: &str) -> Option<String> {
         if line.starts_with("#EXT-X-BYTERANGE:") {
             return Some("HLS byte-range segments are not supported".into());
         }
+        if line.starts_with("#EXT-X-MAP:") && line.contains("BYTERANGE=") {
+            return Some("HLS initialization byte-range segments are not supported".into());
+        }
+    }
+    if !is_complete_vod_playlist(body) {
+        return Some("This is a live or unfinished HLS playlist. Only completed VOD playlists can be downloaded".into());
     }
     None
 }
@@ -289,6 +324,11 @@ pub async fn download_hls(
 
     // If a master playlist is supplied, choose the first (highest listed) variant.
     let variants = parse_hls_master(&body, &base)?;
+    if !variants.is_empty() {
+        if let Some(reason) = unsupported_hls_master_reason(&body) {
+            return Err(anyhow!(reason));
+        }
+    }
     let media_url = variants.first().map(|v| v.url.clone()).unwrap_or_else(|| playlist_url.to_string());
     let media_base = Url::parse(&media_url)?;
     let media = if media_url == playlist_url { body } else {
@@ -391,7 +431,7 @@ pub async fn download_hls(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_complete_vod_playlist, parse_dash_representations, parse_hls_master};
+    use super::{is_complete_vod_playlist, parse_dash_representations, parse_hls_master, unsupported_hls_master_reason, unsupported_hls_reason};
     use url::Url;
 
     #[test]
@@ -418,5 +458,13 @@ mod tests {
     fn live_hls_playlist_is_not_misreported_as_a_finished_download() {
         assert!(is_complete_vod_playlist("#EXTM3U\n#EXTINF:5,\nsegment.ts\n#EXT-X-ENDLIST"));
         assert!(!is_complete_vod_playlist("#EXTM3U\n#EXTINF:5,\nsegment.ts"));
+        assert!(unsupported_hls_reason("#EXTM3U\n#EXTINF:5,\nsegment.ts").is_some());
+    }
+
+    #[test]
+    fn hls_session_encryption_and_separate_audio_are_not_offered_as_downloadable() {
+        assert!(unsupported_hls_master_reason("#EXTM3U\n#EXT-X-SESSION-KEY:METHOD=AES-128,URI=\"key.bin\"").is_some());
+        assert!(unsupported_hls_master_reason("#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",URI=\"audio.m3u8\"").is_some());
+        assert!(unsupported_hls_reason("#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\",BYTERANGE=\"100@0\"\n#EXT-X-ENDLIST").is_some());
     }
 }
