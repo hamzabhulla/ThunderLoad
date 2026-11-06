@@ -79,7 +79,7 @@ async fn register_native_host(
     {
         let browser = browser.trim().to_ascii_lowercase();
         let extension_id = extension_id.trim();
-        let (registry_path, manifest) = match browser.as_str() {
+        let (registry_path, mut manifest) = match browser.as_str() {
             "chrome" => (r"HKCU\Software\Google\Chrome\NativeMessagingHosts\com.thunderload.host",
                 json!({"name":"com.thunderload.host","description":"ThunderLoad local download engine","type":"stdio","allowed_origins":[format!("chrome-extension://{extension_id}/")]})),
             "edge" => (r"HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.thunderload.host",
@@ -111,6 +111,8 @@ async fn register_native_host(
         let host_path = install_dir.join("thunderload-host.exe");
         std::fs::copy(&source, &host_path).map_err(|error| format!("Could not install native host: {error}"))?;
         let manifest_path = install_dir.join(format!("{browser}-native-host.json"));
+        // Native messaging manifests must contain the absolute executable path.
+        manifest["path"] = json!(host_path.to_string_lossy().to_string());
         let bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?;
         std::fs::write(&manifest_path, bytes).map_err(|error| format!("Could not write native host manifest: {error}"))?;
         let status = Command::new("reg").args([
