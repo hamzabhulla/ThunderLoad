@@ -114,6 +114,10 @@ async fn fetch_text(url: &str, referer: Option<&str>) -> Result<String> {
     Ok(request.send().await?.error_for_status()?.text().await?)
 }
 
+fn is_complete_vod_playlist(body: &str) -> bool {
+    body.lines().any(|line| line.trim() == "#EXT-X-ENDLIST")
+}
+
 fn unsupported_hls_reason(body: &str) -> Option<String> {
     for line in body.lines().map(str::trim) {
         if let Some(attributes) = line.strip_prefix("#EXT-X-KEY:") {
@@ -282,7 +286,7 @@ pub async fn download_hls(
     };
     // The current implementation downloads finite VOD playlists. A live playlist
     // without ENDLIST would otherwise keep the job running indefinitely.
-    if !media.lines().any(|line| line.trim() == "#EXT-X-ENDLIST") {
+    if !is_complete_vod_playlist(&media) {
         return Err(anyhow!("This is a live or unfinished HLS playlist. Only completed VOD playlists can be downloaded in this build."));
     }
 
@@ -371,3 +375,36 @@ pub async fn download_hls(
         let _ = fs::remove_dir_all(&work_dir).await;
     }
     download_result
+
+
+#[cfg(test)]
+mod tests {
+    use super::{is_complete_vod_playlist, parse_dash_representations, parse_hls_master};
+    use url::Url;
+
+    #[test]
+    fn hls_master_exposes_quality_options_highest_first() {
+        let playlist = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360\nlow.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=2400000,RESOLUTION=1280x720\nhigh.m3u8\n";
+        let base = Url::parse("https://cdn.example.test/master.m3u8").unwrap();
+        let variants = parse_hls_master(playlist, &base).unwrap();
+        assert_eq!(variants.len(), 2);
+        assert_eq!(variants[0].quality, "720p");
+        assert_eq!(variants[1].quality, "360p");
+        assert!(variants[0].url.ends_with("/high.m3u8"));
+    }
+
+    #[test]
+    fn dash_representations_are_detected_but_not_marked_downloadable() {
+        let manifest = r#"<MPD><Period><AdaptationSet><Representation id="low" bandwidth="300000" width="640" height="360"></Representation><Representation id="high" bandwidth="1200000" width="1280" height="720"></Representation></AdaptationSet></Period></MPD>"#;
+        let variants = parse_dash_representations(manifest, "https://cdn.example.test/video.mpd");
+        assert_eq!(variants.len(), 2);
+        assert_eq!(variants[0].quality, "720p");
+        assert!(!variants[0].downloadable);
+    }
+
+    #[test]
+    fn live_hls_playlist_is_not_misreported_as_a_finished_download() {
+        assert!(is_complete_vod_playlist("#EXTM3U\n#EXTINF:5,\nsegment.ts\n#EXT-X-ENDLIST"));
+        assert!(!is_complete_vod_playlist("#EXTM3U\n#EXTINF:5,\nsegment.ts"));
+    }
+}
