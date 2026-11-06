@@ -127,9 +127,9 @@ export default function App() {
             ? { ...item, status: "Cancelled", detail: "Cancelled · partial file removed", targetPath: undefined, downloaded: 0, percent: 0 }
             : item));
         }),
-listen<{ jobId: string; error: string }>("download-error", ({ payload }) => {
+listen<{ jobId: string; error: string; targetPath?: string }>("download-error", ({ payload }) => {
           setItems((current) => current.map((item) => item.id === payload.jobId
-            ? { ...item, status: "Failed", detail: "Transfer failed", error: payload.error }
+            ? { ...item, status: "Failed", detail: "Transfer interrupted · partial data kept", targetPath: payload.targetPath || item.targetPath, error: payload.error }
             : item));
           setNotice(payload.error);
         })
