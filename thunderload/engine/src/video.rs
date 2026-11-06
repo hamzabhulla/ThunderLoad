@@ -125,6 +125,7 @@ pub async fn inspect_video(url: &str, referer: Option<&str>) -> Result<Vec<Video
             kind: "hls".into(), quality: "Adaptive playlist".into(), width: None, height: None,
             bandwidth: None, url: url.to_string(), downloadable: reason.is_none(),
             note: reason.or_else(|| Some("Unencrypted HLS playlist".into())),
+            representation_id: None, audio_representation_id: None, audio_only: None,
         }]);
     }
     if content_type.contains("dash+xml") {
