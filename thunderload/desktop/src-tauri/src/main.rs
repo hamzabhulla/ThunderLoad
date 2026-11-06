@@ -1,7 +1,7 @@
 use std::{collections::HashMap, path::PathBuf, process::Command, sync::{Arc, Mutex, OnceLock}};
 use serde_json::{json, Value};
 use tauri::{Emitter, Manager};
-use thunderload_engine::{default_download_dir, download_hls, download_url_resumable, inspect_video, partial_download_path, reserve_download_path, safe_filename, DownloadControl, DownloadOutcome, GlobalRateLimiter};
+use thunderload_engine::{default_download_dir, download_hls, download_url_resumable, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, DownloadControl, DownloadOutcome, GlobalRateLimiter};
 use tokio::sync::{mpsc, watch};
 
 #[tauri::command]
@@ -41,6 +41,7 @@ async fn cancel_download(job_id: String, target_path: String) -> Result<(), Stri
     if !actively_running {
         let target = PathBuf::from(target_path);
         let _ = tokio::fs::remove_file(partial_download_path(&target)).await;
+        let _ = tokio::fs::remove_file(partial_download_metadata_path(&target)).await;
         let _ = tokio::fs::remove_file(&target).await;
     }
     Ok(())

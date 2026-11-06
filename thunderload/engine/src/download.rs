@@ -321,6 +321,13 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_metadata_path_is_stable_and_separate_from_partial_bytes() {
+        let target = std::path::Path::new("archive.zip");
+        assert_eq!(super::partial_download_metadata_path(target), std::path::PathBuf::from("archive.zip.thunderload.part.meta.json"));
+        assert_ne!(super::partial_download_metadata_path(target), super::partial_download_path(target));
+    }
+
+    #[test]
     fn filename_sanitization_removes_windows_path_separators() {
         assert_eq!(safe_filename(r"..\\folder/name?.zip", "fallback"), "__folder_name_.zip");
         assert_eq!(safe_filename("   ", "fallback"), "fallback");
