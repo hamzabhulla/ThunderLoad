@@ -16,7 +16,7 @@ pub struct DownloadProgress {
 
 // Reserve the destination atomically so two simultaneous jobs cannot select
 // the same filename and overwrite one another.
-async fn next_available_path(path: &Path) -> Result<PathBuf> {
+pub async fn reserve_download_path(path: &Path) -> Result<PathBuf> {
     let parent = path.parent().ok_or_else(|| anyhow!("Target path has no parent folder"))?;
     fs::create_dir_all(parent).await.with_context(|| format!("Cannot create {}", parent.display()))?;
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("download");
@@ -66,7 +66,7 @@ pub async fn download_url(
     referer: Option<&str>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
 ) -> Result<PathBuf> {
-    let target = next_available_path(target).await?;
+    let target = reserve_download_path(target).await?;
     let result = async {
         let connections = connections.clamp(1, 16);
         let client = client()?;
