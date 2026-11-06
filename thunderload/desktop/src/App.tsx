@@ -4,14 +4,15 @@ import { listen } from "@tauri-apps/api/event";
 
 type Page = "downloads" | "queue" | "video" | "settings";
 type Kind = "direct" | "hls";
-type Status = "Queued" | "Downloading" | "Completed" | "Failed" | "Interrupted";
+type Status = "Queued" | "Downloading" | "Pausing" | "Paused" | "Cancelling" | "Completed" | "Failed" | "Interrupted" | "Cancelled";
 type Variant = { kind: string; quality: string; width?: number; height?: number; bandwidth?: number; url: string; downloadable: boolean; note?: string };
 type Progress = { downloaded: number; total?: number; percent?: number; phase: string };
-type Item = { id: string; name: string; url: string; kind: Kind; status: Status; percent: number; downloaded: number; total?: number; detail: string; error?: string; createdAt: number };
+type Item = { id: string; name: string; url: string; kind: Kind; status: Status; percent: number; downloaded: number; total?: number; detail: string; error?: string; createdAt: number; targetPath?: string; scheduledAt?: number };
 
 const HISTORY_KEY = "thunderload.history.v2";
 const CONNECTIONS_KEY = "thunderload.connections.v1";
 const PARALLEL_KEY = "thunderload.parallel.v1";
+const SPEED_LIMIT_KEY = "thunderload.speed-limit.v1";
 
 function bytes(value: number): string {
   if (!Number.isFinite(value) || value <= 0) return "0 B";
@@ -23,8 +24,10 @@ function readItems(): Item[] {
   try {
     const saved = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
     if (!Array.isArray(saved)) return [];
-    return saved.map((item: Item) => item.status === "Downloading"
-      ? { ...item, status: "Interrupted", detail: "App closed before completion" }
+    return saved.map((item: Item) => item.status === "Downloading" || item.status === "Pausing"
+      ? item.kind === "direct" && item.targetPath
+        ? { ...item, status: "Queued", detail: "Recovering saved partial download…" }
+        : { ...item, status: "Interrupted", detail: "App closed before a resumable checkpoint was created" }
       : item);
   } catch { return []; }
 }
@@ -57,6 +60,7 @@ export default function App() {
   const [page, setPage] = useState<Page>("downloads");
   const [url, setUrl] = useState("");
   const [filename, setFilename] = useState("");
+  const [scheduleAt, setScheduleAt] = useState("");
   const [videoUrl, setVideoUrl] = useState("");
   const [items, setItems] = useState<Item[]>(readItems);
   const [variants, setVariants] = useState<Variant[]>([]);
@@ -65,12 +69,14 @@ export default function App() {
   const [videoNotice, setVideoNotice] = useState("");
   const [connections, setConnections] = useState(() => readSetting(CONNECTIONS_KEY, 8, [1, 2, 4, 8, 12, 16]));
   const [parallel, setParallel] = useState(() => readSetting(PARALLEL_KEY, 2, [1, 2, 3, 4]));
+  const [speedLimit, setSpeedLimit] = useState(() => readSetting(SPEED_LIMIT_KEY, 0, [0, 262144, 524288, 1048576, 2097152, 5242880, 10485760]));
+  const [clock, setClock] = useState(Date.now());
   const [nativeBrowser, setNativeBrowser] = useState("chrome");
   const [nativeExtensionId, setNativeExtensionId] = useState("");
   const [nativeSetupStatus, setNativeSetupStatus] = useState("");
   const [nativeSettingUp, setNativeSettingUp] = useState(false);
 
-  const active = items.filter((item) => item.status === "Downloading").length;
+  const active = items.filter((item) => item.status === "Downloading" || item.status === "Pausing" || item.status === "Cancelling").length;
   const queued = items.filter((item) => item.status === "Queued").length;
   const done = items.filter((item) => item.status === "Completed").length;
   const attention = items.filter((item) => item.status === "Failed" || item.status === "Interrupted").length;
@@ -80,6 +86,14 @@ export default function App() {
   useEffect(() => { localStorage.setItem(HISTORY_KEY, JSON.stringify(items)); }, [items]);
   useEffect(() => { localStorage.setItem(CONNECTIONS_KEY, String(connections)); }, [connections]);
   useEffect(() => { localStorage.setItem(PARALLEL_KEY, String(parallel)); }, [parallel]);
+  useEffect(() => {
+    localStorage.setItem(SPEED_LIMIT_KEY, String(speedLimit));
+    void invoke("set_speed_limit", { bytesPerSecond: speedLimit }).catch((error) => setNotice("Could not apply speed limit: " + String(error)));
+  }, [speedLimit]);
+  useEffect(() => {
+    const timer = window.setInterval(() => setClock(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     let alive = true;
@@ -103,7 +117,17 @@ export default function App() {
             : item));
           setNotice("Download completed.");
         }),
-        listen<{ jobId: string; error: string }>("download-error", ({ payload }) => {
+        listen<{ jobId: string; targetPath: string }>("download-paused", ({ payload }) => {
+          setItems((current) => current.map((item) => item.id === payload.jobId
+            ? { ...item, status: "Paused", targetPath: payload.targetPath, detail: "Paused · partial file saved", error: undefined }
+            : item));
+        }),
+        listen<{ jobId: string }>("download-cancelled", ({ payload }) => {
+          setItems((current) => current.map((item) => item.id === payload.jobId
+            ? { ...item, status: "Cancelled", detail: "Cancelled · partial file removed", targetPath: undefined, downloaded: 0, percent: 0 }
+            : item));
+        }),
+listen<{ jobId: string; error: string }>("download-error", ({ payload }) => {
           setItems((current) => current.map((item) => item.id === payload.jobId
             ? { ...item, status: "Failed", detail: "Transfer failed", error: payload.error }
             : item));
@@ -118,7 +142,7 @@ export default function App() {
 
   useEffect(() => {
     const slots = Math.max(0, parallel - active);
-    const next = items.filter((item) => item.status === "Queued").slice(0, slots);
+    const next = items.filter((item) => item.status === "Queued" && (!item.scheduledAt || item.scheduledAt <= clock)).slice(0, slots);
     if (!next.length) return;
     const ids = new Set(next.map((item) => item.id));
     setItems((current) => current.map((item) => ids.has(item.id) ? { ...item, status: "Downloading", detail: "Starting transfer…" } : item));
@@ -127,7 +151,10 @@ export default function App() {
         if (item.kind === "hls") {
           await invoke("start_hls_download", { jobId: item.id, url: item.url, filename: item.name });
         } else {
-          await invoke("start_download", { jobId: item.id, url: item.url, filename: item.name, connections });
+          const targetPath = await invoke<string>("start_download", {
+            jobId: item.id, url: item.url, filename: item.name, targetPath: item.targetPath || null, connections
+          });
+          setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, targetPath } : entry));
         }
       } catch (error) {
         setItems((current) => current.map((entry) => entry.id === item.id
@@ -135,7 +162,7 @@ export default function App() {
           : entry));
       }
     });
-  }, [items, active, parallel, connections]);
+  }, [items, active, parallel, connections, clock]);
 
   function add(value: string, saveAs?: string, requestedKind?: Kind) {
     const clean = value.trim();
