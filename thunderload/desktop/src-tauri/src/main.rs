@@ -195,6 +195,46 @@ async fn register_native_host(
 }
 
 #[tauri::command]
+async fn start_dash_download(
+    job_id: String,
+    url: String,
+    representation_id: String,
+    audio_representation_id: Option<String>,
+    filename: String,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err("Only HTTP and HTTPS DASH manifests are supported".into());
+    }
+    if representation_id.trim().is_empty() {
+        return Err("A DASH representation must be selected before downloading".into());
+    }
+    let name = safe_filename(&filename, "video.mp4");
+    let job_for_task = job_id.clone();
+    tauri::async_runtime::spawn(async move {
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        let progress_app = app.clone();
+        let progress_id = job_for_task.clone();
+        tauri::async_runtime::spawn(async move {
+            while let Some(progress) = progress_rx.recv().await {
+                let _ = progress_app.emit("download-progress", json!({ "jobId": progress_id, "progress": progress }));
+            }
+        });
+        match thunderload_engine::download_dash(
+            &url, &representation_id, audio_representation_id.as_deref(), &name, None, progress_tx
+        ).await {
+            Ok(path) => {
+                let _ = app.emit("download-complete", json!({ "jobId": job_for_task, "path": path.to_string_lossy() }));
+            }
+            Err(error) => {
+                let _ = app.emit("download-error", json!({ "jobId": job_for_task, "error": error.to_string() }));
+            }
+        }
+    });
+    Ok(job_id)
+}
+
+#[tauri::command]
 async fn get_native_downloads() -> Result<Vec<Value>, String> {
     let directory = default_download_dir().join(".native-jobs");
     if !tokio::fs::try_exists(&directory).await.unwrap_or(false) {
@@ -260,7 +300,7 @@ async fn open_download_folder() -> Result<(), String> {
 
 fn main() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![inspect_video_url, start_download, pause_download, cancel_download, set_speed_limit, start_hls_download, get_native_downloads, dismiss_native_download, register_native_host, open_download_folder])
+        .invoke_handler(tauri::generate_handler![inspect_video_url, start_download, pause_download, cancel_download, set_speed_limit, start_hls_download, start_dash_download, get_native_downloads, dismiss_native_download, register_native_host, open_download_folder])
         .run(tauri::generate_context!())
         .expect("error while running ThunderLoad desktop app");
 }
