@@ -732,7 +732,7 @@ fn resolve_dash_track(
     adaptation: &DashAdaptation,
     representation: &DashRepresentation,
     manifest_url: &str,
-    is_audio: bool,
+    _is_audio: bool,
 ) -> Result<DashResolvedTrack> {
     let template = representation.template.clone()
         .or_else(|| adaptation.template.clone())
