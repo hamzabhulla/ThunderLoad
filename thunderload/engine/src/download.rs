@@ -296,7 +296,7 @@ pub fn safe_filename(input: &str, fallback: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{next_available_path, safe_filename, validate_content_range};
+    use super::{reserve_download_path, safe_filename, validate_content_range};
     use uuid::Uuid;
 
     #[test]
@@ -311,7 +311,7 @@ mod tests {
         let directory = std::env::temp_dir().join(format!("thunderload-test-{}", Uuid::new_v4()));
         tokio::fs::create_dir_all(&directory).await.unwrap();
         let requested = directory.join("archive.zip");
-        let first = next_available_path(&requested).await.unwrap();
+        let first = reserve_download_path(&requested).await.unwrap();
         let second = next_available_path(&requested).await.unwrap();
         assert_eq!(first, requested);
         assert_eq!(second, directory.join("archive (1).zip"));
