@@ -67,7 +67,7 @@ export default function App() {
   const [inspecting, setInspecting] = useState(false);
   const [notice, setNotice] = useState("Ready.");
   const [videoNotice, setVideoNotice] = useState("");
-  const [connections, setConnections] = useState(() => readSetting(CONNECTIONS_KEY, 8, [1, 2, 4, 8, 12, 16]));
+  const [connections, setConnections] = useState(() => readSetting(CONNECTIONS_KEY, 1, [1]));
   const [parallel, setParallel] = useState(() => readSetting(PARALLEL_KEY, 2, [1, 2, 3, 4]));
   const [speedLimit, setSpeedLimit] = useState(() => readSetting(SPEED_LIMIT_KEY, 0, [0, 262144, 524288, 1048576, 2097152, 5242880, 10485760]));
   const [clock, setClock] = useState(Date.now());
@@ -221,7 +221,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     add(item.url, item.name, item.kind);
   }
   function clearFinished() {
-    setItems((current) => current.filter((item) => item.status !== "Completed"));
+    setItems((current) => current.filter((item) => item.status !== "Completed" && item.status !== "Cancelled"));
   }
   async function inspect() {
     const clean = videoUrl.trim();
@@ -262,7 +262,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       <div className="transfer-body">
         <div className="transfer-top"><strong title={item.name}>{item.name}</strong><Status value={item.status} /></div>
         <div className="transfer-detail" title={item.url}>{item.detail}</div>
-        {(item.status === "Downloading" || item.status === "Completed") && <div className="progress"><span style={{ width: item.percent + "%" }} /></div>}
+        {(item.status === "Downloading" || item.status === "Pausing" || item.status === "Paused" || item.status === "Completed") && <div className="progress"><span style={{ width: item.percent + "%" }} /></div>}
         {item.error && <div className="error-text">{item.error}</div>}
       </div>
       <div className="transfer-actions">
@@ -344,7 +344,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
 
         {page === "settings" && <section className="panel settings-panel">
           <div className="settings-section"><div><h2>Transfer behaviour</h2><p>Saved locally. Applies to new downloads.</p></div>
-            <label className="setting-row"><span><strong>Connections per file</strong><small>Used when the server supports byte-range requests.</small></span><select className="select-field" value={connections} onChange={(event) => setConnections(Number(event.target.value))}>{[1, 2, 4, 8, 12, 16].map((n) => <option key={n} value={n}>{n} {n === 1 ? "connection" : "connections"}</option>)}</select></label>
+            <label className="setting-row"><span><strong>Connections per file</strong><small>Checkpoint-safe downloads currently use one stream. Multi-connection resume is still being developed.</small></span><select className="select-field" value={connections} disabled><option value={1}>1 connection</option></select></label>
             <label className="setting-row"><span><strong>Simultaneous downloads</strong><small>Maximum number of active queue items.</small></span><select className="select-field" value={parallel} onChange={(event) => setParallel(Number(event.target.value))}>{[1, 2, 3, 4].map((n) => <option key={n} value={n}>{n} {n === 1 ? "download" : "downloads"}</option>)}</select></label>
             <label className="setting-row"><span><strong>Speed limit</strong><small>Applies to direct HTTP transfers, including active jobs. Zero means unlimited.</small></span><select className="select-field" value={speedLimit} onChange={(event) => setSpeedLimit(Number(event.target.value))}>
               <option value={0}>Unlimited</option><option value={262144}>256 KB/s</option><option value={524288}>512 KB/s</option><option value={1048576}>1 MB/s</option><option value={2097152}>2 MB/s</option><option value={5242880}>5 MB/s</option><option value={10485760}>10 MB/s</option>
