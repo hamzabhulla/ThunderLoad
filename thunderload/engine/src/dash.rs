@@ -499,6 +499,7 @@ mod tests {
         let parsed = parse_dash(mpd, "https://cdn.example.test/path/manifest.mpd").unwrap();
         assert_eq!(parsed.representations[0].id, "v1");
         assert_eq!(parsed.representations[0].quality, "720p");
+        assert_eq!(parsed.representations[0].width, Some(1280));
         assert_eq!(parsed.videos[0].segments.len(), 2);
         assert_eq!(parsed.audios[0].segments.len(), 2);
         assert_eq!(parsed.videos[0].initialization.as_deref(), Some("https://cdn.example.test/path/init-v1.mp4"));
@@ -511,8 +512,10 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_or_protected_dash_is_rejected() {
+    fn dynamic_protected_and_segment_base_dash_are_rejected() {
         assert!(parse_dash(r#"<MPD type="dynamic"><Period/></MPD>"#, "https://cdn.example.test/a.mpd").is_err());
         assert!(parse_dash(r#"<MPD><Period><ContentProtection schemeIdUri="urn:test"/></Period></MPD>"#, "https://cdn.example.test/a.mpd").is_err());
+        let base_only = r#"<MPD mediaPresentationDuration="PT10S"><Period><AdaptationSet mimeType="video/mp4"><Representation id="v1" bandwidth="1000" width="640" height="360"><SegmentBase indexRange="0-100"/></Representation></AdaptationSet></Period></MPD>"#;
+        assert!(parse_dash(base_only, "https://cdn.example.test/a.mpd").is_err());
     }
 }
