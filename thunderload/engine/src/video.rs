@@ -24,6 +24,8 @@ pub struct VideoVariant {
     pub representation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_representation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_only: Option<bool>,
 }
 
 fn client() -> Result<Client> {
@@ -275,28 +277,617 @@ fn attr(input: &str, name: &str) -> Option<String> {
     })
 }
 
-fn parse_dash_representations(body: &str, manifest_url: &str) -> Vec<VideoVariant> {
-    let mut out = Vec::new();
-    // Small, dependency-free starter parser for common Representation attributes.
-    for tag in body.split('<').filter(|s| s.starts_with("Representation ") || s.starts_with("Representation>")) {
-        let attrs = tag.split('>').next().unwrap_or("");
-        let id = xml_attr(attrs, "id").unwrap_or_else(|| "DASH".into());
-        let width = xml_attr(attrs, "width").and_then(|v| v.parse().ok());
-        let height = xml_attr(attrs, "height").and_then(|v| v.parse().ok());
-        let bandwidth = xml_attr(attrs, "bandwidth").and_then(|v| v.parse().ok());
-        let quality = height.map(|h| format!("{h}p")).unwrap_or_else(|| id.clone());
-        out.push(VideoVariant { kind: "dash".into(), quality, width, height, bandwidth,
-            url: manifest_url.to_string(), downloadable: false,
-            note: Some("Quality detected; DASH segment assembly is not enabled yet".into()) });
+#[derive(Debug, Clone, Default)]
+struct DashTimelinePoint {
+    time: Option<u64>,
+    duration: u64,
+    repeat: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DashTemplate {
+    media: Option<String>,
+    initialization: Option<String>,
+    timescale: u64,
+    duration: Option<u64>,
+    start_number: u64,
+    timeline: Vec<DashTimelinePoint>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DashRepresentation {
+    id: String,
+    width: Option<u32>,
+    height: Option<u32>,
+    bandwidth: Option<u64>,
+    mime_type: String,
+    base_url: Option<String>,
+    template: Option<DashTemplate>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DashAdaptation {
+    content_type: String,
+    mime_type: String,
+    base_url: Option<String>,
+    template: Option<DashTemplate>,
+    representations: Vec<DashRepresentation>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DashDocument {
+    is_static: bool,
+    protected: bool,
+    unsupported_segment_mode: bool,
+    period_count: usize,
+    duration_seconds: Option<f64>,
+    period_duration_seconds: Option<f64>,
+    base_url: Option<String>,
+    period_base_url: Option<String>,
+    template: Option<DashTemplate>,
+    period_template: Option<DashTemplate>,
+    adaptations: Vec<DashAdaptation>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DashScope {
+    Mpd,
+    Period,
+    Adaptation,
+    Representation,
+}
+
+#[derive(Default)]
+struct DashParserState {
+    stack: Vec<String>,
+    active_adaptation: Option<usize>,
+    active_representation: Option<(usize, usize)>,
+    active_template_scope: Option<DashScope>,
+    base_scope: Option<DashScope>,
+    base_text: String,
+}
+
+#[derive(Debug, Clone)]
+struct DashResolvedTrack {
+    representation_id: String,
+    mime_type: String,
+    initialization_url: Option<String>,
+    segment_urls: Vec<String>,
+    is_audio: bool,
+}
+
+fn local_xml_name(raw: &[u8]) -> String {
+    let raw = String::from_utf8_lossy(raw);
+    raw.rsplit(':').next().unwrap_or(&raw).to_string()
+}
+
+fn xml_attributes(element: &quick_xml::events::BytesStart<'_>) -> Result<HashMap<String, String>> {
+    let mut values = HashMap::new();
+    for attribute in element.attributes().with_checks(false) {
+        let attribute = attribute?;
+        values.insert(
+            local_xml_name(attribute.key.as_ref()),
+            attribute.unescape_value()?.into_owned(),
+        );
     }
-    out.sort_by(|a, b| b.height.unwrap_or(0).cmp(&a.height.unwrap_or(0)));
+    Ok(values)
+}
+
+fn parse_iso_duration(value: &str) -> Option<f64> {
+    let time = value.strip_prefix("PT")?;
+    let mut number = String::new();
+    let mut seconds = 0.0;
+    for character in time.chars() {
+        if character.is_ascii_digit() || character == '.' {
+            number.push(character);
+            continue;
+        }
+        let amount: f64 = number.parse().ok()?;
+        number.clear();
+        seconds += match character {
+            'H' => amount * 3600.0,
+            'M' => amount * 60.0,
+            'S' => amount,
+            _ => return None,
+        };
+    }
+    if !number.is_empty() || !seconds.is_finite() || seconds <= 0.0 {
+        return None;
+    }
+    Some(seconds)
+}
+
+fn dash_scope(state: &DashParserState) -> DashScope {
+    if state.active_representation.is_some() {
+        DashScope::Representation
+    } else if state.active_adaptation.is_some() {
+        DashScope::Adaptation
+    } else if state.stack.iter().any(|item| item == "Period") {
+        DashScope::Period
+    } else {
+        DashScope::Mpd
+    }
+}
+
+fn inherited_dash_template(
+    document: &DashDocument,
+    adaptation_index: Option<usize>,
+    representation_index: Option<usize>,
+) -> DashTemplate {
+    if let (Some(adaptation_index), Some(representation_index)) = (adaptation_index, representation_index) {
+        if let Some(template) = document.adaptations.get(adaptation_index)
+            .and_then(|adaptation| adaptation.representations.get(representation_index))
+            .and_then(|representation| representation.template.clone()) {
+            return template;
+        }
+    }
+    if let Some(template) = adaptation_index.and_then(|index| document.adaptations.get(index))
+        .and_then(|adaptation| adaptation.template.clone()) {
+        return template;
+    }
+    document.period_template.clone()
+        .or_else(|| document.template.clone())
+        .unwrap_or_else(|| DashTemplate { timescale: 1, start_number: 1, ..DashTemplate::default() })
+}
+
+fn apply_dash_template_attributes(
+    mut template: DashTemplate,
+    attributes: &HashMap<String, String>,
+) -> DashTemplate {
+    if let Some(value) = attributes.get("media") { template.media = Some(value.clone()); }
+    if let Some(value) = attributes.get("initialization") { template.initialization = Some(value.clone()); }
+    if let Some(value) = attributes.get("timescale").and_then(|value| value.parse::<u64>().ok()) {
+        template.timescale = value.max(1);
+    }
+    if let Some(value) = attributes.get("duration").and_then(|value| value.parse::<u64>().ok()) {
+        template.duration = Some(value);
+    }
+    if let Some(value) = attributes.get("startNumber").and_then(|value| value.parse::<u64>().ok()) {
+        template.start_number = value;
+    }
+    if template.timescale == 0 { template.timescale = 1; }
+    if template.start_number == 0 { template.start_number = 1; }
+    template
+}
+
+fn dash_template_mut<'a>(
+    document: &'a mut DashDocument,
+    scope: DashScope,
+    adaptation_index: Option<usize>,
+    representation_index: Option<usize>,
+) -> Option<&'a mut DashTemplate> {
+    match scope {
+        DashScope::Mpd => document.template.as_mut(),
+        DashScope::Period => document.period_template.as_mut(),
+        DashScope::Adaptation => document.adaptations.get_mut(adaptation_index?)?.template.as_mut(),
+        DashScope::Representation => document.adaptations.get_mut(adaptation_index?)?
+            .representations.get_mut(representation_index?)?.template.as_mut(),
+    }
+}
+
+fn set_dash_base_url(
+    document: &mut DashDocument,
+    scope: DashScope,
+    adaptation_index: Option<usize>,
+    representation_index: Option<usize>,
+    value: String,
+) {
+    if value.trim().is_empty() { return; }
+    match scope {
+        DashScope::Mpd => { if document.base_url.is_none() { document.base_url = Some(value); } }
+        DashScope::Period => { if document.period_base_url.is_none() { document.period_base_url = Some(value); } }
+        DashScope::Adaptation => {
+            if let Some(adaptation) = adaptation_index.and_then(|index| document.adaptations.get_mut(index)) {
+                if adaptation.base_url.is_none() { adaptation.base_url = Some(value); }
+            }
+        }
+        DashScope::Representation => {
+            if let Some(representation) = adaptation_index
+                .and_then(|index| document.adaptations.get_mut(index))
+                .and_then(|adaptation| representation_index.and_then(|index| adaptation.representations.get_mut(index))) {
+                if representation.base_url.is_none() { representation.base_url = Some(value); }
+            }
+        }
+    }
+}
+
+fn dash_start_element(
+    document: &mut DashDocument,
+    state: &mut DashParserState,
+    name: &str,
+    attributes: HashMap<String, String>,
+) {
+    let scope_before = dash_scope(state);
+    match name {
+        "MPD" => {
+            document.is_static = attributes.get("type").map(|value| value.eq_ignore_ascii_case("static")).unwrap_or(true);
+            document.duration_seconds = attributes.get("mediaPresentationDuration").and_then(|value| parse_iso_duration(value));
+        }
+        "Period" => {
+            document.period_count += 1;
+            document.period_duration_seconds = attributes.get("duration").and_then(|value| parse_iso_duration(value));
+        }
+        "AdaptationSet" => {
+            document.adaptations.push(DashAdaptation {
+                content_type: attributes.get("contentType").cloned().unwrap_or_default(),
+                mime_type: attributes.get("mimeType").cloned().unwrap_or_default(),
+                ..DashAdaptation::default()
+            });
+            state.active_adaptation = Some(document.adaptations.len() - 1);
+        }
+        "Representation" => {
+            if let Some(adaptation_index) = state.active_adaptation {
+                let representation_index = document.adaptations[adaptation_index].representations.len();
+                document.adaptations[adaptation_index].representations.push(DashRepresentation {
+                    id: attributes.get("id").cloned().unwrap_or_else(|| format!("representation-{representation_index}")),
+                    width: attributes.get("width").and_then(|value| value.parse().ok()),
+                    height: attributes.get("height").and_then(|value| value.parse().ok()),
+                    bandwidth: attributes.get("bandwidth").and_then(|value| value.parse().ok()),
+                    mime_type: attributes.get("mimeType").cloned().unwrap_or_default(),
+                    ..DashRepresentation::default()
+                });
+                state.active_representation = Some((adaptation_index, representation_index));
+            }
+        }
+        "SegmentTemplate" => {
+            let (adaptation_index, representation_index) = state.active_representation
+                .map(|(adaptation, representation)| (Some(adaptation), Some(representation)))
+                .unwrap_or((state.active_adaptation, None));
+            let inherited = inherited_dash_template(document, adaptation_index, representation_index);
+            let template = apply_dash_template_attributes(inherited, &attributes);
+            match scope_before {
+                DashScope::Mpd => document.template = Some(template),
+                DashScope::Period => document.period_template = Some(template),
+                DashScope::Adaptation => {
+                    if let Some(index) = state.active_adaptation { document.adaptations[index].template = Some(template); }
+                }
+                DashScope::Representation => {
+                    if let Some((adaptation, representation)) = state.active_representation {
+                        document.adaptations[adaptation].representations[representation].template = Some(template);
+                    }
+                }
+            }
+            state.active_template_scope = Some(scope_before);
+        }
+        "S" => {
+            if let Some(scope) = state.active_template_scope {
+                let point = DashTimelinePoint {
+                    time: attributes.get("t").and_then(|value| value.parse().ok()),
+                    duration: attributes.get("d").and_then(|value| value.parse().unwrap_or(0)),
+                    repeat: attributes.get("r").and_then(|value| value.parse().unwrap_or(0)),
+                };
+                if point.duration > 0 {
+                    let (adaptation_index, representation_index) = state.active_representation
+                        .map(|(adaptation, representation)| (Some(adaptation), Some(representation)))
+                        .unwrap_or((state.active_adaptation, None));
+                    if let Some(template) = dash_template_mut(document, scope, adaptation_index, representation_index) {
+                        template.timeline.push(point);
+                    }
+                }
+            }
+        }
+        "BaseURL" => {
+            state.base_scope = Some(scope_before);
+            state.base_text.clear();
+        }
+        "ContentProtection" => document.protected = true,
+        "SegmentList" | "SegmentBase" => document.unsupported_segment_mode = true,
+        _ => {}
+    }
+}
+
+fn dash_end_element(document: &mut DashDocument, state: &mut DashParserState, name: &str) {
+    match name {
+        "BaseURL" => {
+            if let Some(scope) = state.base_scope.take() {
+                let (adaptation_index, representation_index) = state.active_representation
+                    .map(|(adaptation, representation)| (Some(adaptation), Some(representation)))
+                    .unwrap_or((state.active_adaptation, None));
+                set_dash_base_url(document, scope, adaptation_index, representation_index, state.base_text.trim().to_string());
+            }
+            state.base_text.clear();
+        }
+        "SegmentTemplate" => state.active_template_scope = None,
+        "Representation" => state.active_representation = None,
+        "AdaptationSet" => state.active_adaptation = None,
+        _ => {}
+    }
+}
+
+fn parse_dash_document(body: &str) -> Result<DashDocument> {
+    let mut reader = Reader::from_str(body);
+    reader.config_mut().trim_text(true);
+    let mut document = DashDocument { is_static: true, ..DashDocument::default() };
+    let mut state = DashParserState::default();
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element)) => {
+                let name = local_xml_name(element.name().as_ref());
+                let attributes = xml_attributes(&element)?;
+                dash_start_element(&mut document, &mut state, &name, attributes);
+                state.stack.push(name);
+            }
+            Ok(Event::Empty(element)) => {
+                let name = local_xml_name(element.name().as_ref());
+                let attributes = xml_attributes(&element)?;
+                dash_start_element(&mut document, &mut state, &name, attributes);
+                dash_end_element(&mut document, &mut state, &name);
+            }
+            Ok(Event::Text(text)) => {
+                if state.base_scope.is_some() {
+                    state.base_text.push_str(&text.unescape()?.into_owned());
+                }
+            }
+            Ok(Event::CData(text)) => {
+                if state.base_scope.is_some() {
+                    state.base_text.push_str(&String::from_utf8_lossy(text.as_ref()));
+                }
+            }
+            Ok(Event::End(element)) => {
+                let name = local_xml_name(element.name().as_ref());
+                dash_end_element(&mut document, &mut state, &name);
+                let _ = state.stack.pop();
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(error) => return Err(anyhow!("Invalid DASH XML: {error}")),
+        }
+    }
+    Ok(document)
+}
+
+#[derive(Debug, Clone)]
+struct DashResolvedTrack {
+    representation_id: String,
+    mime_type: String,
+    initialization_url: Option<String>,
+    segment_urls: Vec<String>,
+    is_audio: bool,
+}
+
+fn merge_dash_base_url(
+    manifest_url: &str,
+    document: &DashDocument,
+    adaptation: &DashAdaptation,
+    representation: &DashRepresentation,
+) -> Result<Url> {
+    let mut base = Url::parse(manifest_url)?;
+    for component in [
+        document.base_url.as_deref(),
+        document.period_base_url.as_deref(),
+        adaptation.base_url.as_deref(),
+        representation.base_url.as_deref(),
+    ].into_iter().flatten() {
+        base = base.join(component)?;
+    }
+    Ok(base)
+}
+
+fn expand_dash_template(
+    template: &str,
+    representation: &DashRepresentation,
+    number: u64,
+    time: u64,
+) -> Result<String> {
+    let mut output = String::new();
+    let mut cursor = 0;
+    while let Some(relative_start) = template[cursor..].find('$') {
+        let start = cursor + relative_start;
+        output.push_str(&template[cursor..start]);
+        if template.as_bytes().get(start + 1) == Some(&b'$') {
+            output.push('$');
+            cursor = start + 2;
+            continue;
+        }
+        let close = template[start + 1..].find('$')
+            .map(|index| start + 1 + index)
+            .ok_or_else(|| anyhow!("Unclosed DASH template token"))?;
+        let token = &template[start + 1..close];
+        let value = if token == "RepresentationID" {
+            representation.id.clone()
+        } else if token == "Bandwidth" {
+            representation.bandwidth.unwrap_or(0).to_string()
+        } else if token == "Number" {
+            number.to_string()
+        } else if token == "Time" {
+            time.to_string()
+        } else if let Some(format_spec) = token.strip_prefix("Number%0").and_then(|value| value.strip_suffix('d')) {
+            let width: usize = format_spec.parse().context("Invalid DASH Number format width")?;
+            format!("{number:0width$}")
+        } else {
+            return Err(anyhow!("Unsupported DASH template token $" .to_string() + token + "$"));
+        };
+        output.push_str(&value);
+        cursor = close + 1;
+    }
+    output.push_str(&template[cursor..]);
+    Ok(output)
+}
+
+fn resolve_dash_track(
+    document: &DashDocument,
+    adaptation: &DashAdaptation,
+    representation: &DashRepresentation,
+    manifest_url: &str,
+    is_audio: bool,
+) -> Result<DashResolvedTrack> {
+    let template = representation.template.clone()
+        .or_else(|| adaptation.template.clone())
+        .or_else(|| document.period_template.clone())
+        .or_else(|| document.template.clone())
+        .ok_or_else(|| anyhow!("DASH representation has no inherited SegmentTemplate"))?;
+    let media_template = template.media.as_deref().ok_or_else(|| anyhow!("DASH SegmentTemplate has no media attribute"))?;
+    if template.timescale == 0 { return Err(anyhow!("DASH SegmentTemplate timescale is zero")); }
+    let timescale = template.timescale.max(1);
+    let period_duration = document.period_duration_seconds.or(document.duration_seconds)
+        .ok_or_else(|| anyhow!("DASH static VOD MPD does not declare a period duration"))?;
+    let mut sequence = Vec::<(u64, u64)>::new();
+    let mut current_time = 0_u64;
+    let mut current_number = template.start_number.max(1);
+    const MAX_DASH_SEGMENTS: u64 = 100_000;
+
+    if !template.timeline.is_empty() {
+        for (index, point) in template.timeline.iter().enumerate() {
+            if let Some(time) = point.time { current_time = time; }
+            let count = if point.repeat >= 0 {
+                point.repeat as u64 + 1
+            } else {
+                let end_time = template.timeline.get(index + 1).and_then(|next| next.time)
+                    .unwrap_or_else(|| (period_duration * timescale as f64).ceil() as u64);
+                end_time.saturating_sub(current_time).saturating_add(point.duration - 1) / point.duration
+            };
+            if sequence.len() as u64 + count > MAX_DASH_SEGMENTS {
+                return Err(anyhow!("DASH manifest expands to too many media segments"));
+            }
+            for _ in 0..count {
+                sequence.push((current_number, current_time));
+                current_number = current_number.saturating_add(1);
+                current_time = current_time.saturating_add(point.duration);
+            }
+        }
+    } else if let Some(duration) = template.duration.filter(|duration| *duration > 0) {
+        let total_units = (period_duration * timescale as f64).ceil() as u64;
+        let count = total_units.saturating_add(duration - 1) / duration;
+        if count == 0 || count > MAX_DASH_SEGMENTS {
+            return Err(anyhow!("DASH SegmentTemplate duration produced an invalid segment count"));
+        }
+        for _ in 0..count {
+            sequence.push((current_number, current_time));
+            current_number = current_number.saturating_add(1);
+            current_time = current_time.saturating_add(duration);
+        }
+    } else {
+        return Err(anyhow!("DASH SegmentTemplate needs SegmentTimeline or duration"));
+    }
+    if sequence.is_empty() { return Err(anyhow!("DASH representation contains no media segments")); }
+
+    let base = merge_dash_base_url(manifest_url, document, adaptation, representation)?;
+    let initialization_url = template.initialization.as_deref()
+        .map(|value| expand_dash_template(value, representation, template.start_number.max(1), 0))
+        .transpose()?
+        .map(|value| base.join(&value).map(|url| url.to_string()))
+        .transpose()?;
+    let mut segment_urls = Vec::with_capacity(sequence.len());
+    for (number, time) in sequence {
+        let resolved = expand_dash_template(media_template, representation, number, time)?;
+        segment_urls.push(base.join(&resolved)?.to_string());
+    }
+    Ok(DashResolvedTrack {
+        representation_id: representation.id.clone(),
+        mime_type: if representation.mime_type.is_empty() { adaptation.mime_type.clone() } else { representation.mime_type.clone() },
+        initialization_url,
+        segment_urls,
+        is_audio,
+    })
+}
+
+fn is_audio_adaptation(adaptation: &DashAdaptation) -> bool {
+    adaptation.content_type.eq_ignore_ascii_case("audio")
+        || adaptation.mime_type.to_ascii_lowercase().starts_with("audio/")
+        || adaptation.representations.iter().any(|rep| rep.mime_type.to_ascii_lowercase().starts_with("audio/"))
+}
+
+fn is_video_representation(adaptation: &DashAdaptation, representation: &DashRepresentation) -> bool {
+    adaptation.content_type.eq_ignore_ascii_case("video")
+        || adaptation.mime_type.to_ascii_lowercase().starts_with("video/")
+        || representation.mime_type.to_ascii_lowercase().starts_with("video/")
+        || representation.height.is_some()
+}
+
+fn parse_dash_representations(body: &str, manifest_url: &str) -> Vec<VideoVariant> {
+    let document = match parse_dash_document(body) {
+        Ok(document) => document,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    if !document.is_static || document.protected || document.unsupported_segment_mode || document.period_count > 1 {
+        let note = if !document.is_static {
+            "Dynamic/live DASH MPDs are not supported"
+        } else if document.protected {
+            "ContentProtection/DRM DASH streams are not supported"
+        } else if document.period_count > 1 {
+            "Multi-period DASH MPDs are not supported in this build"
+        } else {
+            "This DASH SegmentBase/SegmentList layout is not supported"
+        };
+        for adaptation in &document.adaptations {
+            for representation in &adaptation.representations {
+                if is_video_representation(adaptation, representation) {
+                    out.push(VideoVariant {
+                        kind: "dash".into(),
+                        quality: representation.height.map(|height| format!("{height}p")).unwrap_or_else(|| representation.id.clone()),
+                        width: representation.width,
+                        height: representation.height,
+                        bandwidth: representation.bandwidth,
+                        url: manifest_url.to_string(),
+                        downloadable: false,
+                        note: Some(note.to_string()),
+                        representation_id: Some(representation.id.clone()),
+                        audio_representation_id: None,
+                        audio_only: Some(false),
+                    });
+                }
+            }
+        }
+        return out;
+    }
+
+    let audio_representation = document.adaptations.iter().enumerate()
+        .filter(|(_, adaptation)| is_audio_adaptation(adaptation))
+        .flat_map(|(adaptation_index, adaptation)| adaptation.representations.iter().enumerate()
+            .map(move |(representation_index, representation)| (adaptation_index, representation_index, representation)))
+        .max_by_key(|(_, _, representation)| representation.bandwidth.unwrap_or(0));
+
+    for adaptation in &document.adaptations {
+        for representation in adaptation.representations.iter().filter(|representation| is_video_representation(adaptation, representation)) {
+            let result = resolve_dash_track(&document, adaptation, representation, manifest_url, false);
+            let (downloadable, note) = match result {
+                Ok(_) => {
+                    if let Some((audio_adaptation_index, _, audio)) = audio_representation {
+                        match resolve_dash_track(&document, &document.adaptations[audio_adaptation_index], audio, manifest_url, true) {
+                            Ok(_) => (true, Some("Static DASH segments; separate audio will be muxed with FFmpeg".to_string())),
+                            Err(error) => (false, Some(format!("Audio representation is unsupported: {error}"))),
+                        }
+                    } else {
+                        (true, Some("Static DASH VOD segments".to_string()))
+                    }
+                }
+                Err(error) => (false, Some(error.to_string())),
+            };
+            out.push(VideoVariant {
+                kind: "dash".into(),
+                quality: representation.height.map(|height| format!("{height}p")).unwrap_or_else(|| representation.id.clone()),
+                width: representation.width,
+                height: representation.height,
+                bandwidth: representation.bandwidth,
+                url: manifest_url.to_string(),
+                downloadable,
+                note,
+                representation_id: Some(representation.id.clone()),
+                audio_representation_id: audio_representation.map(|(_, _, audio)| audio.id.clone()),
+                audio_only: Some(false),
+            });
+        }
+    }
+    out.sort_by(|left, right| right.height.unwrap_or(0).cmp(&left.height.unwrap_or(0)));
     out
 }
 
-fn xml_attr(input: &str, name: &str) -> Option<String> {
-    let marker = format!("{name}=\"");
-    let rest = input.split_once(&marker)?.1;
-    Some(rest.split('"').next()?.to_string())
+async fn ffmpeg_available() -> bool {
+    let executable = std::env::var_os("THUNDERLOAD_FFMPEG").unwrap_or_else(|| "ffmpeg".into());
+    TokioCommand::new(executable).arg("-version").output().await
+        .map(|output| output.status.success()).unwrap_or(false)
+}
+
+async fn annotate_dash_variants(variants: &mut [VideoVariant]) {
+    let available = ffmpeg_available().await;
+    for variant in variants.iter_mut().filter(|variant| variant.kind == "dash" && variant.audio_representation_id.is_some()) {
+        if !available {
+            variant.downloadable = false;
+            variant.note = Some("This DASH MPD has separate audio and video tracks. Install FFmpeg or set THUNDERLOAD_FFMPEG before downloading.".into());
+        }
+    }
 }
 
 async fn unique_video_path(directory: &Path, stem: &str, extension: &str) -> Result<PathBuf> {
