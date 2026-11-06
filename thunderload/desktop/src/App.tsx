@@ -75,6 +75,9 @@ export default function App() {
   const [nativeExtensionId, setNativeExtensionId] = useState("");
   const [nativeSetupStatus, setNativeSetupStatus] = useState("");
   const [nativeSettingUp, setNativeSettingUp] = useState(false);
+  const [ffmpegPath, setFfmpegPath] = useState("ffmpeg");
+  const [ffmpegStatus, setFfmpegStatus] = useState("");
+  const [ffmpegSaving, setFfmpegSaving] = useState(false);
 
   const active = items.filter((item) => item.status === "Downloading" || item.status === "Pausing" || item.status === "Cancelling").length;
   const queued = items.filter((item) => item.status === "Queued").length;
@@ -138,6 +141,14 @@ export default function App() {
     void refreshNativeJobs();
     const timer = window.setInterval(refreshNativeJobs, 1500);
     return () => { disposed = true; window.clearInterval(timer); };
+  }, []);
+
+  useEffect(() => {
+    let alive = true;
+    void invoke<string | null>("get_ffmpeg_path").then((path) => {
+      if (alive && path) setFfmpegPath(path);
+    }).catch(() => {});
+    return () => { alive = false; };
   }, []);
 
   useEffect(() => {
@@ -295,6 +306,16 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     } catch (error) { setVideoNotice(String(error)); }
     finally { setInspecting(false); }
   }
+  async function saveFfmpegPath() {
+    setFfmpegSaving(true);
+    setFfmpegStatus("Verifying FFmpeg…");
+    try {
+      const status = await invoke<string>("set_ffmpeg_path", { path: ffmpegPath });
+      setFfmpegStatus(status);
+    } catch (error) {
+      setFfmpegStatus(String(error));
+    } finally { setFfmpegSaving(false); }
+  }
   async function registerNativeHost() {
     const extensionId = nativeExtensionId.trim();
     if (!extensionId) { setNativeSetupStatus("Enter your browser extension ID first."); return; }
@@ -407,12 +428,23 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           <div className="settings-section"><div><h2>Transfer behaviour</h2><p>Saved locally. Applies to new downloads.</p></div>
             <label className="setting-row"><span><strong>Connections per file</strong><small>Checkpoint-safe downloads currently use one stream. Multi-connection resume is still being developed.</small></span><select className="select-field" value={connections} disabled><option value={1}>1 connection</option></select></label>
             <label className="setting-row"><span><strong>Simultaneous downloads</strong><small>Maximum number of active queue items.</small></span><select className="select-field" value={parallel} onChange={(event) => setParallel(Number(event.target.value))}>{[1, 2, 3, 4].map((n) => <option key={n} value={n}>{n} {n === 1 ? "download" : "downloads"}</option>)}</select></label>
-            <label className="setting-row"><span><strong>Speed limit</strong><small>Applies to direct desktop HTTP transfers, including active jobs. Zero means unlimited.</small></span><select className="select-field" value={speedLimit} onChange={(event) => setSpeedLimit(Number(event.target.value))}>
+            <label className="setting-row"><span><strong>Speed limit</strong><small>Applies to direct desktop HTTP transfers, including active jobs. HLS/DASH segment throttling is not yet included. Zero means unlimited.</small></span><select className="select-field" value={speedLimit} onChange={(event) => setSpeedLimit(Number(event.target.value))}>
               <option value={0}>Unlimited</option><option value={262144}>256 KB/s</option><option value={524288}>512 KB/s</option><option value={1048576}>1 MB/s</option><option value={2097152}>2 MB/s</option><option value={5242880}>5 MB/s</option><option value={10485760}>10 MB/s</option>
             </select></label>
           </div>
           <div className="rule" />
           <div className="settings-section"><div><h2>Storage</h2><p>ThunderLoad uses a dedicated folder in your system Downloads directory.</p></div><div className="storage-row"><span>Downloads / ThunderLoad</span><button className="secondary-button" onClick={openFolder}>Open folder ↗</button></div></div>
+          <div className="rule" />
+          <div className="settings-section">
+            <div><h2>DASH video support</h2><p>Static DASH VOD with separate audio/video tracks needs FFmpeg to combine the selected quality into one MP4 file.</p></div>
+            <div className="ffmpeg-row">
+              <label htmlFor="ffmpeg-path">FFmpeg executable path</label>
+              <input id="ffmpeg-path" className="field" value={ffmpegPath} onChange={(event) => setFfmpegPath(event.target.value)} placeholder="C:\Tools\ffmpeg\bin\ffmpeg.exe or ffmpeg" />
+              <button className="secondary-button" onClick={saveFfmpegPath} disabled={ffmpegSaving}>{ffmpegSaving ? "Checking…" : "Verify & save"}</button>
+            </div>
+            {ffmpegStatus && <div className="notice native-host-notice">{ffmpegStatus}</div>}
+            <p className="footnote">ThunderLoad verifies the executable by running <code>ffmpeg -version</code>, then saves its path in your local app configuration. An empty value clears the custom path and falls back to FFmpeg on PATH.</p>
+          </div>
           <div className="rule" />
           <div className="settings-section">
             <div><h2>Browser connection</h2><p>Register the optional local engine for adaptive video downloads. Direct file downloads work without this connection.</p></div>
@@ -433,7 +465,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
             <p className="footnote">Copy the ID from the browser's Extensions page. After registration, restart the browser and allow Native messaging in the ThunderLoad extension.</p>
           </div>
           <div className="rule" />
-          <div className="settings-section"><div><h2>About</h2><p>Local desktop transfer engine · Version 0.2.0</p></div><div className="about-line"><span>Supported media</span><strong>Direct files · HLS</strong></div><div className="about-line"><span>Direct downloads</span><strong>Pause · Resume · Cancel · Speed limit · Schedule</strong></div><div className="about-line"><span>Still in development</span><strong>DASH remux · Multi-connection resume · HLS pause</strong></div></div>
+          <div className="settings-section"><div><h2>About</h2><p>Local desktop transfer engine · Version 0.2.0</p></div><div className="about-line"><span>Supported media</span><strong>Direct files · HLS VOD · Static DASH VOD</strong></div><div className="about-line"><span>Direct downloads</span><strong>Pause · Resume · Cancel · Speed limit · Schedule</strong></div><div className="about-line"><span>Still in development</span><strong>Multi-connection resume · HLS pause · Live/multi-period DASH</strong></div></div>
         </section>}
 
         <footer className="app-footer"><span>ThunderLoad</span><span>Downloads stay on this device.</span></footer>
