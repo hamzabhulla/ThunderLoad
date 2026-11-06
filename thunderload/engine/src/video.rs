@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{path::{Path, PathBuf}, sync::{atomic::{AtomicUsize, Ordering}, Arc}};
 use tokio::{fs, io::AsyncWriteExt, process::Command as TokioCommand, sync::mpsc};
 use quick_xml::{events::Event, Reader};
+use futures_util::StreamExt;
 use std::collections::HashMap;
 use url::Url;
 use uuid::Uuid;
@@ -629,6 +630,14 @@ fn parse_dash_document(body: &str) -> Result<DashDocument> {
                         state.base_text.push(character);
                     } else {
                         let resolved = match reference.as_ref() {
+                            b"amp" => Some("&"), b"lt" => Some("<"), b"gt" => Some(">"),
+                            b"apos" => Some("'"), b"quot" => Some("\""), _ => None,
+                        };
+                        if let Some(value) = resolved { state.base_text.push_str(value); }
+                    }
+                }
+            }
+            /*
                             "amp" => Some("&"), "lt" => Some("<"), "gt" => Some(">"),
                             "apos" => Some("'"), "quot" => Some("\""), _ => None,
                         };
