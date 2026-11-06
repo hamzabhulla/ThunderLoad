@@ -439,7 +439,7 @@ pub async fn enqueue_download_command(
     scheduled_at: Option<u64>,
     representation_id: Option<String>,
 ) -> Result<JobRecord, String> {
-    enqueue_download(app, state, job_id, url, filename, kind, connections, scheduled_at).await
+    enqueue_download(app, state, job_id, url, filename, kind, connections, scheduled_at, representation_id).await
 }
 
 #[tauri::command]
