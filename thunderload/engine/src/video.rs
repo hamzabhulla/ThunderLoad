@@ -1034,6 +1034,211 @@ pub async fn download_hls(
     download_result
 }
 
+
+fn find_dash_representation<'a>(
+    document: &'a DashDocument,
+    representation_id: &str,
+    audio: bool,
+) -> Option<(&'a DashAdaptation, &'a DashRepresentation)> {
+    document.adaptations.iter()
+        .filter(|adaptation| is_audio_adaptation(adaptation) == audio)
+        .find_map(|adaptation| adaptation.representations.iter()
+            .find(|representation| representation.id == representation_id)
+            .map(|representation| (adaptation, representation)))
+}
+
+async fn download_dash_track(
+    client: &Client,
+    track: &DashResolvedTrack,
+    work_dir: &Path,
+    prefix: &str,
+    referer: Option<&str>,
+    progress_tx: &mpsc::UnboundedSender<DownloadProgress>,
+    completed: Arc<AtomicUsize>,
+    total_segments: usize,
+) -> Result<PathBuf> {
+    let mut urls = Vec::with_capacity(track.segment_urls.len() + usize::from(track.initialization_url.is_some()));
+    if let Some(initialization) = &track.initialization_url {
+        urls.push(initialization.clone());
+    } else if track.mime_type.to_ascii_lowercase().contains("mp4") {
+        return Err(anyhow!("DASH MP4 representation is missing its initialization segment"));
+    }
+    urls.extend(track.segment_urls.iter().cloned());
+    if urls.is_empty() { return Err(anyhow!("DASH representation contains no media URLs")); }
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for (index, segment_url) in urls.into_iter().enumerate() {
+        let client = client.clone();
+        let referrer = referer.map(str::to_string);
+        let path = work_dir.join(format!("{prefix}-{index:06}.segment"));
+        let tx = progress_tx.clone();
+        let completed = completed.clone();
+        tasks.spawn(async move {
+            let mut request = client.get(segment_url);
+            if let Some(referrer) = referrer {
+                request = request.header(reqwest::header::REFERER, referrer);
+            }
+            let response = request.send().await?.error_for_status()?;
+            let mut stream = response.bytes_stream();
+            let mut file = fs::File::create(&path).await?;
+            let mut bytes = 0_u64;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                file.write_all(&chunk).await?;
+                bytes = bytes.saturating_add(chunk.len() as u64);
+            }
+            file.flush().await?;
+            if bytes == 0 { return Err(anyhow!("DASH server returned an empty initialization/segment file")); }
+            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            let _ = tx.send(DownloadProgress {
+                downloaded: done as u64,
+                total: Some(total_segments as u64),
+                percent: Some(done as f64 * 100.0 / total_segments.max(1) as f64),
+                phase: "dash-segments".into(),
+            });
+            Ok::<PathBuf, anyhow::Error>(path)
+        });
+        if tasks.len() >= 6 {
+            if let Some(result) = tasks.join_next().await {
+                if let Err(error) = result? { tasks.abort_all(); return Err(error); }
+            }
+        }
+    }
+
+    let mut failures = Vec::new();
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => failures.push(error),
+            Err(error) => failures.push(anyhow!(error)),
+        }
+    }
+    if let Some(error) = failures.into_iter().next() { return Err(error); }
+
+    let extension = if track.mime_type.to_ascii_lowercase().contains("webm") { "webm" } else { "mp4" };
+    let assembled = work_dir.join(format!("{prefix}-track.{extension}"));
+    let mut output = fs::File::create(&assembled).await?;
+    // The numeric filenames preserve the manifest's initialization + timeline order.
+    let segment_count = completed.load(Ordering::Relaxed);
+    let expected_files: Vec<PathBuf> = (0..(track.segment_urls.len() + usize::from(track.initialization_url.is_some())))
+        .map(|index| work_dir.join(format!("{prefix}-{index:06}.segment")))
+        .collect();
+    if expected_files.len() != segment_count.min(expected_files.len()) && segment_count == 0 {
+        return Err(anyhow!("No DASH media segments were saved"));
+    }
+    for path in expected_files {
+        let mut input = fs::File::open(&path).await
+            .with_context(|| format!("DASH segment is missing: {}", path.display()))?;
+        tokio::io::copy(&mut input, &mut output).await?;
+    }
+    output.flush().await?;
+    drop(output);
+    Ok(assembled)
+}
+
+/// Downloads one static DASH representation. When the MPD defines separate
+/// audio/video AdaptationSets, both tracks are fetched and stream-copied into a
+/// playable container using FFmpeg. Dynamic MPDs, DRM and unsupported segment
+/// addressing are rejected during inspection instead of producing a broken file.
+pub async fn download_dash(
+    manifest_url: &str,
+    representation_id: &str,
+    audio_representation_id: Option<&str>,
+    filename: &str,
+    referer: Option<&str>,
+    progress_tx: mpsc::UnboundedSender<DownloadProgress>,
+) -> Result<PathBuf> {
+    let body = fetch_text(manifest_url, referer).await?;
+    let document = parse_dash_document(&body)?;
+    if !document.is_static { return Err(anyhow!("Dynamic/live DASH MPDs are not supported")); }
+    if document.protected { return Err(anyhow!("DASH ContentProtection/DRM is not supported")); }
+    if document.unsupported_segment_mode { return Err(anyhow!("DASH SegmentBase/SegmentList is not supported by this build")); }
+    if document.period_count > 1 { return Err(anyhow!("Multi-period DASH MPDs are not supported by this build")); }
+
+    let (video_adaptation, video_representation) = find_dash_representation(&document, representation_id, false)
+        .ok_or_else(|| anyhow!("The selected DASH video representation is not present in the MPD"))?;
+    let video = resolve_dash_track(&document, video_adaptation, video_representation, manifest_url, false)?;
+    let audio = audio_representation_id.map(|id| {
+        let (adaptation, representation) = find_dash_representation(&document, id, true)
+            .ok_or_else(|| anyhow!("The selected DASH audio representation is not present in the MPD"))?;
+        resolve_dash_track(&document, adaptation, representation, manifest_url, true)
+    }).transpose()?;
+
+    if audio.is_some() && !ffmpeg_available().await {
+        return Err(anyhow!("This DASH MPD has separate audio and video tracks. Install FFmpeg or set THUNDERLOAD_FFMPEG to its executable path, then retry."));
+    }
+
+    let total_segments = video.segment_urls.len() + usize::from(video.initialization_url.is_some())
+        + audio.as_ref().map(|track| track.segment_urls.len() + usize::from(track.initialization_url.is_some())).unwrap_or(0);
+    if total_segments == 0 { return Err(anyhow!("DASH MPD did not produce media segments")); }
+
+    let out_dir = default_download_dir();
+    fs::create_dir_all(&out_dir).await?;
+    let extension = if audio.is_some() { "mp4" }
+        else if video.mime_type.to_ascii_lowercase().contains("webm") { "webm" }
+        else { "mp4" };
+    let safe = safe_filename(filename, "video");
+    let stem = Path::new(&safe).file_stem().and_then(|value| value.to_str()).unwrap_or("video");
+    let target = unique_video_path(&out_dir, stem, extension).await?;
+    let work_dir = out_dir.join(format!(".dash-{}", Uuid::new_v4()));
+    let download_result = async {
+        fs::create_dir_all(&work_dir).await?;
+        let client = client()?;
+        let completed = Arc::new(AtomicUsize::new(0));
+        let video_file = download_dash_track(
+            &client, &video, &work_dir, "video", referer, &progress_tx,
+            completed.clone(), total_segments
+        ).await?;
+
+        let output_file = if let Some(audio) = &audio {
+            let audio_file = download_dash_track(
+                &client, audio, &work_dir, "audio", referer, &progress_tx,
+                completed.clone(), total_segments
+            ).await?;
+            let muxed = work_dir.join("muxed.mp4");
+            let executable = std::env::var_os("THUNDERLOAD_FFMPEG").unwrap_or_else(|| "ffmpeg".into());
+            let result = TokioCommand::new(executable)
+                .arg("-hide_banner").arg("-loglevel").arg("error").arg("-y")
+                .arg("-i").arg(&video_file)
+                .arg("-i").arg(&audio_file)
+                .arg("-map").arg("0:v:0").arg("-map").arg("1:a:0")
+                .arg("-c").arg("copy")
+                .arg("-movflags").arg("+faststart")
+                .arg("-shortest")
+                .arg(&muxed)
+                .output().await.context("Could not launch FFmpeg to combine DASH audio and video")?;
+            if !result.status.success() {
+                let stderr = String::from_utf8_lossy(&result.stderr);
+                return Err(anyhow!("FFmpeg could not mux the DASH tracks: {}", stderr.trim()));
+            }
+            muxed
+        } else {
+            video_file
+        };
+
+        let metadata = fs::metadata(&output_file).await?;
+        if metadata.len() == 0 { return Err(anyhow!("DASH assembly produced an empty output file")); }
+        fs::remove_file(&target).await?;
+        fs::rename(&output_file, &target).await
+            .with_context(|| format!("Could not move the assembled DASH file to {}", target.display()))?;
+        let _ = progress_tx.send(DownloadProgress {
+            downloaded: total_segments as u64,
+            total: Some(total_segments as u64),
+            percent: Some(100.0),
+            phase: "complete".into(),
+        });
+        Ok::<PathBuf, anyhow::Error>(target.clone())
+    }.await;
+
+    if download_result.is_err() {
+        let _ = fs::remove_dir_all(&work_dir).await;
+        let _ = fs::remove_file(&target).await;
+    } else {
+        let _ = fs::remove_dir_all(&work_dir).await;
+    }
+    download_result
+}
+
 #[cfg(test)]
 mod tests {
     use super::{is_complete_vod_playlist, parse_dash_representations, parse_hls_master, unsupported_hls_master_reason, unsupported_hls_reason};
