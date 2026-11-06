@@ -2,7 +2,7 @@ use std::{collections::HashMap, path::PathBuf, process::Command, sync::{Arc, Mut
 use serde_json::{json, Value};
 use tauri::{Emitter, Manager};
 use thunderload_engine::{default_download_dir, download_hls, download_url_resumable, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, DownloadControl, DownloadOutcome, GlobalRateLimiter};
-use tokio::sync::{mpsc, watch};
+use tokio::{process::Command as TokioCommand, sync::{mpsc, watch}};
 
 #[tauri::command]
 async fn inspect_video_url(url: String, referer: Option<String>) -> Result<Vec<thunderload_engine::VideoVariant>, String> {
@@ -236,6 +236,46 @@ async fn start_dash_download(
 }
 
 #[tauri::command]
+async fn get_ffmpeg_path(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    let path = app.path().app_config_dir().map_err(|error| error.to_string())?.join("ffmpeg.path");
+    match tokio::fs::read_to_string(path).await {
+        Ok(value) => {
+            let value = value.trim().to_string();
+            Ok((!value.is_empty()).then_some(value))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[tauri::command]
+async fn set_ffmpeg_path(path: String, app: tauri::AppHandle) -> Result<String, String> {
+    let value = path.trim().to_string();
+    let config_file = app.path().app_config_dir()
+        .map_err(|error| error.to_string())?.join("ffmpeg.path");
+    if value.is_empty() {
+        match tokio::fs::remove_file(&config_file).await {
+            Ok(()) => {},
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) => return Err(error.to_string()),
+        }
+        std::env::remove_var("THUNDERLOAD_FFMPEG");
+        return Ok("Custom FFmpeg path cleared. ThunderLoad will look for ffmpeg on PATH.".into());
+    }
+    let result = TokioCommand::new(&value).arg("-version").output().await
+        .map_err(|error| format!("Could not start FFmpeg at '{value}': {error}"))?;
+    if !result.status.success() {
+        return Err(format!("FFmpeg returned a non-zero exit code when checking '{value}'."));
+    }
+    let version = String::from_utf8_lossy(&result.stdout).lines().next().unwrap_or("FFmpeg verified").to_string();
+    let parent = config_file.parent().ok_or_else(|| "Application config directory is unavailable".to_string())?;
+    tokio::fs::create_dir_all(parent).await.map_err(|error| error.to_string())?;
+    tokio::fs::write(&config_file, &value).await.map_err(|error| error.to_string())?;
+    std::env::set_var("THUNDERLOAD_FFMPEG", &value);
+    Ok(format!("{version} · saved in ThunderLoad settings"))
+}
+
+#[tauri::command]
 async fn get_native_downloads() -> Result<Vec<Value>, String> {
     let directory = default_download_dir().join(".native-jobs");
     if !tokio::fs::try_exists(&directory).await.unwrap_or(false) {
@@ -301,7 +341,16 @@ async fn open_download_folder() -> Result<(), String> {
 
 fn main() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![inspect_video_url, start_download, pause_download, cancel_download, set_speed_limit, start_hls_download, start_dash_download, get_native_downloads, dismiss_native_download, register_native_host, open_download_folder])
+        .setup(|app| {
+            if let Ok(config_dir) = app.path().app_config_dir() {
+                if let Ok(value) = std::fs::read_to_string(config_dir.join("ffmpeg.path")) {
+                    let value = value.trim();
+                    if !value.is_empty() { std::env::set_var("THUNDERLOAD_FFMPEG", value); }
+                }
+            }
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![inspect_video_url, start_download, pause_download, cancel_download, set_speed_limit, start_hls_download, start_dash_download, get_ffmpeg_path, set_ffmpeg_path, get_native_downloads, dismiss_native_download, register_native_host, open_download_folder])
         .run(tauri::generate_context!())
         .expect("error while running ThunderLoad desktop app");
 }
