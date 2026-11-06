@@ -718,6 +718,172 @@ mod resumable_tests {
 }
 
 
+
+#[cfg(test)]
+mod resumable_http_tests {
+    use super::{
+        download_url_resumable, partial_download_metadata_path, partial_download_path,
+        reserve_download_path, DownloadControl, DownloadOutcome, GlobalRateLimiter,
+    };
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::{atomic::{AtomicBool, AtomicUsize, Ordering}, Arc},
+        thread,
+        time::Duration,
+    };
+    use tokio::sync::{mpsc, watch};
+
+    const BODY_SIZE: usize = 32 * 1024;
+
+    fn spawn_range_server() -> (String, Arc<AtomicUsize>, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let version = Arc::new(AtomicUsize::new(1));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_version = version.clone();
+        let thread_shutdown = shutdown.clone();
+        let handle = thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(3));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => {
+                            request.extend_from_slice(&buffer[..count]);
+                            if request.windows(4).any(|window| window == b"\r\n\r\n") { break; }
+                        }
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let mut lines = request.lines();
+                let first = lines.next().unwrap_or_default();
+                let is_head = first.starts_with("HEAD ");
+                let range = lines.find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("range").then(|| value.trim().to_string())
+                });
+                let if_range = request.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("if-range").then(|| value.trim().to_string())
+                });
+                let current_version = thread_version.load(Ordering::Relaxed);
+                let etag = if current_version == 1 { "\"v1\"" } else { "\"v2\"" };
+                let fill = if current_version == 1 { b'A' } else { b'B' };
+                let body = vec![fill; BODY_SIZE];
+                if is_head {
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                        BODY_SIZE, etag
+                    );
+                    let _ = stream.write_all(headers.as_bytes());
+                    continue;
+                }
+                let requested_start = range.as_deref()
+                    .and_then(|value| value.strip_prefix("bytes="))
+                    .and_then(|value| value.strip_suffix('-'))
+                    .and_then(|value| value.parse::<usize>().ok());
+                let can_resume = requested_start.is_some() && if_range.as_deref() == Some(etag);
+                let start = if can_resume { requested_start.unwrap() } else { 0 };
+                let payload = &body[start..];
+                let (status, extra) = if can_resume {
+                    ("206 Partial Content", format!("Content-Range: bytes {}-{}/{BODY_SIZE}\r\n", start, BODY_SIZE - 1))
+                } else {
+                    ("200 OK", String::new())
+                };
+                let headers = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nETag: {}\r\nAccept-Ranges: bytes\r\n{extra}Connection: close\r\n\r\n",
+                    payload.len(), etag
+                );
+                if stream.write_all(headers.as_bytes()).is_err() { continue; }
+                for chunk in payload.chunks(1024) {
+                    if stream.write_all(chunk).is_err() { break; }
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+        });
+        (format!("http://{address}/download.bin"), version, shutdown, handle)
+    }
+
+    async fn run_until_pause(url: &str, target: &std::path::Path) -> (DownloadOutcome, watch::Sender<DownloadControl>) {
+        let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        let limiter = Arc::new(GlobalRateLimiter::new());
+        let url = url.to_string();
+        let target = target.to_path_buf();
+        let task = tokio::spawn(async move {
+            download_url_resumable(&url, &target, None, control_rx, limiter, progress_tx).await
+        });
+        tokio::time::sleep(Duration::from_millis(45)).await;
+        control_tx.send(DownloadControl::Paused).unwrap();
+        let outcome = task.await.unwrap().unwrap();
+        (outcome, control_tx)
+    }
+
+    #[tokio::test]
+    async fn pause_resume_uses_byte_range_and_preserves_original_file_bytes() {
+        let (url, _version, shutdown, server) = spawn_range_server();
+        let directory = std::env::temp_dir().join(format!("thunderload-resume-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("file.bin")).await.unwrap();
+        let (outcome, _control) = run_until_pause(&url, &target).await;
+        assert_eq!(outcome, DownloadOutcome::Paused);
+        let part = partial_download_path(&target);
+        let saved = tokio::fs::metadata(&part).await.unwrap().len();
+        assert!(saved > 0 && saved < BODY_SIZE as u64);
+        assert!(tokio::fs::try_exists(partial_download_metadata_path(&target)).await.unwrap());
+
+        let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        let outcome = download_url_resumable(
+            &url, &target, None, control_rx, Arc::new(GlobalRateLimiter::new()), progress_tx
+        ).await.unwrap();
+        assert_eq!(outcome, DownloadOutcome::Completed);
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(bytes, vec![b'A'; BODY_SIZE]);
+        assert!(!tokio::fs::try_exists(&part).await.unwrap());
+        assert!(!tokio::fs::try_exists(partial_download_metadata_path(&target)).await.unwrap());
+        drop(control_tx);
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn changed_etag_restarts_full_download_instead_of_joining_old_bytes() {
+        let (url, version, shutdown, server) = spawn_range_server();
+        let directory = std::env::temp_dir().join(format!("thunderload-etag-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("changed.bin")).await.unwrap();
+        let (outcome, _control) = run_until_pause(&url, &target).await;
+        assert_eq!(outcome, DownloadOutcome::Paused);
+        version.store(2, Ordering::Relaxed);
+
+        let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        let outcome = download_url_resumable(
+            &url, &target, None, control_rx, Arc::new(GlobalRateLimiter::new()), progress_tx
+        ).await.unwrap();
+        assert_eq!(outcome, DownloadOutcome::Completed);
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(bytes, vec![b'B'; BODY_SIZE]);
+        drop(control_tx);
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+}
+
 #[cfg(test)]
 mod rate_limit_tests {
     use super::GlobalRateLimiter;
