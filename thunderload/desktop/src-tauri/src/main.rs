@@ -1,7 +1,7 @@
-use std::{collections::HashMap, path::PathBuf, process::Command, sync::{atomic::AtomicU64, Arc, Mutex, OnceLock}};
+use std::{collections::HashMap, path::PathBuf, process::Command, sync::{Arc, Mutex, OnceLock}};
 use serde_json::json;
 use tauri::{Emitter, Manager};
-use thunderload_engine::{default_download_dir, download_hls, download_url, download_url_resumable, inspect_video, partial_download_path, reserve_download_path, safe_filename, DownloadControl, DownloadOutcome};
+use thunderload_engine::{default_download_dir, download_hls, download_url_resumable, inspect_video, partial_download_path, reserve_download_path, safe_filename, DownloadControl, DownloadOutcome, GlobalRateLimiter};
 use tokio::sync::{mpsc, watch};
 
 #[tauri::command]
@@ -11,19 +11,19 @@ async fn inspect_video_url(url: String, referer: Option<String>) -> Result<Vec<t
 
 
 static JOB_CONTROLS: OnceLock<Mutex<HashMap<String, watch::Sender<DownloadControl>>>> = OnceLock::new();
-static SPEED_LIMIT: OnceLock<Arc<AtomicU64>> = OnceLock::new();
+static RATE_LIMITER: OnceLock<Arc<GlobalRateLimiter>> = OnceLock::new();
 
 fn job_controls() -> &'static Mutex<HashMap<String, watch::Sender<DownloadControl>>> {
     JOB_CONTROLS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn speed_limit() -> Arc<AtomicU64> {
-    SPEED_LIMIT.get_or_init(|| Arc::new(AtomicU64::new(0))).clone()
+fn rate_limiter() -> Arc<GlobalRateLimiter> {
+    RATE_LIMITER.get_or_init(|| Arc::new(GlobalRateLimiter::new())).clone()
 }
 
 #[tauri::command]
 async fn set_speed_limit(bytes_per_second: u64) -> Result<(), String> {
-    speed_limit().store(bytes_per_second.min(1_073_741_824), std::sync::atomic::Ordering::Relaxed);
+    rate_limiter().set_limit(bytes_per_second);
     Ok(())
 }
 
@@ -72,7 +72,7 @@ async fn start_download(
 
     let job_for_task = job_id.clone();
     let app_for_task = app.clone();
-    let limit = speed_limit();
+    let limit = rate_limiter();
     tauri::async_runtime::spawn(async move {
         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
         let progress_app = app_for_task.clone();
