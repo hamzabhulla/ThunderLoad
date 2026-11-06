@@ -124,15 +124,29 @@ async fn main() -> Result<()> {
                     let tx_progress = tx.clone();
                     let progress_job = job_id.clone();
                     let progress_state = state.clone();
-                    tokio::spawn(async move {
+                    let progress_handle = tokio::spawn(async move {
                         let mut state = progress_state;
-                        while let Some(progress) = progress_rx.recv().await {
-                            apply_native_progress(&mut state, &progress);
-                            let _ = save_native_job_state(&state).await;
-                            let _ = tx_progress.send(json!({"event": "download.progress", "jobId": progress_job, "progress": progress}));
+                        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(10));
+                        loop {
+                            tokio::select! {
+                                _ = heartbeat.tick() => {
+                                    state["updatedAt"] = json!(timestamp_ms());
+                                    let _ = save_native_job_state(&state).await;
+                                }
+                                progress = progress_rx.recv() => match progress {
+                                    Some(progress) => {
+                                        apply_native_progress(&mut state, &progress);
+                                        let _ = save_native_job_state(&state).await;
+                                        let _ = tx_progress.send(json!({"event": "download.progress", "jobId": progress_job, "progress": progress}));
+                                    }
+                                    None => break,
+                                }
+                            }
                         }
                     });
-                    match download_url(&url, &target, 8, referer.as_deref(), progress_tx).await {
+                    let result = download_url(&url, &target, 8, referer.as_deref(), progress_tx).await;
+                    let _ = progress_handle.await;
+                    match result {
                         Ok(path) => {
                             state["status"] = json!("Completed");
                             state["percent"] = json!(100);
@@ -167,15 +181,29 @@ async fn main() -> Result<()> {
                     let tx_progress = tx.clone();
                     let progress_job = job_id.clone();
                     let progress_state = state.clone();
-                    tokio::spawn(async move {
+                    let progress_handle = tokio::spawn(async move {
                         let mut state = progress_state;
-                        while let Some(progress) = progress_rx.recv().await {
-                            apply_native_progress(&mut state, &progress);
-                            let _ = save_native_job_state(&state).await;
-                            let _ = tx_progress.send(json!({"event": "download.progress", "jobId": progress_job, "progress": progress}));
+                        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(10));
+                        loop {
+                            tokio::select! {
+                                _ = heartbeat.tick() => {
+                                    state["updatedAt"] = json!(timestamp_ms());
+                                    let _ = save_native_job_state(&state).await;
+                                }
+                                progress = progress_rx.recv() => match progress {
+                                    Some(progress) => {
+                                        apply_native_progress(&mut state, &progress);
+                                        let _ = save_native_job_state(&state).await;
+                                        let _ = tx_progress.send(json!({"event": "download.progress", "jobId": progress_job, "progress": progress}));
+                                    }
+                                    None => break,
+                                }
+                            }
                         }
                     });
-                    match download_hls(&url, &filename, referer.as_deref(), progress_tx).await {
+                    let result = download_hls(&url, &filename, referer.as_deref(), progress_tx).await;
+                    let _ = progress_handle.await;
+                    match result {
                         Ok(path) => {
                             state["status"] = json!("Completed");
                             state["percent"] = json!(100);
