@@ -52,6 +52,15 @@ async fn save_native_job_state(state: &Value) -> Result<()> {
     Ok(())
 }
 
+async fn load_native_job_state(id: &str, fallback: Value) -> Value {
+    let safe_id = safe_filename(id, "job");
+    let path = default_download_dir().join(".native-jobs").join(format!("{safe_id}.json"));
+    match tokio::fs::read(path).await {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or(fallback),
+        Err(_) => fallback,
+    }
+}
+
 fn native_job_state(id: &str, name: &str, url: &str, kind: &str) -> Value {
     json!({
         "id": id, "name": name, "url": url, "kind": kind,
@@ -148,6 +157,7 @@ async fn main() -> Result<()> {
                     let _ = progress_handle.await;
                     match result {
                         Ok(path) => {
+                            state = load_native_job_state(&job_id, state).await;
                             state["status"] = json!("Completed");
                             state["percent"] = json!(100);
                             state["detail"] = json!("Download complete");
@@ -157,6 +167,7 @@ async fn main() -> Result<()> {
                             let _ = tx.send(json!({"event": "download.complete", "jobId": job_id, "path": path.to_string_lossy()}));
                         }
                         Err(error) => {
+                            state = load_native_job_state(&job_id, state).await;
                             state["status"] = json!("Failed");
                             state["error"] = json!(error.to_string());
                             state["detail"] = json!("Download failed");
@@ -205,6 +216,7 @@ async fn main() -> Result<()> {
                     let _ = progress_handle.await;
                     match result {
                         Ok(path) => {
+                            state = load_native_job_state(&job_id, state).await;
                             state["status"] = json!("Completed");
                             state["percent"] = json!(100);
                             state["detail"] = json!("Video download complete");
@@ -214,6 +226,7 @@ async fn main() -> Result<()> {
                             let _ = tx.send(json!({"event": "download.complete", "jobId": job_id, "path": path.to_string_lossy()}));
                         }
                         Err(error) => {
+                            state = load_native_job_state(&job_id, state).await;
                             state["status"] = json!("Failed");
                             state["error"] = json!(error.to_string());
                             state["detail"] = json!("Video download failed");
