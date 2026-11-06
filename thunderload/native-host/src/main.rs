@@ -237,6 +237,74 @@ async fn main() -> Result<()> {
                     }
                 });
             }
+            "dash.download" => {
+                let url = message.get("url").and_then(Value::as_str).unwrap_or("").to_string();
+                let referer = message.get("referer").and_then(Value::as_str).map(str::to_string);
+                let filename = output_name(message.get("filename"), "video.mp4");
+                let representation_id = message.get("representationId").and_then(Value::as_str).unwrap_or("").to_string();
+                let audio_representation_id = message.get("audioRepresentationId").and_then(Value::as_str).map(str::to_string);
+                if representation_id.is_empty() {
+                    let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": "Missing DASH representationId"}));
+                    continue;
+                }
+                let job_id = uuid::Uuid::new_v4().to_string();
+                let tx = outgoing_tx.clone();
+                let mut state = native_job_state(&job_id, &filename, &url, "dash");
+                let _ = save_native_job_state(&state).await;
+                let _ = outgoing_tx.send(json!({"id": id, "ok": true, "data": {"accepted": true, "jobId": job_id}}));
+                tokio::spawn(async move {
+                    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+                    let tx_progress = tx.clone();
+                    let progress_job = job_id.clone();
+                    let progress_state = state.clone();
+                    let progress_handle = tokio::spawn(async move {
+                        let mut state = progress_state;
+                        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(10));
+                        loop {
+                            tokio::select! {
+                                _ = heartbeat.tick() => {
+                                    state["updatedAt"] = json!(timestamp_ms());
+                                    let _ = save_native_job_state(&state).await;
+                                }
+                                progress = progress_rx.recv() => match progress {
+                                    Some(progress) => {
+                                        apply_native_progress(&mut state, &progress);
+                                        let _ = save_native_job_state(&state).await;
+                                        let _ = tx_progress.send(json!({"event": "download.progress", "jobId": progress_job, "progress": progress}));
+                                    }
+                                    None => break,
+                                }
+                            }
+                        }
+                    });
+                    let result = thunderload_engine::download_dash(
+                        &url, &representation_id, audio_representation_id.as_deref(),
+                        &filename, referer.as_deref(), progress_tx
+                    ).await;
+                    let _ = progress_handle.await;
+                    match result {
+                        Ok(path) => {
+                            state = load_native_job_state(&job_id, state).await;
+                            state["status"] = json!("Completed");
+                            state["percent"] = json!(100);
+                            state["detail"] = json!("DASH video download complete");
+                            state["targetPath"] = json!(path.to_string_lossy().to_string());
+                            state["updatedAt"] = json!(timestamp_ms());
+                            let _ = save_native_job_state(&state).await;
+                            let _ = tx.send(json!({"event": "download.complete", "jobId": job_id, "path": path.to_string_lossy()}));
+                        }
+                        Err(error) => {
+                            state = load_native_job_state(&job_id, state).await;
+                            state["status"] = json!("Failed");
+                            state["error"] = json!(error.to_string());
+                            state["detail"] = json!("DASH download failed");
+                            state["updatedAt"] = json!(timestamp_ms());
+                            let _ = save_native_job_state(&state).await;
+                            let _ = tx.send(json!({"event": "download.error", "jobId": job_id, "error": error.to_string()}));
+                        }
+                    }
+                });
+            }
             _ => {
                 let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": "Unknown action"}));
             }
