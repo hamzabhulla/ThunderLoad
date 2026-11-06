@@ -208,7 +208,27 @@ async fn get_native_downloads() -> Result<Vec<Value>, String> {
             Ok(content) => content,
             Err(_) => continue,
         };
-        if let Ok(job) = serde_json::from_str::<Value>(&content) { jobs.push(job); }
+        if let Ok(mut job) = serde_json::from_str::<Value>(&content) {
+            let status = job.get("status").and_then(Value::as_str).unwrap_or("");
+            let updated = job.get("updatedAt").and_then(Value::as_u64).unwrap_or(0);
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_millis() as u64;
+            // Native host refreshes its heartbeat every ten seconds. A stale
+            // "Downloading" entry therefore means the host process exited.
+            if status == "Downloading" && updated > 0 && now.saturating_sub(updated) > 45_000 {
+                job["status"] = json!("Interrupted");
+                job["detail"] = json!("Browser native host stopped. Retry this URL to start again.");
+                job["error"] = json!("The browser companion disconnected before completion.");
+                job["updatedAt"] = json!(now);
+                if let Ok(bytes) = serde_json::to_vec(&job) {
+                    let temporary = entry.path().with_extension("json.tmp");
+                    if tokio::fs::write(&temporary, bytes).await.is_ok() {
+                        let _ = tokio::fs::rename(&temporary, entry.path()).await;
+                    }
+                }
+            }
+            jobs.push(job);
+        }
     }
     jobs.sort_by_key(|job| std::cmp::Reverse(job.get("createdAt").and_then(Value::as_u64).unwrap_or(0)));
     Ok(jobs)
