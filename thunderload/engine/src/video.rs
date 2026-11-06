@@ -375,7 +375,7 @@ pub async fn download_hls(
         let _ = fs::remove_dir_all(&work_dir).await;
     }
     download_result
-
+}
 
 #[cfg(test)]
 mod tests {
