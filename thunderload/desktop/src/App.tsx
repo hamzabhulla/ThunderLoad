@@ -65,6 +65,10 @@ export default function App() {
   const [videoNotice, setVideoNotice] = useState("");
   const [connections, setConnections] = useState(() => readSetting(CONNECTIONS_KEY, 8, [1, 2, 4, 8, 12, 16]));
   const [parallel, setParallel] = useState(() => readSetting(PARALLEL_KEY, 2, [1, 2, 3, 4]));
+  const [nativeBrowser, setNativeBrowser] = useState("chrome");
+  const [nativeExtensionId, setNativeExtensionId] = useState("");
+  const [nativeSetupStatus, setNativeSetupStatus] = useState("");
+  const [nativeSettingUp, setNativeSettingUp] = useState(false);
 
   const active = items.filter((item) => item.status === "Downloading").length;
   const queued = items.filter((item) => item.status === "Queued").length;
@@ -168,6 +172,23 @@ export default function App() {
     } catch (error) { setVideoNotice(String(error)); }
     finally { setInspecting(false); }
   }
+  async function registerNativeHost() {
+    const extensionId = nativeExtensionId.trim();
+    if (!extensionId) { setNativeSetupStatus("Enter your browser extension ID first."); return; }
+    setNativeSettingUp(true);
+    setNativeSetupStatus("Registering local browser connection…");
+    try {
+      const message = await invoke<string>("register_native_host", {
+        browser: nativeBrowser,
+        extensionId
+      });
+      setNativeSetupStatus(message);
+    } catch (error) {
+      setNativeSetupStatus(String(error));
+    } finally {
+      setNativeSettingUp(false);
+    }
+  }
   async function openFolder() {
     try { await invoke("open_download_folder"); }
     catch (error) { setNotice("Could not open download folder: " + String(error)); }
@@ -262,6 +283,25 @@ export default function App() {
           </div>
           <div className="rule" />
           <div className="settings-section"><div><h2>Storage</h2><p>ThunderLoad uses a dedicated folder in your system Downloads directory.</p></div><div className="storage-row"><span>Downloads / ThunderLoad</span><button className="secondary-button" onClick={openFolder}>Open folder ↗</button></div></div>
+          <div className="rule" />
+          <div className="settings-section">
+            <div><h2>Browser connection</h2><p>Register the optional local engine for adaptive video downloads. Direct file downloads work without this connection.</p></div>
+            <div className="native-host-grid">
+              <label><span>Browser</span><select className="select-field" value={nativeBrowser} onChange={(event) => {
+                setNativeBrowser(event.target.value);
+                if (event.target.value === "firefox" && !nativeExtensionId) setNativeExtensionId("thunderload@example.com");
+              }}>
+                <option value="chrome">Google Chrome</option>
+                <option value="edge">Microsoft Edge</option>
+                <option value="brave">Brave</option>
+                <option value="firefox">Firefox</option>
+              </select></label>
+              <label><span>Extension ID</span><input className="field" value={nativeExtensionId} onChange={(event) => setNativeExtensionId(event.target.value)} placeholder={nativeBrowser === "firefox" ? "thunderload@example.com" : "32 characters a–p"} /></label>
+              <button className="secondary-button" onClick={registerNativeHost} disabled={nativeSettingUp}>{nativeSettingUp ? "Registering…" : "Connect browser"}</button>
+            </div>
+            {nativeSetupStatus && <div className="notice native-host-notice">{nativeSetupStatus}</div>}
+            <p className="footnote">Copy the ID from the browser's Extensions page. After registration, restart the browser and allow Native messaging in the ThunderLoad extension.</p>
+          </div>
           <div className="rule" />
           <div className="settings-section"><div><h2>About</h2><p>Local desktop transfer engine · Version 0.2.0</p></div><div className="about-line"><span>Supported media</span><strong>Direct files · HLS</strong></div><div className="about-line"><span>Not available yet</span><strong>Resume · DASH remux · Speed limit</strong></div></div>
         </section>}
