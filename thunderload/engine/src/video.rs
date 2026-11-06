@@ -637,14 +637,6 @@ fn parse_dash_document(body: &str) -> Result<DashDocument> {
                     }
                 }
             }
-            /*
-                            "amp" => Some("&"), "lt" => Some("<"), "gt" => Some(">"),
-                            "apos" => Some("'"), "quot" => Some("\""), _ => None,
-                        };
-                        if let Some(value) = resolved { state.base_text.push_str(value); }
-                    }
-                }
-            }
             Ok(Event::CData(text)) => {
                 if state.base_scope.is_some() {
                     state.base_text.push_str(&String::from_utf8_lossy(text.as_ref()));
