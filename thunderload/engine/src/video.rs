@@ -557,8 +557,8 @@ fn dash_start_element(
             if let Some(scope) = state.active_template_scope {
                 let point = DashTimelinePoint {
                     time: attributes.get("t").and_then(|value| value.parse().ok()),
-                    duration: attributes.get("d").and_then(|value| value.parse().unwrap_or(0)),
-                    repeat: attributes.get("r").and_then(|value| value.parse().unwrap_or(0)),
+                    duration: attributes.get("d").and_then(|value| value.parse::<u64>().ok()).unwrap_or(0),
+                    repeat: attributes.get("r").and_then(|value| value.parse::<i64>().ok()).unwrap_or(0),
                 };
                 if point.duration > 0 {
                     let (adaptation_index, representation_index) = state.active_representation
@@ -620,7 +620,20 @@ fn parse_dash_document(body: &str) -> Result<DashDocument> {
             }
             Ok(Event::Text(text)) => {
                 if state.base_scope.is_some() {
-                    state.base_text.push_str(&text.unescape()?.into_owned());
+                    state.base_text.push_str(&text.decode()?.into_owned());
+                }
+            }
+            Ok(Event::GeneralRef(reference)) => {
+                if state.base_scope.is_some() {
+                    if let Some(character) = reference.resolve_char_ref()? {
+                        state.base_text.push(character);
+                    } else {
+                        let resolved = match reference.as_ref() {
+                            "amp" => Some("&"), "lt" => Some("<"), "gt" => Some(">"),
+                            "apos" => Some("'"), "quot" => Some("\""), _ => None,
+                        };
+                        if let Some(value) = resolved { state.base_text.push_str(value); }
+                    }
                 }
             }
             Ok(Event::CData(text)) => {
@@ -639,15 +652,6 @@ fn parse_dash_document(body: &str) -> Result<DashDocument> {
         }
     }
     Ok(document)
-}
-
-#[derive(Debug, Clone)]
-struct DashResolvedTrack {
-    representation_id: String,
-    mime_type: String,
-    initialization_url: Option<String>,
-    segment_urls: Vec<String>,
-    is_audio: bool,
 }
 
 fn merge_dash_base_url(
