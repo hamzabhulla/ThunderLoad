@@ -3,15 +3,16 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 type Page = "downloads" | "queue" | "video" | "settings";
-type Kind = "direct" | "hls";
-type Status = "Queued" | "Downloading" | "Completed" | "Failed" | "Interrupted";
-type Variant = { kind: string; quality: string; width?: number; height?: number; bandwidth?: number; url: string; downloadable: boolean; note?: string };
+type Kind = "direct" | "hls" | "dash";
+type Status = "Queued" | "Downloading" | "Pausing" | "Paused" | "Cancelling" | "Completed" | "Failed" | "Interrupted" | "Cancelled";
+type Variant = { kind: string; quality: string; width?: number; height?: number; bandwidth?: number; url: string; downloadable: boolean; note?: string; representationId?: string; audioRepresentationId?: string; audioOnly?: boolean };
 type Progress = { downloaded: number; total?: number; percent?: number; phase: string };
-type Item = { id: string; name: string; url: string; kind: Kind; status: Status; percent: number; downloaded: number; total?: number; detail: string; error?: string; createdAt: number };
+type Item = { id: string; name: string; url: string; kind: Kind; status: Status; percent: number; downloaded: number; total?: number; detail: string; error?: string; createdAt: number; targetPath?: string; scheduledAt?: number; source?: "native"; representationId?: string; audioRepresentationId?: string };
 
 const HISTORY_KEY = "thunderload.history.v2";
 const CONNECTIONS_KEY = "thunderload.connections.v1";
 const PARALLEL_KEY = "thunderload.parallel.v1";
+const SPEED_LIMIT_KEY = "thunderload.speed-limit.v1";
 
 function bytes(value: number): string {
   if (!Number.isFinite(value) || value <= 0) return "0 B";
@@ -23,8 +24,10 @@ function readItems(): Item[] {
   try {
     const saved = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
     if (!Array.isArray(saved)) return [];
-    return saved.map((item: Item) => item.status === "Downloading"
-      ? { ...item, status: "Interrupted", detail: "App closed before completion" }
+    return saved.map((item: Item) => item.status === "Downloading" || item.status === "Pausing"
+      ? item.kind === "direct" && item.targetPath
+        ? { ...item, status: "Queued", detail: "Recovering saved partial download…" }
+        : { ...item, status: "Interrupted", detail: "App closed before a resumable checkpoint was created" }
       : item);
   } catch { return []; }
 }
@@ -57,20 +60,26 @@ export default function App() {
   const [page, setPage] = useState<Page>("downloads");
   const [url, setUrl] = useState("");
   const [filename, setFilename] = useState("");
+  const [scheduleAt, setScheduleAt] = useState("");
   const [videoUrl, setVideoUrl] = useState("");
   const [items, setItems] = useState<Item[]>(readItems);
   const [variants, setVariants] = useState<Variant[]>([]);
   const [inspecting, setInspecting] = useState(false);
   const [notice, setNotice] = useState("Ready.");
   const [videoNotice, setVideoNotice] = useState("");
-  const [connections, setConnections] = useState(() => readSetting(CONNECTIONS_KEY, 8, [1, 2, 4, 8, 12, 16]));
+  const [connections, setConnections] = useState(() => readSetting(CONNECTIONS_KEY, 1, [1]));
   const [parallel, setParallel] = useState(() => readSetting(PARALLEL_KEY, 2, [1, 2, 3, 4]));
+  const [speedLimit, setSpeedLimit] = useState(() => readSetting(SPEED_LIMIT_KEY, 0, [0, 262144, 524288, 1048576, 2097152, 5242880, 10485760]));
+  const [clock, setClock] = useState(Date.now());
   const [nativeBrowser, setNativeBrowser] = useState("chrome");
   const [nativeExtensionId, setNativeExtensionId] = useState("");
   const [nativeSetupStatus, setNativeSetupStatus] = useState("");
   const [nativeSettingUp, setNativeSettingUp] = useState(false);
+  const [ffmpegPath, setFfmpegPath] = useState("ffmpeg");
+  const [ffmpegStatus, setFfmpegStatus] = useState("");
+  const [ffmpegSaving, setFfmpegSaving] = useState(false);
 
-  const active = items.filter((item) => item.status === "Downloading").length;
+  const active = items.filter((item) => item.status === "Downloading" || item.status === "Pausing" || item.status === "Cancelling").length;
   const queued = items.filter((item) => item.status === "Queued").length;
   const done = items.filter((item) => item.status === "Completed").length;
   const attention = items.filter((item) => item.status === "Failed" || item.status === "Interrupted").length;
@@ -80,6 +89,67 @@ export default function App() {
   useEffect(() => { localStorage.setItem(HISTORY_KEY, JSON.stringify(items)); }, [items]);
   useEffect(() => { localStorage.setItem(CONNECTIONS_KEY, String(connections)); }, [connections]);
   useEffect(() => { localStorage.setItem(PARALLEL_KEY, String(parallel)); }, [parallel]);
+  useEffect(() => {
+    localStorage.setItem(SPEED_LIMIT_KEY, String(speedLimit));
+    void invoke("set_speed_limit", { bytesPerSecond: speedLimit }).catch((error) => setNotice("Could not apply speed limit: " + String(error)));
+  }, [speedLimit]);
+  useEffect(() => {
+    const timer = window.setInterval(() => setClock(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let inFlight = false;
+    const refreshNativeJobs = async () => {
+      if (inFlight || disposed) return;
+      inFlight = true;
+      try {
+        const jobs = await invoke<Array<{
+          id: string; name?: string; url?: string; kind?: string; status?: string;
+          percent?: number; downloaded?: number; total?: number | null; detail?: string;
+          error?: string; createdAt?: number; targetPath?: string;
+          representationId?: string; audioRepresentationId?: string;
+        }>>("get_native_downloads");
+        if (disposed) return;
+        const external: Item[] = jobs.map((job) => ({
+          id: "native-" + job.id,
+          name: job.name || "Browser download",
+          url: job.url || "",
+          kind: job.kind === "hls" ? "hls" : job.kind === "dash" ? "dash" : "direct",
+          status: (["Downloading", "Completed", "Failed", "Interrupted"].includes(job.status || "") ? job.status : "Failed") as Status,
+          percent: Math.max(0, Math.min(100, job.percent || 0)),
+          downloaded: job.downloaded || 0,
+          total: job.total ?? undefined,
+          detail: job.detail || "Started from browser extension",
+          error: job.error,
+          createdAt: job.createdAt || Date.now(),
+          targetPath: job.targetPath,
+          representationId: job.representationId,
+          audioRepresentationId: job.audioRepresentationId,
+          source: "native"
+        }));
+        setItems((current) => {
+          const merged = new Map(current.filter((item) => item.source !== "native").map((item) => [item.id, item]));
+          for (const item of external) merged.set(item.id, item);
+          return Array.from(merged.values()).sort((a, b) => b.createdAt - a.createdAt);
+        });
+      } catch (error) {
+        // The companion is optional; local desktop transfers remain usable without it.
+      } finally { inFlight = false; }
+    };
+    void refreshNativeJobs();
+    const timer = window.setInterval(refreshNativeJobs, 1500);
+    return () => { disposed = true; window.clearInterval(timer); };
+  }, []);
+
+  useEffect(() => {
+    let alive = true;
+    void invoke<string | null>("get_ffmpeg_path").then((path) => {
+      if (alive && path) setFfmpegPath(path);
+    }).catch(() => {});
+    return () => { alive = false; };
+  }, []);
 
   useEffect(() => {
     let alive = true;
@@ -103,9 +173,19 @@ export default function App() {
             : item));
           setNotice("Download completed.");
         }),
-        listen<{ jobId: string; error: string }>("download-error", ({ payload }) => {
+        listen<{ jobId: string; targetPath: string }>("download-paused", ({ payload }) => {
           setItems((current) => current.map((item) => item.id === payload.jobId
-            ? { ...item, status: "Failed", detail: "Transfer failed", error: payload.error }
+            ? { ...item, status: "Paused", targetPath: payload.targetPath, detail: "Paused · partial file saved", error: undefined }
+            : item));
+        }),
+        listen<{ jobId: string }>("download-cancelled", ({ payload }) => {
+          setItems((current) => current.map((item) => item.id === payload.jobId
+            ? { ...item, status: "Cancelled", detail: "Cancelled · partial file removed", targetPath: undefined, downloaded: 0, percent: 0 }
+            : item));
+        }),
+listen<{ jobId: string; error: string; targetPath?: string }>("download-error", ({ payload }) => {
+          setItems((current) => current.map((item) => item.id === payload.jobId
+            ? { ...item, status: "Failed", detail: "Transfer interrupted · partial data kept", targetPath: payload.targetPath || item.targetPath, error: payload.error }
             : item));
           setNotice(payload.error);
         })
@@ -118,7 +198,7 @@ export default function App() {
 
   useEffect(() => {
     const slots = Math.max(0, parallel - active);
-    const next = items.filter((item) => item.status === "Queued").slice(0, slots);
+    const next = items.filter((item) => item.status === "Queued" && (!item.scheduledAt || item.scheduledAt <= clock)).slice(0, slots);
     if (!next.length) return;
     const ids = new Set(next.map((item) => item.id));
     setItems((current) => current.map((item) => ids.has(item.id) ? { ...item, status: "Downloading", detail: "Starting transfer…" } : item));
@@ -126,8 +206,16 @@ export default function App() {
       try {
         if (item.kind === "hls") {
           await invoke("start_hls_download", { jobId: item.id, url: item.url, filename: item.name });
+        } else if (item.kind === "dash") {
+          await invoke("start_dash_download", {
+            jobId: item.id, url: item.url, representationId: item.representationId,
+            audioRepresentationId: item.audioRepresentationId || null, filename: item.name
+          });
         } else {
-          await invoke("start_download", { jobId: item.id, url: item.url, filename: item.name, connections });
+          const targetPath = await invoke<string>("start_download", {
+            jobId: item.id, url: item.url, filename: item.name, targetPath: item.targetPath || null, connections
+          });
+          setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, targetPath } : entry));
         }
       } catch (error) {
         setItems((current) => current.map((entry) => entry.id === item.id
@@ -135,31 +223,77 @@ export default function App() {
           : entry));
       }
     });
-  }, [items, active, parallel, connections]);
+  }, [items, active, parallel, connections, clock]);
 
-  function add(value: string, saveAs?: string, requestedKind?: Kind) {
+  function add(value: string, saveAs?: string, requestedKind?: Kind, representationId?: string, audioRepresentationId?: string) {
     const clean = value.trim();
     if (!/^https?:\/\//i.test(clean)) { setNotice("Enter a valid HTTP or HTTPS URL."); return; }
     let kind: Kind = requestedKind || "direct";
     try {
-      if (!requestedKind && new URL(clean).pathname.toLowerCase().endsWith(".m3u8")) kind = "hls";
+      if (!requestedKind) {
+        const pathname = new URL(clean).pathname.toLowerCase();
+        if (pathname.endsWith(".m3u8")) kind = "hls";
+        else if (pathname.endsWith(".mpd")) kind = "dash";
+      }
     } catch { setNotice("That URL is not valid."); return; }
     const suggested = nameFromUrl(clean);
     const item: Item = {
-      id: crypto.randomUUID(), name: (saveAs || "").trim() || (kind === "hls" ? "video.mp4" : suggested),
+      id: crypto.randomUUID(), name: (saveAs || "").trim() || (kind === "hls" || kind === "dash" ? "video.mp4" : suggested),
       url: clean, kind, status: "Queued", percent: 0, downloaded: 0,
-      detail: "Waiting in queue", createdAt: Date.now()
+      representationId, audioRepresentationId,
+      detail: scheduleAt && new Date(scheduleAt).getTime() > Date.now()
+        ? "Scheduled for " + new Date(scheduleAt).toLocaleString()
+        : "Waiting in queue",
+      createdAt: Date.now(),
+      scheduledAt: scheduleAt ? new Date(scheduleAt).getTime() : undefined
     };
     setItems((current) => [item, ...current]);
     setNotice("Added to queue.");
-    setUrl(""); setFilename("");
+    setUrl(""); setFilename(""); setScheduleAt("");
   }
-  function remove(id: string) {
-    setItems((current) => current.filter((item) => item.id !== id || item.status === "Downloading"));
+  async function pause(item: Item) {
+    try {
+      await invoke("pause_download", { jobId: item.id });
+      setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, status: "Pausing", detail: "Pausing · saving checkpoint…" } : entry));
+    } catch (error) { setNotice(String(error)); }
   }
-  function retry(item: Item) { add(item.url, item.name, item.kind); }
-  function clearFinished() {
-    setItems((current) => current.filter((item) => item.status !== "Completed"));
+  function resume(item: Item) {
+    if (item.kind !== "direct") { retry(item); return; }
+    setItems((current) => current.map((entry) => entry.id === item.id
+      ? { ...entry, status: "Queued", error: undefined, detail: "Resume queued from saved checkpoint" }
+      : entry));
+  }
+  async function cancel(item: Item) {
+    if (item.kind !== "direct" || !item.targetPath) {
+      setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, status: "Cancelled", detail: "Cancelled" } : entry));
+      return;
+    }
+    try {
+      await invoke("cancel_download", { jobId: item.id, targetPath: item.targetPath });
+      setItems((current) => current.map((entry) => entry.id === item.id
+        ? { ...entry, status: "Cancelling", detail: "Cancelling and deleting partial file…" }
+        : entry));
+    } catch (error) { setNotice(String(error)); }
+  }
+  async function remove(id: string) {
+    const item = items.find((entry) => entry.id === id);
+    if (item?.source === "native") {
+      await invoke("dismiss_native_download", { jobId: item.id.replace(/^native-/, "") }).catch(() => {});
+    } else if (item?.targetPath && item.kind === "direct" && item.status !== "Completed") {
+      await invoke("cancel_download", { jobId: item.id, targetPath: item.targetPath }).catch(() => {});
+    }
+    setItems((current) => current.filter((entry) => entry.id !== id || entry.status === "Downloading" || entry.status === "Pausing"));
+  }
+  function retry(item: Item) {
+    if (item.source === "native") { add(item.url, item.name, item.kind, item.representationId, item.audioRepresentationId); return; }
+    if (item.kind === "direct" && item.targetPath) { resume(item); return; }
+    add(item.url, item.name, item.kind, item.representationId, item.audioRepresentationId);
+  }
+  async function clearFinished() {
+    const finished = items.filter((item) => item.status === "Completed" || item.status === "Cancelled");
+    await Promise.all(finished.filter((item) => item.source === "native")
+      .map((item) => invoke("dismiss_native_download", { jobId: item.id.replace(/^native-/, "") }).catch(() => {})));
+    setItems((current) => current.filter((item) => item.status !== "Completed" && item.status !== "Cancelled"));
   }
   async function inspect() {
     const clean = videoUrl.trim();
@@ -171,6 +305,16 @@ export default function App() {
       setVideoNotice(result.length ? result.length + " stream option(s) found." : "No downloadable streams found.");
     } catch (error) { setVideoNotice(String(error)); }
     finally { setInspecting(false); }
+  }
+  async function saveFfmpegPath() {
+    setFfmpegSaving(true);
+    setFfmpegStatus("Verifying FFmpeg…");
+    try {
+      const status = await invoke<string>("set_ffmpeg_path", { path: ffmpegPath });
+      setFfmpegStatus(status);
+    } catch (error) {
+      setFfmpegStatus(String(error));
+    } finally { setFfmpegSaving(false); }
   }
   async function registerNativeHost() {
     const extensionId = nativeExtensionId.trim();
@@ -200,12 +344,15 @@ export default function App() {
       <div className="transfer-body">
         <div className="transfer-top"><strong title={item.name}>{item.name}</strong><Status value={item.status} /></div>
         <div className="transfer-detail" title={item.url}>{item.detail}</div>
-        {(item.status === "Downloading" || item.status === "Completed") && <div className="progress"><span style={{ width: item.percent + "%" }} /></div>}
+        {(item.status === "Downloading" || item.status === "Pausing" || item.status === "Paused" || item.status === "Completed") && <div className="progress"><span style={{ width: item.percent + "%" }} /></div>}
         {item.error && <div className="error-text">{item.error}</div>}
       </div>
       <div className="transfer-actions">
-        {(item.status === "Failed" || item.status === "Interrupted") && <button className="quiet-button" onClick={() => retry(item)}>Retry</button>}
-        {item.status !== "Downloading" && <button className="remove-button" title="Remove" aria-label="Remove" onClick={() => remove(item.id)}>×</button>}
+        {item.status === "Downloading" && item.kind === "direct" && item.source !== "native" && <button className="quiet-button transfer-control" onClick={() => void pause(item)}>Pause</button>}
+        {item.status === "Paused" && <button className="quiet-button transfer-control" onClick={() => resume(item)}>Resume</button>}
+        {(item.status === "Failed" || item.status === "Interrupted") && <button className="quiet-button transfer-control" onClick={() => retry(item)}>{item.kind === "direct" && item.targetPath ? "Resume" : "Retry"}</button>}
+        {(item.status === "Downloading" || item.status === "Pausing" || item.status === "Paused" || item.status === "Failed" || item.status === "Interrupted" || item.status === "Queued") && item.kind === "direct" && item.source !== "native" && <button className="quiet-button transfer-control" onClick={() => void cancel(item)}>Cancel</button>}
+        {item.status !== "Downloading" && item.status !== "Pausing" && item.status !== "Cancelling" && (item.source !== "native" || item.status === "Completed" || item.status === "Failed" || item.status === "Interrupted") && <button className="remove-button" title="Remove" aria-label="Remove" onClick={() => void remove(item.id)}>×</button>}
       </div>
     </article>)}</div>;
   }
@@ -241,6 +388,7 @@ export default function App() {
               <label htmlFor="download-url">Download URL</label>
               <input id="download-url" className="field" value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://example.com/archive.zip" />
               <div className="add-actions"><div className="filename-field"><label htmlFor="download-name">Save as <small>OPTIONAL</small></label><input id="download-name" className="field" value={filename} onChange={(event) => setFilename(event.target.value)} placeholder="Use original filename" /></div><button type="submit" className="primary-button">Add to queue ↗</button></div>
+              <div className="schedule-row"><label htmlFor="schedule-at">Start later <small>OPTIONAL</small></label><input id="schedule-at" type="datetime-local" className="field schedule-field" min={new Date(clock - new Date(clock).getTimezoneOffset() * 60000).toISOString().slice(0, 16)} value={scheduleAt} onChange={(event) => setScheduleAt(event.target.value)} /></div>
             </form>
             <div className="notice">{notice}</div>
             {url.trim() && <button className="text-link" onClick={() => { setVideoUrl(url.trim()); setPage("video"); }}>Inspect media qualities instead →</button>}
@@ -256,7 +404,7 @@ export default function App() {
           <div className="summary queue-summary"><div><strong>{active}</strong><span>Active</span></div><div><strong>{queued}</strong><span>Waiting</span></div><div><strong>{done}</strong><span>Completed</span></div><div><strong>{attention}</strong><span>Failed</span></div></div>
           <div className="panel-heading"><div><h2>All transfers</h2><p>Jobs start automatically, up to your active transfer limit.</p></div><button className="quiet-button" onClick={clearFinished}>Clear finished</button></div>
           {transferList(ordered)}
-          <p className="footnote">Downloads that are interrupted by closing the app can be retried. Resuming partial files is not available in this build.</p>
+          <p className="footnote">Direct HTTP downloads keep a partial file on disk. Pause saves a checkpoint, Resume continues with HTTP Range when the server permits it, and startup automatically recovers saved direct-download checkpoints. Scheduled jobs start at their selected local time.</p>
         </section>}
 
         {page === "video" && <section className="panel video-panel">
@@ -270,19 +418,33 @@ export default function App() {
           {variants.length > 0 && <div className="variants"><div className="variants-heading"><h3>Available streams</h3><span>{variants.length} OPTIONS</span></div>
             {variants.map((variant, index) => <div className="variant" key={variant.url + index}>
               <div><strong>{variant.quality}</strong><small>{variant.kind.toUpperCase()}{variant.width && variant.height ? " · " + variant.width + " × " + variant.height : ""}{variant.bandwidth ? " · " + Math.round(variant.bandwidth / 1000) + " kbps" : ""}</small>{variant.note && <p>{variant.note}</p>}</div>
-              <button className="secondary-button" disabled={!variant.downloadable} onClick={() => add(variant.url, "video.mp4", variant.kind === "hls" ? "hls" : "direct")}>{variant.downloadable ? "Download" : "Unavailable"}</button>
+              <button className="secondary-button" disabled={!variant.downloadable} onClick={() => add(variant.kind === "dash" ? videoUrl : variant.url, "video.mp4", variant.kind === "hls" ? "hls" : variant.kind === "dash" ? "dash" : "direct", variant.representationId, variant.audioRepresentationId)}>{variant.downloadable ? "Download" : "Unavailable"}</button>
             </div>)}
           </div>}
-          <div className="support-note"><strong>What works</strong><p>Direct media files and unencrypted HLS playlists. DASH quality detection is available, but DASH downloading is not. A YouTube watch page is not a direct media URL; this desktop build does not extract its streams.</p></div>
+          <div className="support-note"><strong>Format support</strong><p>Direct HTTP/HTTPS files use resumable transfers. HLS supports completed unencrypted VOD. DASH supports static MPDs with SegmentTemplate/SegmentTimeline; separate audio/video requires FFmpeg. Live/dynamic MPDs, DRM, SegmentBase/SegmentList and multi-period DASH are not supported. A YouTube watch page is not a direct media URL; page extraction is not available in this build.</p></div>
         </section>}
 
         {page === "settings" && <section className="panel settings-panel">
           <div className="settings-section"><div><h2>Transfer behaviour</h2><p>Saved locally. Applies to new downloads.</p></div>
-            <label className="setting-row"><span><strong>Connections per file</strong><small>Used when the server supports byte-range requests.</small></span><select className="select-field" value={connections} onChange={(event) => setConnections(Number(event.target.value))}>{[1, 2, 4, 8, 12, 16].map((n) => <option key={n} value={n}>{n} {n === 1 ? "connection" : "connections"}</option>)}</select></label>
+            <label className="setting-row"><span><strong>Connections per file</strong><small>Checkpoint-safe downloads currently use one stream. Multi-connection resume is still being developed.</small></span><select className="select-field" value={connections} disabled><option value={1}>1 connection</option></select></label>
             <label className="setting-row"><span><strong>Simultaneous downloads</strong><small>Maximum number of active queue items.</small></span><select className="select-field" value={parallel} onChange={(event) => setParallel(Number(event.target.value))}>{[1, 2, 3, 4].map((n) => <option key={n} value={n}>{n} {n === 1 ? "download" : "downloads"}</option>)}</select></label>
+            <label className="setting-row"><span><strong>Speed limit</strong><small>Applies to direct desktop HTTP transfers, including active jobs. HLS/DASH segment throttling is not yet included. Zero means unlimited.</small></span><select className="select-field" value={speedLimit} onChange={(event) => setSpeedLimit(Number(event.target.value))}>
+              <option value={0}>Unlimited</option><option value={262144}>256 KB/s</option><option value={524288}>512 KB/s</option><option value={1048576}>1 MB/s</option><option value={2097152}>2 MB/s</option><option value={5242880}>5 MB/s</option><option value={10485760}>10 MB/s</option>
+            </select></label>
           </div>
           <div className="rule" />
           <div className="settings-section"><div><h2>Storage</h2><p>ThunderLoad uses a dedicated folder in your system Downloads directory.</p></div><div className="storage-row"><span>Downloads / ThunderLoad</span><button className="secondary-button" onClick={openFolder}>Open folder ↗</button></div></div>
+          <div className="rule" />
+          <div className="settings-section">
+            <div><h2>DASH video support</h2><p>Static DASH VOD with separate audio/video tracks needs FFmpeg to combine the selected quality into one MP4 file.</p></div>
+            <div className="ffmpeg-row">
+              <label htmlFor="ffmpeg-path">FFmpeg executable path</label>
+              <input id="ffmpeg-path" className="field" value={ffmpegPath} onChange={(event) => setFfmpegPath(event.target.value)} placeholder="C:\Tools\ffmpeg\bin\ffmpeg.exe or ffmpeg" />
+              <button className="secondary-button" onClick={saveFfmpegPath} disabled={ffmpegSaving}>{ffmpegSaving ? "Checking…" : "Verify & save"}</button>
+            </div>
+            {ffmpegStatus && <div className="notice native-host-notice">{ffmpegStatus}</div>}
+            <p className="footnote">ThunderLoad verifies the executable by running <code>ffmpeg -version</code>, then saves its path in your local app configuration. An empty value clears the custom path and falls back to FFmpeg on PATH.</p>
+          </div>
           <div className="rule" />
           <div className="settings-section">
             <div><h2>Browser connection</h2><p>Register the optional local engine for adaptive video downloads. Direct file downloads work without this connection.</p></div>
@@ -303,7 +465,7 @@ export default function App() {
             <p className="footnote">Copy the ID from the browser's Extensions page. After registration, restart the browser and allow Native messaging in the ThunderLoad extension.</p>
           </div>
           <div className="rule" />
-          <div className="settings-section"><div><h2>About</h2><p>Local desktop transfer engine · Version 0.2.0</p></div><div className="about-line"><span>Supported media</span><strong>Direct files · HLS</strong></div><div className="about-line"><span>Not available yet</span><strong>Resume · DASH remux · Speed limit</strong></div></div>
+          <div className="settings-section"><div><h2>About</h2><p>Local desktop transfer engine · Version 0.2.0</p></div><div className="about-line"><span>Supported media</span><strong>Direct files · HLS VOD · Static DASH VOD</strong></div><div className="about-line"><span>Direct downloads</span><strong>Pause · Resume · Cancel · Speed limit · Schedule</strong></div><div className="about-line"><span>Still in development</span><strong>Multi-connection resume · HLS pause · Live/multi-period DASH</strong></div></div>
         </section>}
 
         <footer className="app-footer"><span>ThunderLoad</span><span>Downloads stay on this device.</span></footer>

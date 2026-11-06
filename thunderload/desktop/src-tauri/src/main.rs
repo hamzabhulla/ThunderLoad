@@ -1,12 +1,50 @@
-use std::{path::PathBuf, process::Command};
-use serde_json::json;
+use std::{collections::HashMap, path::PathBuf, process::Command, sync::{Arc, Mutex, OnceLock}};
+use serde_json::{json, Value};
 use tauri::{Emitter, Manager};
-use thunderload_engine::{default_download_dir, download_hls, download_url, inspect_video, safe_filename};
-use tokio::sync::mpsc;
+use thunderload_engine::{default_download_dir, download_hls, download_url_resumable, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, DownloadControl, DownloadOutcome, GlobalRateLimiter};
+use tokio::{process::Command as TokioCommand, sync::{mpsc, watch}};
 
 #[tauri::command]
 async fn inspect_video_url(url: String, referer: Option<String>) -> Result<Vec<thunderload_engine::VideoVariant>, String> {
     inspect_video(&url, referer.as_deref()).await.map_err(|error| error.to_string())
+}
+
+
+static JOB_CONTROLS: OnceLock<Mutex<HashMap<String, watch::Sender<DownloadControl>>>> = OnceLock::new();
+static RATE_LIMITER: OnceLock<Arc<GlobalRateLimiter>> = OnceLock::new();
+
+fn job_controls() -> &'static Mutex<HashMap<String, watch::Sender<DownloadControl>>> {
+    JOB_CONTROLS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn rate_limiter() -> Arc<GlobalRateLimiter> {
+    RATE_LIMITER.get_or_init(|| Arc::new(GlobalRateLimiter::new())).clone()
+}
+
+#[tauri::command]
+async fn set_speed_limit(bytes_per_second: u64) -> Result<(), String> {
+    rate_limiter().set_limit(bytes_per_second);
+    Ok(())
+}
+
+#[tauri::command]
+async fn pause_download(job_id: String) -> Result<(), String> {
+    let controls = job_controls().lock().map_err(|_| "Download control lock is unavailable")?;
+    let sender = controls.get(&job_id).ok_or_else(|| "This download is not active. Resume it from the queue.".to_string())?;
+    sender.send(DownloadControl::Paused).map_err(|_| "The download has already stopped. Resume it from the queue.".to_string())
+}
+
+#[tauri::command]
+async fn cancel_download(job_id: String, target_path: String) -> Result<(), String> {
+    let sender = job_controls().lock().map_err(|_| "Download control lock is unavailable")?.remove(&job_id);
+    let actively_running = sender.map(|sender| sender.send(DownloadControl::Cancelled).is_ok()).unwrap_or(false);
+    if !actively_running {
+        let target = PathBuf::from(target_path);
+        let _ = tokio::fs::remove_file(partial_download_path(&target)).await;
+        let _ = tokio::fs::remove_file(partial_download_metadata_path(&target)).await;
+        let _ = tokio::fs::remove_file(&target).await;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -14,6 +52,7 @@ async fn start_download(
     job_id: String,
     url: String,
     filename: String,
+    target_path: Option<String>,
     connections: usize,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
@@ -21,23 +60,50 @@ async fn start_download(
         return Err("Only HTTP and HTTPS download URLs are supported".into());
     }
     let name = safe_filename(&filename, "download.bin");
-    let target: PathBuf = default_download_dir().join(name);
+    let target = match target_path {
+        Some(path) => PathBuf::from(path),
+        None => reserve_download_path(&default_download_dir().join(name)).await.map_err(|error| error.to_string())?,
+    };
+    let _ = connections; // Resumable transfers use one stream so their checkpoint is continuous.
+    let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
+    {
+        let mut controls = job_controls().lock().map_err(|_| "Download control lock is unavailable")?;
+        controls.insert(job_id.clone(), control_tx);
+    }
+
     let job_for_task = job_id.clone();
+    let app_for_task = app.clone();
+    let limit = rate_limiter();
+    let task_target = target.clone();
     tauri::async_runtime::spawn(async move {
         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
-        let progress_app = app.clone();
+        let progress_app = app_for_task.clone();
         let progress_id = job_for_task.clone();
         tauri::async_runtime::spawn(async move {
             while let Some(progress) = progress_rx.recv().await {
                 let _ = progress_app.emit("download-progress", json!({ "jobId": progress_id, "progress": progress }));
             }
         });
-        match download_url(&url, &target, connections.clamp(1, 16), None, progress_tx).await {
-            Ok(path) => { let _ = app.emit("download-complete", json!({ "jobId": job_for_task, "path": path.to_string_lossy() })); }
-            Err(error) => { let _ = app.emit("download-error", json!({ "jobId": job_for_task, "error": error.to_string() })); }
+        let result = download_url_resumable(&url, &task_target, None, control_rx, limit, progress_tx).await;
+        match result {
+            Ok(DownloadOutcome::Completed) => {
+                let _ = app_for_task.emit("download-complete", json!({ "jobId": job_for_task, "path": task_target.to_string_lossy() }));
+                if let Ok(mut controls) = job_controls().lock() { controls.remove(&job_for_task); }
+            }
+            Ok(DownloadOutcome::Paused) => {
+                let _ = app_for_task.emit("download-paused", json!({ "jobId": job_for_task, "targetPath": task_target.to_string_lossy() }));
+            }
+            Ok(DownloadOutcome::Cancelled) => {
+                let _ = app_for_task.emit("download-cancelled", json!({ "jobId": job_for_task }));
+                if let Ok(mut controls) = job_controls().lock() { controls.remove(&job_for_task); }
+            }
+            Err(error) => {
+                let _ = app_for_task.emit("download-error", json!({ "jobId": job_for_task, "error": error.to_string(), "targetPath": task_target.to_string_lossy() }));
+                if let Ok(mut controls) = job_controls().lock() { controls.remove(&job_for_task); }
+            }
         }
     });
-    Ok(job_id)
+    Ok(target.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -130,6 +196,137 @@ async fn register_native_host(
 }
 
 #[tauri::command]
+async fn start_dash_download(
+    job_id: String,
+    url: String,
+    representation_id: String,
+    audio_representation_id: Option<String>,
+    filename: String,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err("Only HTTP and HTTPS DASH manifests are supported".into());
+    }
+    if representation_id.trim().is_empty() {
+        return Err("A DASH representation must be selected before downloading".into());
+    }
+    let name = safe_filename(&filename, "video.mp4");
+    let job_for_task = job_id.clone();
+    tauri::async_runtime::spawn(async move {
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        let progress_app = app.clone();
+        let progress_id = job_for_task.clone();
+        tauri::async_runtime::spawn(async move {
+            while let Some(progress) = progress_rx.recv().await {
+                let _ = progress_app.emit("download-progress", json!({ "jobId": progress_id, "progress": progress }));
+            }
+        });
+        match thunderload_engine::download_dash(
+            &url, &representation_id, audio_representation_id.as_deref(), &name, None, progress_tx
+        ).await {
+            Ok(path) => {
+                let _ = app.emit("download-complete", json!({ "jobId": job_for_task, "path": path.to_string_lossy() }));
+            }
+            Err(error) => {
+                let _ = app.emit("download-error", json!({ "jobId": job_for_task, "error": error.to_string() }));
+            }
+        }
+    });
+    Ok(job_id)
+}
+
+#[tauri::command]
+async fn get_ffmpeg_path(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    let path = app.path().app_config_dir().map_err(|error| error.to_string())?.join("ffmpeg.path");
+    match tokio::fs::read_to_string(path).await {
+        Ok(value) => {
+            let value = value.trim().to_string();
+            Ok((!value.is_empty()).then_some(value))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[tauri::command]
+async fn set_ffmpeg_path(path: String, app: tauri::AppHandle) -> Result<String, String> {
+    let value = path.trim().to_string();
+    let config_file = app.path().app_config_dir()
+        .map_err(|error| error.to_string())?.join("ffmpeg.path");
+    if value.is_empty() {
+        match tokio::fs::remove_file(&config_file).await {
+            Ok(()) => {},
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) => return Err(error.to_string()),
+        }
+        std::env::remove_var("THUNDERLOAD_FFMPEG");
+        return Ok("Custom FFmpeg path cleared. ThunderLoad will look for ffmpeg on PATH.".into());
+    }
+    let result = TokioCommand::new(&value).arg("-version").output().await
+        .map_err(|error| format!("Could not start FFmpeg at '{value}': {error}"))?;
+    if !result.status.success() {
+        return Err(format!("FFmpeg returned a non-zero exit code when checking '{value}'."));
+    }
+    let version = String::from_utf8_lossy(&result.stdout).lines().next().unwrap_or("FFmpeg verified").to_string();
+    let parent = config_file.parent().ok_or_else(|| "Application config directory is unavailable".to_string())?;
+    tokio::fs::create_dir_all(parent).await.map_err(|error| error.to_string())?;
+    tokio::fs::write(&config_file, &value).await.map_err(|error| error.to_string())?;
+    std::env::set_var("THUNDERLOAD_FFMPEG", &value);
+    Ok(format!("{version} · saved in ThunderLoad settings"))
+}
+
+#[tauri::command]
+async fn get_native_downloads() -> Result<Vec<Value>, String> {
+    let directory = default_download_dir().join(".native-jobs");
+    if !tokio::fs::try_exists(&directory).await.unwrap_or(false) {
+        return Ok(Vec::new());
+    }
+    let mut entries = tokio::fs::read_dir(&directory).await.map_err(|error| error.to_string())?;
+    let mut jobs = Vec::new();
+    while let Some(entry) = entries.next_entry().await.map_err(|error| error.to_string())? {
+        if entry.path().extension().and_then(|value| value.to_str()) != Some("json") { continue; }
+        let content = match tokio::fs::read_to_string(entry.path()).await {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+        if let Ok(mut job) = serde_json::from_str::<Value>(&content) {
+            let status = job.get("status").and_then(Value::as_str).unwrap_or("");
+            let updated = job.get("updatedAt").and_then(Value::as_u64).unwrap_or(0);
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_millis() as u64;
+            // Native host refreshes its heartbeat every ten seconds. A stale
+            // "Downloading" entry therefore means the host process exited.
+            if status == "Downloading" && updated > 0 && now.saturating_sub(updated) > 45_000 {
+                job["status"] = json!("Interrupted");
+                job["detail"] = json!("Browser native host stopped. Retry this URL to start again.");
+                job["error"] = json!("The browser companion disconnected before completion.");
+                job["updatedAt"] = json!(now);
+                if let Ok(bytes) = serde_json::to_vec(&job) {
+                    let temporary = entry.path().with_extension("json.tmp");
+                    if tokio::fs::write(&temporary, bytes).await.is_ok() {
+                        let _ = tokio::fs::rename(&temporary, entry.path()).await;
+                    }
+                }
+            }
+            jobs.push(job);
+        }
+    }
+    jobs.sort_by_key(|job| std::cmp::Reverse(job.get("createdAt").and_then(Value::as_u64).unwrap_or(0)));
+    Ok(jobs)
+}
+
+#[tauri::command]
+async fn dismiss_native_download(job_id: String) -> Result<(), String> {
+    let id = safe_filename(&job_id, "job");
+    let path = default_download_dir().join(".native-jobs").join(format!("{id}.json"));
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[tauri::command]
 async fn open_download_folder() -> Result<(), String> {
     let folder = default_download_dir();
     std::fs::create_dir_all(&folder).map_err(|error| error.to_string())?;
@@ -144,7 +341,16 @@ async fn open_download_folder() -> Result<(), String> {
 
 fn main() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![inspect_video_url, start_download, start_hls_download, register_native_host, open_download_folder])
+        .setup(|app| {
+            if let Ok(config_dir) = app.path().app_config_dir() {
+                if let Ok(value) = std::fs::read_to_string(config_dir.join("ffmpeg.path")) {
+                    let value = value.trim();
+                    if !value.is_empty() { std::env::set_var("THUNDERLOAD_FFMPEG", value); }
+                }
+            }
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![inspect_video_url, start_download, pause_download, cancel_download, set_speed_limit, start_hls_download, start_dash_download, get_ffmpeg_path, set_ffmpeg_path, get_native_downloads, dismiss_native_download, register_native_host, open_download_folder])
         .run(tauri::generate_context!())
         .expect("error while running ThunderLoad desktop app");
 }
