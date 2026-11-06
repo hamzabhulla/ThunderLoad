@@ -3,30 +3,25 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 type Page = "downloads" | "queue" | "video" | "settings";
-type Kind = "direct" | "hls";
-type Status = "Queued" | "Downloading" | "Completed" | "Failed" | "Interrupted";
-type Variant = { kind: string; quality: string; width?: number; height?: number; bandwidth?: number; url: string; downloadable: boolean; note?: string };
+type Kind = "direct" | "hls" | "dash";
+type Status = "Scheduled" | "Queued" | "Downloading" | "Pausing" | "Paused" | "Completed" | "Failed" | "Interrupted" | "Cancelling" | "Cancelled";
+type Variant = { kind: string; quality: string; width?: number; height?: number; bandwidth?: number; url: string; representationId?: string; downloadable: boolean; note?: string };
 type Progress = { downloaded: number; total?: number; percent?: number; phase: string };
-type Item = { id: string; name: string; url: string; kind: Kind; status: Status; percent: number; downloaded: number; total?: number; detail: string; error?: string; createdAt: number };
+type Item = { id: string; name: string; url: string; kind: Kind; representationId?: string; status: Status; percent: number; downloaded: number; total?: number; detail: string; error?: string; createdAt: number };
+type StoredJob = { id: string; url: string; filename: string; kind: string; representationId?: string; status: Status; targetPath: string; connections: number; downloaded: number; total?: number; percent: number; detail: string; error?: string; createdAt: number; updatedAt: number; scheduledAt?: number };
+function fromStoredJob(job: StoredJob): Item {
+  return { id: job.id, name: job.filename, url: job.url, kind: job.kind === "hls" ? "hls" : job.kind === "dash" ? "dash" : "direct", representationId: job.representationId, status: job.status, percent: job.percent || 0, downloaded: job.downloaded || 0, total: job.total, detail: job.detail, error: job.error, createdAt: job.createdAt };
+}
 
-const HISTORY_KEY = "thunderload.history.v2";
 const CONNECTIONS_KEY = "thunderload.connections.v1";
 const PARALLEL_KEY = "thunderload.parallel.v1";
+const SPEED_KEY = "thunderload.speed-limit-kbps.v1";
 
 function bytes(value: number): string {
   if (!Number.isFinite(value) || value <= 0) return "0 B";
   const units = ["B", "KB", "MB", "GB", "TB"];
   const unit = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1);
   return (value / Math.pow(1024, unit)).toFixed(unit ? 1 : 0) + " " + units[unit];
-}
-function readItems(): Item[] {
-  try {
-    const saved = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
-    if (!Array.isArray(saved)) return [];
-    return saved.map((item: Item) => item.status === "Downloading"
-      ? { ...item, status: "Interrupted", detail: "App closed before completion" }
-      : item);
-  } catch { return []; }
 }
 function readSetting(key: string, fallback: number, allowed: number[]): number {
   try {
@@ -58,28 +53,30 @@ export default function App() {
   const [url, setUrl] = useState("");
   const [filename, setFilename] = useState("");
   const [videoUrl, setVideoUrl] = useState("");
-  const [items, setItems] = useState<Item[]>(readItems);
+  const [items, setItems] = useState<Item[]>([]);
   const [variants, setVariants] = useState<Variant[]>([]);
   const [inspecting, setInspecting] = useState(false);
   const [notice, setNotice] = useState("Ready.");
   const [videoNotice, setVideoNotice] = useState("");
   const [connections, setConnections] = useState(() => readSetting(CONNECTIONS_KEY, 8, [1, 2, 4, 8, 12, 16]));
   const [parallel, setParallel] = useState(() => readSetting(PARALLEL_KEY, 2, [1, 2, 3, 4]));
+  const [speedLimitKbps, setSpeedLimitKbps] = useState(() => readSetting(SPEED_KEY, 0, [0, 64, 128, 256, 512, 1024, 2048, 5120]));
+  const [scheduleAt, setScheduleAt] = useState("");
   const [nativeBrowser, setNativeBrowser] = useState("chrome");
   const [nativeExtensionId, setNativeExtensionId] = useState("");
   const [nativeSetupStatus, setNativeSetupStatus] = useState("");
   const [nativeSettingUp, setNativeSettingUp] = useState(false);
 
-  const active = items.filter((item) => item.status === "Downloading").length;
-  const queued = items.filter((item) => item.status === "Queued").length;
+  const active = items.filter((item) => ["Downloading", "Pausing", "Cancelling"].includes(item.status)).length;
+  const queued = items.filter((item) => ["Queued", "Scheduled"].includes(item.status)).length;
   const done = items.filter((item) => item.status === "Completed").length;
-  const attention = items.filter((item) => item.status === "Failed" || item.status === "Interrupted").length;
+  const attention = items.filter((item) => ["Failed", "Interrupted"].includes(item.status)).length;
   const ordered = useMemo(() => items.slice().sort((a, b) => b.createdAt - a.createdAt), [items]);
   const [title, subtitle] = pageInfo(page);
 
-  useEffect(() => { localStorage.setItem(HISTORY_KEY, JSON.stringify(items)); }, [items]);
   useEffect(() => { localStorage.setItem(CONNECTIONS_KEY, String(connections)); }, [connections]);
-  useEffect(() => { localStorage.setItem(PARALLEL_KEY, String(parallel)); }, [parallel]);
+  useEffect(() => { localStorage.setItem(PARALLEL_KEY, String(parallel)); void invoke("set_max_active_command", { count: parallel }); }, [parallel]);
+  useEffect(() => { localStorage.setItem(SPEED_KEY, String(speedLimitKbps)); void invoke("set_speed_limit_command", { bytesPerSecond: Math.round(speedLimitKbps * 1024) }); }, [speedLimitKbps]);
 
   useEffect(() => {
     let alive = true;
@@ -92,7 +89,7 @@ export default function App() {
             downloaded: payload.progress.downloaded,
             total: payload.progress.total,
             percent: Math.max(0, Math.min(100, payload.progress.percent ?? item.percent)),
-            detail: item.kind === "hls"
+            detail: item.kind !== "direct"
               ? "Downloading media segments · " + Math.round(payload.progress.percent ?? 0) + "%"
               : bytes(payload.progress.downloaded) + (payload.progress.total ? " of " + bytes(payload.progress.total) : " downloaded")
           }));
@@ -108,58 +105,79 @@ export default function App() {
             ? { ...item, status: "Failed", detail: "Transfer failed", error: payload.error }
             : item));
           setNotice(payload.error);
+        }),
+        listen<StoredJob>("job-updated", ({ payload }) => {
+          const incoming = fromStoredJob(payload);
+          setItems((current) => current.some((item) => item.id === incoming.id)
+            ? current.map((item) => item.id === incoming.id ? incoming : item)
+            : [incoming, ...current]);
         })
       ]);
       if (!alive) listeners.forEach((fn) => fn());
       else cleanup = listeners;
     })().catch((error) => setNotice(String(error)));
+    void invoke<StoredJob[]>("list_downloads_command").then((saved) => {
+      if (alive) setItems(saved.map(fromStoredJob));
+    }).catch((error) => setNotice("Could not restore saved queue: " + String(error)));
     return () => { alive = false; cleanup.forEach((fn) => fn()); };
   }, []);
 
-  useEffect(() => {
-    const slots = Math.max(0, parallel - active);
-    const next = items.filter((item) => item.status === "Queued").slice(0, slots);
-    if (!next.length) return;
-    const ids = new Set(next.map((item) => item.id));
-    setItems((current) => current.map((item) => ids.has(item.id) ? { ...item, status: "Downloading", detail: "Starting transfer…" } : item));
-    next.forEach(async (item) => {
-      try {
-        if (item.kind === "hls") {
-          await invoke("start_hls_download", { jobId: item.id, url: item.url, filename: item.name });
-        } else {
-          await invoke("start_download", { jobId: item.id, url: item.url, filename: item.name, connections });
-        }
-      } catch (error) {
-        setItems((current) => current.map((entry) => entry.id === item.id
-          ? { ...entry, status: "Failed", detail: "Could not start", error: String(error) }
-          : entry));
-      }
-    });
-  }, [items, active, parallel, connections]);
-
-  function add(value: string, saveAs?: string, requestedKind?: Kind) {
+  async function add(value: string, saveAs?: string, requestedKind?: Kind, representationId?: string) {
     const clean = value.trim();
     if (!/^https?:\/\//i.test(clean)) { setNotice("Enter a valid HTTP or HTTPS URL."); return; }
     let kind: Kind = requestedKind || "direct";
     try {
-      if (!requestedKind && new URL(clean).pathname.toLowerCase().endsWith(".m3u8")) kind = "hls";
+      const pathname = new URL(clean).pathname.toLowerCase();
+      if (!requestedKind && pathname.endsWith(".m3u8")) kind = "hls";
+      else if (!requestedKind && pathname.endsWith(".mpd")) kind = "dash";
     } catch { setNotice("That URL is not valid."); return; }
     const suggested = nameFromUrl(clean);
     const item: Item = {
-      id: crypto.randomUUID(), name: (saveAs || "").trim() || (kind === "hls" ? "video.mp4" : suggested),
-      url: clean, kind, status: "Queued", percent: 0, downloaded: 0,
-      detail: "Waiting in queue", createdAt: Date.now()
+      id: crypto.randomUUID(),
+      name: (saveAs || "").trim() || (kind === "hls" || kind === "dash" ? "video.mp4" : suggested),
+      url: clean, kind, representationId, status: "Queued", percent: 0, downloaded: 0,
+      detail: "Saving to persistent queue", createdAt: Date.now()
     };
-    setItems((current) => [item, ...current]);
-    setNotice("Added to queue.");
-    setUrl(""); setFilename("");
+    try {
+      const scheduledAt = scheduleAt ? new Date(scheduleAt).getTime() : null;
+      if (scheduledAt !== null && (!Number.isFinite(scheduledAt) || scheduledAt <= Date.now())) {
+        setNotice("Choose a schedule time in the future.");
+        return;
+      }
+      const stored = await invoke<StoredJob>("enqueue_download_command", {
+        jobId: item.id, url: clean, filename: item.name, kind, connections,
+        scheduledAt, representationId: representationId || null
+      });
+      const savedItem = fromStoredJob(stored);
+      setItems((current) => [savedItem, ...current.filter((entry) => entry.id !== savedItem.id)]);
+      setNotice(scheduledAt ? "Download scheduled." : "Added to persistent queue.");
+      setUrl(""); setFilename(""); setScheduleAt("");
+    } catch (error) {
+      setItems((current) => [{ ...item, status: "Failed", error: String(error), detail: "Could not save job" }, ...current]);
+      setNotice("Could not add download: " + String(error));
+    }
   }
-  function remove(id: string) {
-    setItems((current) => current.filter((item) => item.id !== id || item.status === "Downloading"));
+  async function remove(id: string) {
+    try {
+      await invoke("remove_download_command", { jobId: id });
+      setItems((current) => current.filter((item) => item.id !== id));
+    } catch (error) { setNotice(String(error)); }
   }
-  function retry(item: Item) { add(item.url, item.name, item.kind); }
+  async function retry(item: Item) {
+    try { await invoke("resume_download_command", { jobId: item.id }); }
+    catch (error) { setNotice(String(error)); }
+  }
+  async function pause(item: Item) {
+    try { await invoke("pause_download_command", { jobId: item.id }); }
+    catch (error) { setNotice(String(error)); }
+  }
+  async function cancel(item: Item) {
+    try { await invoke("cancel_download_command", { jobId: item.id }); }
+    catch (error) { setNotice(String(error)); }
+  }
   function clearFinished() {
-    setItems((current) => current.filter((item) => item.status !== "Completed"));
+    const finished = items.filter((item) => ["Completed", "Cancelled"].includes(item.status));
+    finished.forEach((item) => { void remove(item.id); });
   }
   async function inspect() {
     const clean = videoUrl.trim();
@@ -194,18 +212,20 @@ export default function App() {
     catch (error) { setNotice("Could not open download folder: " + String(error)); }
   }
   function transferList(list: Item[]) {
-    if (!list.length) return <div className="empty-state"><span className="empty-icon">↓</span><strong>No transfers yet</strong><p>Add a direct file URL to begin. Your activity will appear here.</p></div>;
+    if (!list.length) return <div className="empty-state"><span className="empty-icon">↓</span><strong>No transfers yet</strong><p>Add a direct file, HLS playlist or supported DASH manifest.</p></div>;
     return <div className="transfer-list">{list.map((item) => <article className="transfer" key={item.id}>
-      <div className="file-type">{item.kind === "hls" ? "▶" : "↓"}</div>
+      <div className="file-type">{item.kind === "direct" ? "↓" : "▶"}</div>
       <div className="transfer-body">
         <div className="transfer-top"><strong title={item.name}>{item.name}</strong><Status value={item.status} /></div>
         <div className="transfer-detail" title={item.url}>{item.detail}</div>
-        {(item.status === "Downloading" || item.status === "Completed") && <div className="progress"><span style={{ width: item.percent + "%" }} /></div>}
+        {(["Downloading", "Pausing", "Paused", "Completed"].includes(item.status)) && <div className="progress"><span style={{ width: item.percent + "%" }} /></div>}
         {item.error && <div className="error-text">{item.error}</div>}
       </div>
       <div className="transfer-actions">
-        {(item.status === "Failed" || item.status === "Interrupted") && <button className="quiet-button" onClick={() => retry(item)}>Retry</button>}
-        {item.status !== "Downloading" && <button className="remove-button" title="Remove" aria-label="Remove" onClick={() => remove(item.id)}>×</button>}
+        {item.status === "Downloading" && <button className="quiet-button" onClick={() => pause(item)}>Pause</button>}
+        {["Paused", "Interrupted", "Failed"].includes(item.status) && <button className="quiet-button" onClick={() => retry(item)}>Resume</button>}
+        {["Queued", "Scheduled", "Downloading", "Pausing", "Paused"].includes(item.status) && <button className="quiet-button" onClick={() => cancel(item)}>Cancel</button>}
+        {["Completed", "Cancelled", "Failed", "Interrupted"].includes(item.status) && <button className="remove-button" title="Remove" aria-label="Remove" onClick={() => remove(item.id)}>×</button>}
       </div>
     </article>)}</div>;
   }
@@ -236,11 +256,13 @@ export default function App() {
             <div><strong>{active}</strong><span>Active</span></div><div><strong>{queued}</strong><span>Queued</span></div><div><strong>{done}</strong><span>Completed</span></div><div><strong>{attention}</strong><span>Needs attention</span></div>
           </section>
           <section className="panel">
-            <div className="panel-heading"><div><h2>Add a download</h2><p>Direct file links and supported HLS playlists.</p></div><span className="connection-tag">{connections} CONNECTIONS</span></div>
+            <div className="panel-heading"><div><h2>Add a download</h2><p>Direct files, HLS and supported static DASH VOD manifests.</p></div><span className="connection-tag">{connections} CONNECTIONS</span></div>
             <form onSubmit={(event) => { event.preventDefault(); add(url, filename); }}>
               <label htmlFor="download-url">Download URL</label>
               <input id="download-url" className="field" value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://example.com/archive.zip" />
               <div className="add-actions"><div className="filename-field"><label htmlFor="download-name">Save as <small>OPTIONAL</small></label><input id="download-name" className="field" value={filename} onChange={(event) => setFilename(event.target.value)} placeholder="Use original filename" /></div><button type="submit" className="primary-button">Add to queue ↗</button></div>
+              <label htmlFor="schedule-at">Schedule start <small>OPTIONAL · LOCAL TIME</small></label>
+              <input id="schedule-at" className="field" type="datetime-local" value={scheduleAt} onChange={(event) => setScheduleAt(event.target.value)} />
             </form>
             <div className="notice">{notice}</div>
             {url.trim() && <button className="text-link" onClick={() => { setVideoUrl(url.trim()); setPage("video"); }}>Inspect media qualities instead →</button>}
@@ -270,7 +292,7 @@ export default function App() {
           {variants.length > 0 && <div className="variants"><div className="variants-heading"><h3>Available streams</h3><span>{variants.length} OPTIONS</span></div>
             {variants.map((variant, index) => <div className="variant" key={variant.url + index}>
               <div><strong>{variant.quality}</strong><small>{variant.kind.toUpperCase()}{variant.width && variant.height ? " · " + variant.width + " × " + variant.height : ""}{variant.bandwidth ? " · " + Math.round(variant.bandwidth / 1000) + " kbps" : ""}</small>{variant.note && <p>{variant.note}</p>}</div>
-              <button className="secondary-button" disabled={!variant.downloadable} onClick={() => add(variant.url, "video.mp4", variant.kind === "hls" ? "hls" : "direct")}>{variant.downloadable ? "Download" : "Unavailable"}</button>
+              <button className="secondary-button" disabled={!variant.downloadable} onClick={() => add(variant.url, "video.mp4", variant.kind === "hls" ? "hls" : variant.kind === "dash" ? "dash" : "direct", variant.representationId)}>{variant.downloadable ? "Download" : "Unavailable"}</button>
             </div>)}
           </div>}
           <div className="support-note"><strong>What works</strong><p>Direct media files and unencrypted HLS playlists. DASH quality detection is available, but DASH downloading is not. A YouTube watch page is not a direct media URL; this desktop build does not extract its streams.</p></div>
@@ -280,6 +302,7 @@ export default function App() {
           <div className="settings-section"><div><h2>Transfer behaviour</h2><p>Saved locally. Applies to new downloads.</p></div>
             <label className="setting-row"><span><strong>Connections per file</strong><small>Used when the server supports byte-range requests.</small></span><select className="select-field" value={connections} onChange={(event) => setConnections(Number(event.target.value))}>{[1, 2, 4, 8, 12, 16].map((n) => <option key={n} value={n}>{n} {n === 1 ? "connection" : "connections"}</option>)}</select></label>
             <label className="setting-row"><span><strong>Simultaneous downloads</strong><small>Maximum number of active queue items.</small></span><select className="select-field" value={parallel} onChange={(event) => setParallel(Number(event.target.value))}>{[1, 2, 3, 4].map((n) => <option key={n} value={n}>{n} {n === 1 ? "download" : "downloads"}</option>)}</select></label>
+            <label className="setting-row"><span><strong>Speed limit per download</strong><small>0 means unlimited; applies to running transfers.</small></span><select className="select-field" value={speedLimitKbps} onChange={(event) => setSpeedLimitKbps(Number(event.target.value))}>{[0, 64, 128, 256, 512, 1024, 2048, 5120].map((n) => <option key={n} value={n}>{n === 0 ? "Unlimited" : n >= 1024 ? (n / 1024) + " MB/s" : n + " KB/s"}</option>)}</select></label>
           </div>
           <div className="rule" />
           <div className="settings-section"><div><h2>Storage</h2><p>ThunderLoad uses a dedicated folder in your system Downloads directory.</p></div><div className="storage-row"><span>Downloads / ThunderLoad</span><button className="secondary-button" onClick={openFolder}>Open folder ↗</button></div></div>

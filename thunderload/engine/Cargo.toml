@@ -7,7 +7,9 @@ edition = "2021"
 anyhow = "1"
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+roxmltree = "0.20"
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["fs", "io-util", "io-std", "macros", "rt-multi-thread", "sync", "time"] }
+serde_json = "1"
+tokio = { version = "1", features = ["fs", "io-util", "io-std", "macros", "process", "rt-multi-thread", "sync", "time"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
