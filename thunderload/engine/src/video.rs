@@ -2,7 +2,9 @@ use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::{path::{Path, PathBuf}, sync::{atomic::{AtomicUsize, Ordering}, Arc}};
-use tokio::{fs, io::AsyncWriteExt, sync::mpsc};
+use tokio::{fs, io::AsyncWriteExt, process::Command as TokioCommand, sync::mpsc};
+use quick_xml::{events::Event, Reader};
+use std::{collections::HashMap, process::Command};
 use url::Url;
 use uuid::Uuid;
 use crate::download::{default_download_dir, safe_filename, DownloadProgress};
@@ -18,6 +20,10 @@ pub struct VideoVariant {
     pub url: String,
     pub downloadable: bool,
     pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub representation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_representation_id: Option<String>,
 }
 
 fn client() -> Result<Client> {
@@ -56,12 +62,14 @@ pub async fn inspect_video(url: &str, referer: Option<&str>) -> Result<Vec<Video
     }
     if lower.ends_with(".mpd") {
         let body = fetch_text(url, referer).await?;
-        let reps = parse_dash_representations(&body, url);
+        let mut reps = parse_dash_representations(&body, url);
+        annotate_dash_variants(&mut reps).await;
         if reps.is_empty() {
             return Ok(vec![VideoVariant {
                 kind: "dash".into(), quality: "Adaptive DASH".into(), width: None,
                 height: None, bandwidth: None, url: url.into(), downloadable: false,
-                note: Some("DASH manifest detected; DASH segment assembly is not available".into())
+                note: Some("DASH manifest detected, but no supported static segment layout was found".into()),
+                representation_id: None, audio_representation_id: None,
             }]);
         }
         return Ok(reps);
@@ -118,7 +126,9 @@ pub async fn inspect_video(url: &str, referer: Option<&str>) -> Result<Vec<Video
     }
     if content_type.contains("dash+xml") {
         let body = fetch_text(url, referer).await?;
-        return Ok(parse_dash_representations(&body, url));
+        let mut variants = parse_dash_representations(&body, url);
+        annotate_dash_variants(&mut variants).await;
+        return Ok(variants);
     }
     if content_type.starts_with("video/") || content_type.starts_with("audio/")
         || content_type == "application/octet-stream" || content_type == "application/zip"
