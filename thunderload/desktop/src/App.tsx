@@ -7,7 +7,7 @@ type Kind = "direct" | "hls";
 type Status = "Queued" | "Downloading" | "Pausing" | "Paused" | "Cancelling" | "Completed" | "Failed" | "Interrupted" | "Cancelled";
 type Variant = { kind: string; quality: string; width?: number; height?: number; bandwidth?: number; url: string; downloadable: boolean; note?: string };
 type Progress = { downloaded: number; total?: number; percent?: number; phase: string };
-type Item = { id: string; name: string; url: string; kind: Kind; status: Status; percent: number; downloaded: number; total?: number; detail: string; error?: string; createdAt: number; targetPath?: string; scheduledAt?: number };
+type Item = { id: string; name: string; url: string; kind: Kind; status: Status; percent: number; downloaded: number; total?: number; detail: string; error?: string; createdAt: number; targetPath?: string; scheduledAt?: number; source?: "native" };
 
 const HISTORY_KEY = "thunderload.history.v2";
 const CONNECTIONS_KEY = "thunderload.connections.v1";
@@ -93,6 +93,48 @@ export default function App() {
   useEffect(() => {
     const timer = window.setInterval(() => setClock(Date.now()), 1000);
     return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let inFlight = false;
+    const refreshNativeJobs = async () => {
+      if (inFlight || disposed) return;
+      inFlight = true;
+      try {
+        const jobs = await invoke<Array<{
+          id: string; name?: string; url?: string; kind?: string; status?: string;
+          percent?: number; downloaded?: number; total?: number | null; detail?: string;
+          error?: string; createdAt?: number; targetPath?: string;
+        }>>("get_native_downloads");
+        if (disposed) return;
+        const external: Item[] = jobs.map((job) => ({
+          id: "native-" + job.id,
+          name: job.name || "Browser download",
+          url: job.url || "",
+          kind: job.kind === "hls" ? "hls" : "direct",
+          status: (["Downloading", "Completed", "Failed", "Interrupted"].includes(job.status || "") ? job.status : "Failed") as Status,
+          percent: Math.max(0, Math.min(100, job.percent || 0)),
+          downloaded: job.downloaded || 0,
+          total: job.total ?? undefined,
+          detail: job.detail || "Started from browser extension",
+          error: job.error,
+          createdAt: job.createdAt || Date.now(),
+          targetPath: job.targetPath,
+          source: "native"
+        }));
+        setItems((current) => {
+          const merged = new Map(current.map((item) => [item.id, item]));
+          for (const item of external) merged.set(item.id, item);
+          return Array.from(merged.values()).sort((a, b) => b.createdAt - a.createdAt);
+        });
+      } catch (error) {
+        // The companion is optional; local desktop transfers remain usable without it.
+      } finally { inFlight = false; }
+    };
+    void refreshNativeJobs();
+    const timer = window.setInterval(refreshNativeJobs, 1500);
+    return () => { disposed = true; window.clearInterval(timer); };
   }, []);
 
   useEffect(() => {
@@ -211,16 +253,22 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
   }
   async function remove(id: string) {
     const item = items.find((entry) => entry.id === id);
-    if (item?.targetPath && item.kind === "direct" && item.status !== "Completed") {
+    if (item?.source === "native") {
+      await invoke("dismiss_native_download", { jobId: item.id.replace(/^native-/, "") }).catch(() => {});
+    } else if (item?.targetPath && item.kind === "direct" && item.status !== "Completed") {
       await invoke("cancel_download", { jobId: item.id, targetPath: item.targetPath }).catch(() => {});
     }
     setItems((current) => current.filter((entry) => entry.id !== id || entry.status === "Downloading" || entry.status === "Pausing"));
   }
   function retry(item: Item) {
+    if (item.source === "native") { add(item.url, item.name, item.kind); return; }
     if (item.kind === "direct" && item.targetPath) { resume(item); return; }
     add(item.url, item.name, item.kind);
   }
-  function clearFinished() {
+  async function clearFinished() {
+    const finished = items.filter((item) => item.status === "Completed" || item.status === "Cancelled");
+    await Promise.all(finished.filter((item) => item.source === "native")
+      .map((item) => invoke("dismiss_native_download", { jobId: item.id.replace(/^native-/, "") }).catch(() => {})));
     setItems((current) => current.filter((item) => item.status !== "Completed" && item.status !== "Cancelled"));
   }
   async function inspect() {
@@ -266,11 +314,11 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
         {item.error && <div className="error-text">{item.error}</div>}
       </div>
       <div className="transfer-actions">
-        {item.status === "Downloading" && item.kind === "direct" && <button className="quiet-button transfer-control" onClick={() => void pause(item)}>Pause</button>}
+        {item.status === "Downloading" && item.kind === "direct" && item.source !== "native" && <button className="quiet-button transfer-control" onClick={() => void pause(item)}>Pause</button>}
         {item.status === "Paused" && <button className="quiet-button transfer-control" onClick={() => resume(item)}>Resume</button>}
         {(item.status === "Failed" || item.status === "Interrupted") && <button className="quiet-button transfer-control" onClick={() => retry(item)}>{item.kind === "direct" && item.targetPath ? "Resume" : "Retry"}</button>}
-        {(item.status === "Downloading" || item.status === "Pausing" || item.status === "Paused" || item.status === "Failed" || item.status === "Interrupted" || item.status === "Queued") && item.kind === "direct" && <button className="quiet-button transfer-control" onClick={() => void cancel(item)}>Cancel</button>}
-        {item.status !== "Downloading" && item.status !== "Pausing" && item.status !== "Cancelling" && <button className="remove-button" title="Remove" aria-label="Remove" onClick={() => void remove(item.id)}>×</button>}
+        {(item.status === "Downloading" || item.status === "Pausing" || item.status === "Paused" || item.status === "Failed" || item.status === "Interrupted" || item.status === "Queued") && item.kind === "direct" && item.source !== "native" && <button className="quiet-button transfer-control" onClick={() => void cancel(item)}>Cancel</button>}
+        {item.status !== "Downloading" && item.status !== "Pausing" && item.status !== "Cancelling" && (item.source !== "native" || item.status === "Completed" || item.status === "Failed" || item.status === "Interrupted") && <button className="remove-button" title="Remove" aria-label="Remove" onClick={() => void remove(item.id)}>×</button>}
       </div>
     </article>)}</div>;
   }
@@ -346,7 +394,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           <div className="settings-section"><div><h2>Transfer behaviour</h2><p>Saved locally. Applies to new downloads.</p></div>
             <label className="setting-row"><span><strong>Connections per file</strong><small>Checkpoint-safe downloads currently use one stream. Multi-connection resume is still being developed.</small></span><select className="select-field" value={connections} disabled><option value={1}>1 connection</option></select></label>
             <label className="setting-row"><span><strong>Simultaneous downloads</strong><small>Maximum number of active queue items.</small></span><select className="select-field" value={parallel} onChange={(event) => setParallel(Number(event.target.value))}>{[1, 2, 3, 4].map((n) => <option key={n} value={n}>{n} {n === 1 ? "download" : "downloads"}</option>)}</select></label>
-            <label className="setting-row"><span><strong>Speed limit</strong><small>Applies to direct HTTP transfers, including active jobs. Zero means unlimited.</small></span><select className="select-field" value={speedLimit} onChange={(event) => setSpeedLimit(Number(event.target.value))}>
+            <label className="setting-row"><span><strong>Speed limit</strong><small>Applies to direct desktop HTTP transfers, including active jobs. Zero means unlimited.</small></span><select className="select-field" value={speedLimit} onChange={(event) => setSpeedLimit(Number(event.target.value))}>
               <option value={0}>Unlimited</option><option value={262144}>256 KB/s</option><option value={524288}>512 KB/s</option><option value={1048576}>1 MB/s</option><option value={2097152}>2 MB/s</option><option value={5242880}>5 MB/s</option><option value={10485760}>10 MB/s</option>
             </select></label>
           </div>
