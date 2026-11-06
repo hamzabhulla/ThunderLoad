@@ -1,12 +1,49 @@
-use std::{path::PathBuf, process::Command};
+use std::{collections::HashMap, path::PathBuf, process::Command, sync::{atomic::AtomicU64, Arc, Mutex, OnceLock}};
 use serde_json::json;
 use tauri::{Emitter, Manager};
-use thunderload_engine::{default_download_dir, download_hls, download_url, inspect_video, safe_filename};
-use tokio::sync::mpsc;
+use thunderload_engine::{default_download_dir, download_hls, download_url, download_url_resumable, inspect_video, partial_download_path, reserve_download_path, safe_filename, DownloadControl, DownloadOutcome};
+use tokio::sync::{mpsc, watch};
 
 #[tauri::command]
 async fn inspect_video_url(url: String, referer: Option<String>) -> Result<Vec<thunderload_engine::VideoVariant>, String> {
     inspect_video(&url, referer.as_deref()).await.map_err(|error| error.to_string())
+}
+
+
+static JOB_CONTROLS: OnceLock<Mutex<HashMap<String, watch::Sender<DownloadControl>>>> = OnceLock::new();
+static SPEED_LIMIT: OnceLock<Arc<AtomicU64>> = OnceLock::new();
+
+fn job_controls() -> &'static Mutex<HashMap<String, watch::Sender<DownloadControl>>> {
+    JOB_CONTROLS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn speed_limit() -> Arc<AtomicU64> {
+    SPEED_LIMIT.get_or_init(|| Arc::new(AtomicU64::new(0))).clone()
+}
+
+#[tauri::command]
+async fn set_speed_limit(bytes_per_second: u64) -> Result<(), String> {
+    speed_limit().store(bytes_per_second.min(1_073_741_824), std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+#[tauri::command]
+async fn pause_download(job_id: String) -> Result<(), String> {
+    let controls = job_controls().lock().map_err(|_| "Download control lock is unavailable")?;
+    let sender = controls.get(&job_id).ok_or_else(|| "This download is not active. Resume it from the queue.".to_string())?;
+    sender.send(DownloadControl::Paused).map_err(|_| "The download has already stopped. Resume it from the queue.".to_string())
+}
+
+#[tauri::command]
+async fn cancel_download(job_id: String, target_path: String) -> Result<(), String> {
+    let sender = job_controls().lock().map_err(|_| "Download control lock is unavailable")?.remove(&job_id);
+    let actively_running = sender.map(|sender| sender.send(DownloadControl::Cancelled).is_ok()).unwrap_or(false);
+    if !actively_running {
+        let target = PathBuf::from(target_path);
+        let _ = tokio::fs::remove_file(partial_download_path(&target)).await;
+        let _ = tokio::fs::remove_file(&target).await;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -14,6 +51,7 @@ async fn start_download(
     job_id: String,
     url: String,
     filename: String,
+    target_path: Option<String>,
     connections: usize,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
@@ -21,23 +59,49 @@ async fn start_download(
         return Err("Only HTTP and HTTPS download URLs are supported".into());
     }
     let name = safe_filename(&filename, "download.bin");
-    let target: PathBuf = default_download_dir().join(name);
+    let target = match target_path {
+        Some(path) => PathBuf::from(path),
+        None => reserve_download_path(&default_download_dir().join(name)).await.map_err(|error| error.to_string())?,
+    };
+    let _ = connections; // Resumable transfers use one stream so their checkpoint is continuous.
+    let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
+    {
+        let mut controls = job_controls().lock().map_err(|_| "Download control lock is unavailable")?;
+        controls.insert(job_id.clone(), control_tx);
+    }
+
     let job_for_task = job_id.clone();
+    let app_for_task = app.clone();
+    let limit = speed_limit();
     tauri::async_runtime::spawn(async move {
         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
-        let progress_app = app.clone();
+        let progress_app = app_for_task.clone();
         let progress_id = job_for_task.clone();
         tauri::async_runtime::spawn(async move {
             while let Some(progress) = progress_rx.recv().await {
                 let _ = progress_app.emit("download-progress", json!({ "jobId": progress_id, "progress": progress }));
             }
         });
-        match download_url(&url, &target, connections.clamp(1, 16), None, progress_tx).await {
-            Ok(path) => { let _ = app.emit("download-complete", json!({ "jobId": job_for_task, "path": path.to_string_lossy() })); }
-            Err(error) => { let _ = app.emit("download-error", json!({ "jobId": job_for_task, "error": error.to_string() })); }
+        let result = download_url_resumable(&url, &target, None, control_rx, limit, progress_tx).await;
+        match result {
+            Ok(DownloadOutcome::Completed) => {
+                let _ = app_for_task.emit("download-complete", json!({ "jobId": job_for_task, "path": target.to_string_lossy() }));
+                if let Ok(mut controls) = job_controls().lock() { controls.remove(&job_for_task); }
+            }
+            Ok(DownloadOutcome::Paused) => {
+                let _ = app_for_task.emit("download-paused", json!({ "jobId": job_for_task, "targetPath": target.to_string_lossy() }));
+            }
+            Ok(DownloadOutcome::Cancelled) => {
+                let _ = app_for_task.emit("download-cancelled", json!({ "jobId": job_for_task }));
+                if let Ok(mut controls) = job_controls().lock() { controls.remove(&job_for_task); }
+            }
+            Err(error) => {
+                let _ = app_for_task.emit("download-error", json!({ "jobId": job_for_task, "error": error.to_string(), "targetPath": target.to_string_lossy() }));
+                if let Ok(mut controls) = job_controls().lock() { controls.remove(&job_for_task); }
+            }
         }
     });
-    Ok(job_id)
+    Ok(target.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -144,7 +208,7 @@ async fn open_download_folder() -> Result<(), String> {
 
 fn main() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![inspect_video_url, start_download, start_hls_download, register_native_host, open_download_folder])
+        .invoke_handler(tauri::generate_handler![inspect_video_url, start_download, pause_download, cancel_download, set_speed_limit, start_hls_download, register_native_host, open_download_folder])
         .run(tauri::generate_context!())
         .expect("error while running ThunderLoad desktop app");
 }
