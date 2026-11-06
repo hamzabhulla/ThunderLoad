@@ -5,7 +5,8 @@ use std::{path::{Path, PathBuf}, sync::{atomic::{AtomicUsize, Ordering}, Arc}};
 use tokio::{fs, io::AsyncWriteExt, sync::mpsc};
 use url::Url;
 use uuid::Uuid;
-use crate::download::{default_download_dir, safe_filename, DownloadProgress};
+use crate::download::{default_download_dir, reserve_download_path, safe_filename, DownloadProgress};
+use crate::managed::{ManagedOutcome, TransferControl};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -467,4 +468,210 @@ mod tests {
         assert!(unsupported_hls_master_reason("#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",URI=\"audio.m3u8\"").is_some());
         assert!(unsupported_hls_reason("#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\",BYTERANGE=\"100@0\"\n#EXT-X-ENDLIST").is_some());
     }
+}
+
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ManagedHlsMetadata {
+    playlist_url: String,
+    media_url: String,
+    segment_urls: Vec<String>,
+    target_path: String,
+    extension: String,
+}
+
+pub async fn download_hls_managed(
+    playlist_url: &str,
+    target: &Path,
+    job_id: &str,
+    referer: Option<&str>,
+    control: TransferControl,
+    progress_tx: mpsc::UnboundedSender<DownloadProgress>,
+) -> Result<ManagedOutcome> {
+    let base = Url::parse(playlist_url)?;
+    if !matches!(base.scheme(), "http" | "https") {
+        return Err(anyhow!("Only HTTP and HTTPS HLS URLs are supported"));
+    }
+    let client = client()?;
+    let mut request = client.get(playlist_url);
+    if let Some(referrer) = referer { request = request.header(reqwest::header::REFERER, referrer); }
+    let body = request.send().await?.error_for_status()?.text().await?;
+    let variants = parse_hls_master(&body, &base)?;
+    if !variants.is_empty() {
+        if let Some(reason) = unsupported_hls_master_reason(&body) {
+            return Err(anyhow!(reason));
+        }
+    }
+    let media_url = variants.first().map(|variant| variant.url.clone()).unwrap_or_else(|| playlist_url.to_string());
+    let media_base = Url::parse(&media_url)?;
+    let media = if media_url == playlist_url { body } else {
+        let mut request = client.get(&media_url);
+        if let Some(referrer) = referer { request = request.header(reqwest::header::REFERER, referrer); }
+        request.send().await?.error_for_status()?.text().await?
+    };
+    if let Some(reason) = unsupported_hls_reason(&media) {
+        return Err(anyhow!(reason));
+    }
+
+    let mut init_segment = None;
+    let mut segments = Vec::new();
+    for line in media.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        if let Some(attributes) = line.strip_prefix("#EXT-X-MAP:") {
+            if attributes.contains("BYTERANGE=") {
+                return Err(anyhow!("HLS initialization byte-range segments are not supported"));
+            }
+            init_segment = attr(attributes, "URI").and_then(|value| media_base.join(&value).ok()).map(|value| value.to_string());
+        } else if let Some(attributes) = line.strip_prefix("#EXT-X-KEY:") {
+            let method = attr(attributes, "METHOD").unwrap_or_default();
+            if !method.eq_ignore_ascii_case("NONE") {
+                return Err(anyhow!("Encrypted HLS streams are not supported"));
+            }
+        } else if line.starts_with("#EXT-X-BYTERANGE:") {
+            return Err(anyhow!("HLS byte-range segments are not supported"));
+        } else if line.starts_with('#') {
+            continue;
+        } else {
+            segments.push(media_base.join(line)?.to_string());
+        }
+    }
+    if segments.is_empty() {
+        return Err(anyhow!("No HLS media segments were found"));
+    }
+
+    let mut segment_urls = Vec::new();
+    if let Some(init) = init_segment { segment_urls.push(init); }
+    segment_urls.extend(segments);
+    let extension = if media.contains("#EXT-X-MAP:") { "mp4" } else { "ts" };
+    let safe_id: String = job_id.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || "-_".contains(*ch))
+        .take(80)
+        .collect();
+    if safe_id.is_empty() { return Err(anyhow!("Invalid HLS job identifier")); }
+    let parent = target.parent().ok_or_else(|| anyhow!("Target path has no parent directory"))?;
+    fs::create_dir_all(parent).await?;
+    let work_dir = parent.join(format!(".thunderload-hls-job-{safe_id}"));
+    fs::create_dir_all(&work_dir).await?;
+    let metadata_path = work_dir.join("hls.json");
+    let old_metadata: Option<ManagedHlsMetadata> = fs::read(&metadata_path).await.ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let matching = old_metadata.as_ref().is_some_and(|old| {
+        old.playlist_url == playlist_url
+            && old.media_url == media_url
+            && old.segment_urls == segment_urls
+            && old.extension == extension
+    });
+    if old_metadata.is_some() && !matching {
+        fs::remove_dir_all(&work_dir).await?;
+        fs::create_dir_all(&work_dir).await?;
+    }
+
+    let final_target = if matching {
+        PathBuf::from(old_metadata.as_ref().unwrap().target_path.clone())
+    } else {
+        let desired = target.with_extension(extension);
+        if desired == target {
+            target.to_path_buf()
+        } else {
+            if fs::try_exists(target).await.unwrap_or(false) {
+                fs::remove_file(target).await?;
+            }
+            reserve_download_path(&desired).await?
+        }
+    };
+    let metadata = ManagedHlsMetadata {
+        playlist_url: playlist_url.to_string(),
+        media_url: media_url.clone(),
+        segment_urls: segment_urls.clone(),
+        target_path: final_target.to_string_lossy().to_string(),
+        extension: extension.to_string(),
+    };
+    let bytes = serde_json::to_vec_pretty(&metadata)?;
+    let meta_temp = work_dir.join("hls.json.tmp");
+    fs::write(&meta_temp, bytes).await?;
+    if fs::try_exists(&metadata_path).await.unwrap_or(false) {
+        fs::remove_file(&metadata_path).await?;
+    }
+    fs::rename(&meta_temp, &metadata_path).await?;
+
+    let total_segments = segment_urls.len() as u64;
+    let mut completed = 0_u64;
+    for (index, segment_url) in segment_urls.iter().enumerate() {
+        if control.cancelled() {
+            let _ = fs::remove_dir_all(&work_dir).await;
+            let _ = fs::remove_file(&final_target).await;
+            return Err(anyhow!("Download cancelled"));
+        }
+        let segment_path = work_dir.join(format!("segment-{index:06}.bin"));
+        if fs::metadata(&segment_path).await.is_ok() {
+            completed += 1;
+            continue;
+        }
+        let partial_path = work_dir.join(format!("segment-{index:06}.part"));
+        let _ = fs::remove_file(&partial_path).await;
+        let mut request = client.get(segment_url);
+        if let Some(referrer) = referer { request = request.header(reqwest::header::REFERER, referrer); }
+        let response = request.send().await?.error_for_status()?;
+        let mut stream = response.bytes_stream();
+        let mut file = fs::File::create(&partial_path).await?;
+        loop {
+            let Some(next) = control.next_chunk(&mut stream).await? else {
+                file.flush().await?;
+                drop(file);
+                let _ = fs::remove_file(&partial_path).await;
+                let _ = progress_tx.send(DownloadProgress {
+                    downloaded: completed, total: Some(total_segments),
+                    percent: Some(completed as f64 * 100.0 / total_segments as f64),
+                    phase: "paused".into(),
+                });
+                return Ok(ManagedOutcome::Paused {
+                    path: final_target, downloaded: completed, total: Some(total_segments)
+                });
+            };
+            let Some(chunk) = next else { break; };
+            if !control.throttle(chunk.len()).await? {
+                file.flush().await?;
+                drop(file);
+                let _ = fs::remove_file(&partial_path).await;
+                let _ = progress_tx.send(DownloadProgress {
+                    downloaded: completed, total: Some(total_segments),
+                    percent: Some(completed as f64 * 100.0 / total_segments as f64),
+                    phase: "paused".into(),
+                });
+                return Ok(ManagedOutcome::Paused {
+                    path: final_target, downloaded: completed, total: Some(total_segments)
+                });
+            }
+            file.write_all(&chunk).await?;
+        }
+        file.flush().await?;
+        drop(file);
+        fs::rename(&partial_path, &segment_path).await?;
+        completed += 1;
+        let _ = progress_tx.send(DownloadProgress {
+            downloaded: completed, total: Some(total_segments),
+            percent: Some(completed as f64 * 100.0 / total_segments as f64),
+            phase: "video-segments".into(),
+        });
+    }
+
+    let assembled = work_dir.join("assembled.tmp");
+    let mut output = fs::File::create(&assembled).await?;
+    for index in 0..segment_urls.len() {
+        let mut input = fs::File::open(work_dir.join(format!("segment-{index:06}.bin"))).await?;
+        tokio::io::copy(&mut input, &mut output).await?;
+    }
+    output.flush().await?;
+    drop(output);
+    if fs::metadata(&assembled).await?.len() == 0 {
+        return Err(anyhow!("The completed HLS stream is empty"));
+    }
+    if fs::try_exists(&final_target).await.unwrap_or(false) {
+        fs::remove_file(&final_target).await?;
+    }
+    fs::rename(&assembled, &final_target).await?;
+    let _ = fs::remove_dir_all(&work_dir).await;
+    let _ = progress_tx.send(DownloadProgress {
+        downloaded: total_segments, total: Some(total_segments), percent: Some(100.0), phase: "complete".into()
+    });
+    Ok(ManagedOutcome::Completed(final_target))
 }

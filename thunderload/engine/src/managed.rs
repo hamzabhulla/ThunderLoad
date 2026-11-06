@@ -30,7 +30,7 @@ pub struct ResumeMetadata {
 #[derive(Debug, Clone)]
 pub enum ManagedOutcome {
     Completed(PathBuf),
-    Paused { downloaded: u64, total: Option<u64> },
+    Paused { path: PathBuf, downloaded: u64, total: Option<u64> },
 }
 
 #[derive(Clone)]
@@ -95,7 +95,7 @@ impl TransferControl {
         *self.pause_rx.borrow()
     }
 
-    fn cancelled(&self) -> bool {
+    pub(crate) fn cancelled(&self) -> bool {
         *self.cancel_rx.borrow()
     }
 
@@ -106,7 +106,7 @@ impl TransferControl {
         Ok(!self.paused())
     }
 
-    async fn next_chunk<S, B, E>(&self, stream: &mut S) -> Result<Option<Option<B>>>
+    pub(crate) async fn next_chunk<S, B, E>(&self, stream: &mut S) -> Result<Option<Option<B>>>
     where
         S: Stream<Item = std::result::Result<B, E>> + Unpin,
         E: std::fmt::Display,
@@ -130,7 +130,7 @@ impl TransferControl {
         }
     }
 
-    async fn throttle(&self, byte_count: usize) -> Result<bool> {
+    pub(crate) async fn throttle(&self, byte_count: usize) -> Result<bool> {
         if !self.check()? {
             return Ok(false);
         }
@@ -461,7 +461,7 @@ async fn download_ranges(
     if paused || control.paused() {
         let downloaded = directory_size(work_dir).await?;
         emit_progress(progress_tx, downloaded, Some(total), "paused").await;
-        return Ok(ManagedOutcome::Paused { downloaded, total: Some(total) });
+        return Ok(ManagedOutcome::Paused { path: target.to_path_buf(), downloaded, total: Some(total) });
     }
 
     let temp = work_dir.join("assembled.tmp");
@@ -534,7 +534,7 @@ async fn download_single(
     loop {
         let Some(next) = control.next_chunk(&mut stream).await? else {
             file.flush().await?;
-            return Ok(ManagedOutcome::Paused { downloaded, total });
+            return Ok(ManagedOutcome::Paused { path: target.to_path_buf(), downloaded, total });
         };
         let Some(chunk) = next else { break; };
         if !control.throttle(chunk.len()).await? {
