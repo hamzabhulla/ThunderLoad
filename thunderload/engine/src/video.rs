@@ -354,11 +354,9 @@ struct DashParserState {
 
 #[derive(Debug, Clone)]
 struct DashResolvedTrack {
-    representation_id: String,
     mime_type: String,
     initialization_url: Option<String>,
     segment_urls: Vec<String>,
-    is_audio: bool,
 }
 
 fn local_xml_name(raw: &[u8]) -> String {
@@ -783,11 +781,9 @@ fn resolve_dash_track(
         segment_urls.push(base.join(&resolved)?.to_string());
     }
     Ok(DashResolvedTrack {
-        representation_id: representation.id.clone(),
         mime_type: if representation.mime_type.is_empty() { adaptation.mime_type.clone() } else { representation.mime_type.clone() },
         initialization_url,
         segment_urls,
-        is_audio,
     })
 }
 
@@ -1124,11 +1120,10 @@ async fn download_dash_track(
     let assembled = work_dir.join(format!("{prefix}-track.{extension}"));
     let mut output = fs::File::create(&assembled).await?;
     // The numeric filenames preserve the manifest's initialization + timeline order.
-    let segment_count = completed.load(Ordering::Relaxed);
     let expected_files: Vec<PathBuf> = (0..(track.segment_urls.len() + usize::from(track.initialization_url.is_some())))
         .map(|index| work_dir.join(format!("{prefix}-{index:06}.segment")))
         .collect();
-    if expected_files.len() != segment_count.min(expected_files.len()) && segment_count == 0 {
+    if expected_files.is_empty() {
         return Err(anyhow!("No DASH media segments were saved"));
     }
     for path in expected_files {
@@ -1246,7 +1241,11 @@ pub async fn download_dash(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_complete_vod_playlist, parse_dash_representations, parse_hls_master, unsupported_hls_master_reason, unsupported_hls_reason};
+    use super::{
+        expand_dash_template, is_complete_vod_playlist, parse_dash_document,
+        parse_dash_representations, parse_hls_master, resolve_dash_track,
+        unsupported_hls_master_reason, unsupported_hls_reason,
+    };
     use url::Url;
 
     #[test]
@@ -1274,6 +1273,104 @@ mod tests {
         assert!(is_complete_vod_playlist("#EXTM3U\n#EXTINF:5,\nsegment.ts\n#EXT-X-ENDLIST"));
         assert!(!is_complete_vod_playlist("#EXTM3U\n#EXTINF:5,\nsegment.ts"));
         assert!(unsupported_hls_reason("#EXTM3U\n#EXTINF:5,\nsegment.ts").is_some());
+    }
+
+    #[test]
+    fn dash_template_expands_all_supported_tokens() {
+        let representation = super::DashRepresentation {
+            id: "video-main".into(), bandwidth: Some(1_800_000), ..Default::default()
+        };
+        let expanded = expand_dash_template(
+            "video/$RepresentationID$/$Bandwidth$/$Number%05d$-$Time$-$.m4s",
+            &representation, 7, 12000
+        ).unwrap();
+        assert_eq!(expanded, "video/video-main/1800000/00007-12000-$.m4s");
+    }
+
+    #[test]
+    fn static_dash_segment_template_builds_init_and_timeline_urls() {
+        let manifest = r#"<MPD type="static" mediaPresentationDuration="PT6S">
+          <BaseURL>https://cdn.example.test/root/</BaseURL>
+          <Period duration="PT6S">
+            <AdaptationSet contentType="video" mimeType="video/mp4">
+              <SegmentTemplate timescale="1" startNumber="1" initialization="$RepresentationID$/init.mp4" media="$RepresentationID$/seg-$Number%03d$.m4s">
+                <SegmentTimeline><S t="0" d="2" r="2"/></SegmentTimeline>
+              </SegmentTemplate>
+              <Representation id="v720" bandwidth="1800000" width="1280" height="720"/>
+              <Representation id="v360" bandwidth="700000" width="640" height="360"/>
+            </AdaptationSet>
+          </Period>
+        </MPD>"#;
+        let manifest_url = "https://cdn.example.test/manifest/video.mpd";
+        let document = parse_dash_document(manifest).unwrap();
+        assert!(document.is_static);
+        assert_eq!(document.period_count, 1);
+        let variants = parse_dash_representations(manifest, manifest_url);
+        assert_eq!(variants.len(), 2);
+        assert!(variants[0].downloadable);
+        assert_eq!(variants[0].representation_id.as_deref(), Some("v720"));
+        let (adaptation, representation) = document.adaptations[0].representations.iter()
+            .find(|representation| representation.id == "v720")
+            .map(|representation| (&document.adaptations[0], representation)).unwrap();
+        let track = resolve_dash_track(&document, adaptation, representation, manifest_url, false).unwrap();
+        assert_eq!(track.segment_urls.len(), 3);
+        assert_eq!(track.initialization_url.as_deref(), Some("https://cdn.example.test/root/v720/init.mp4"));
+        assert_eq!(track.segment_urls[0], "https://cdn.example.test/root/v720/seg-001.m4s");
+        assert_eq!(track.segment_urls[2], "https://cdn.example.test/root/v720/seg-003.m4s");
+    }
+
+    #[test]
+    fn dash_inherits_segment_template_and_resolves_baseurl_entities() {
+        let manifest = r#"<MPD type="static" mediaPresentationDuration="PT4S">
+          <BaseURL>https://cdn.example.test/vod/?token=a&amp;quality=1/</BaseURL>
+          <Period duration="PT4S">
+            <SegmentTemplate timescale="1" duration="2" startNumber="5" initialization="init-$RepresentationID$.mp4" media="chunk-$Number$.m4s"/>
+            <AdaptationSet contentType="video" mimeType="video/mp4">
+              <Representation id="main" bandwidth="900000" width="960" height="540"/>
+            </AdaptationSet>
+          </Period>
+        </MPD>"#;
+        let manifest_url = "https://cdn.example.test/index.mpd";
+        let document = parse_dash_document(manifest).unwrap();
+        let adaptation = &document.adaptations[0];
+        let representation = &adaptation.representations[0];
+        let track = resolve_dash_track(&document, adaptation, representation, manifest_url, false).unwrap();
+        assert_eq!(track.segment_urls.len(), 2);
+        assert!(track.segment_urls[0].contains("token=a&quality=1/chunk-5.m4s"));
+        assert!(track.initialization_url.unwrap().ends_with("init-main.mp4"));
+    }
+
+    #[test]
+    fn dash_separate_audio_is_selected_and_attached_to_each_video_quality() {
+        let manifest = r#"<MPD type="static" mediaPresentationDuration="PT4S">
+          <Period duration="PT4S">
+            <AdaptationSet contentType="video" mimeType="video/mp4">
+              <SegmentTemplate duration="2" initialization="v-init.mp4" media="v-$Number$.m4s"/>
+              <Representation id="video-720" bandwidth="1600000" width="1280" height="720"/>
+            </AdaptationSet>
+            <AdaptationSet contentType="audio" mimeType="audio/mp4">
+              <SegmentTemplate duration="2" initialization="a-init.mp4" media="a-$Number$.m4s"/>
+              <Representation id="audio-en" bandwidth="128000"/>
+            </AdaptationSet>
+          </Period>
+        </MPD>"#;
+        let variants = parse_dash_representations(manifest, "https://cdn.example.test/manifest.mpd");
+        assert_eq!(variants.len(), 1);
+        assert!(variants[0].downloadable);
+        assert_eq!(variants[0].representation_id.as_deref(), Some("video-720"));
+        assert_eq!(variants[0].audio_representation_id.as_deref(), Some("audio-en"));
+    }
+
+    #[test]
+    fn dynamic_drm_and_unsupported_dash_layouts_are_not_downloadable() {
+        let dynamic = r#"<MPD type="dynamic"><Period><AdaptationSet contentType="video"><Representation id="v1" height="720"/></AdaptationSet></Period></MPD>"#;
+        let drm = r#"<MPD type="static" mediaPresentationDuration="PT4S"><Period duration="PT4S"><AdaptationSet contentType="video"><ContentProtection schemeIdUri="urn:uuid:0000"/><Representation id="v1" height="720"/></AdaptationSet></Period></MPD>"#;
+        let segment_base = r#"<MPD type="static"><Period><AdaptationSet contentType="video"><SegmentBase indexRange="1-10"/><Representation id="v1" height="720"/></AdaptationSet></Period></MPD>"#;
+        for manifest in [dynamic, drm, segment_base] {
+            let variants = parse_dash_representations(manifest, "https://cdn.example.test/manifest.mpd");
+            assert!(!variants.is_empty());
+            assert!(variants.iter().all(|variant| !variant.downloadable));
+        }
     }
 
     #[test]
