@@ -74,6 +74,9 @@ function safeFilenameFromUrl(url, fallback = "download.bin") {
 async function quickDownloadMedia({ url, kind, pageUrl, filename }) {
   const name = filename || safeFilenameFromUrl(url, kind === "HLS playlist" ? "video.mp4" : "download.bin");
   const nativePermission = await hasNativePermission();
+
+  // Prefer the ThunderLoad engine when the optional native bridge is installed.
+  // A failed inspection/start must never block an ordinary direct-file download.
   if (nativePermission) {
     const inspected = await requestNative("video.inspect", { url, referer: pageUrl || "" });
     if (inspected?.ok) {
@@ -88,23 +91,35 @@ async function quickDownloadMedia({ url, kind, pageUrl, filename }) {
           filename: selected.kind === "hls" ? (name.replace(/\.[^.]+$/, "") + ".mp4") : name,
           referer: pageUrl || ""
         });
-        if (result?.ok) return { ok: true, message: selected.quality && variants.length > 1 ? "Downloading " + selected.quality + " in ThunderLoad." : "Download started in ThunderLoad." };
-        return { ok: false, error: result?.error || "ThunderLoad could not start this download." };
+        if (result?.ok) {
+          return { ok: true, message: selected.quality && variants.length > 1
+            ? "Downloading " + selected.quality + " in ThunderLoad."
+            : "Download started in ThunderLoad." };
+        }
+        if (kind !== "Direct media") {
+          return { ok: false, error: result?.error || "ThunderLoad could not start this download." };
+        }
+      } else if (kind !== "Direct media") {
+        return { ok: false, error: variants[0]?.note || "No downloadable stream was exposed by this page." };
       }
-      const reason = variants[0]?.note || "No downloadable stream was exposed by this page.";
-      return { ok: false, error: reason };
+    } else if (kind !== "Direct media") {
+      return { ok: false, error: inspected?.error || "Could not inspect this media source." };
     }
-    if (kind !== "Direct media") return { ok: false, error: inspected?.error || "Could not inspect this media source." };
   }
+
+  // Direct files always have a browser-download fallback, whether the native
+  // permission is absent, the host is disconnected, or the desktop engine fails.
   if (kind === "Direct media") {
-    try {
-      await browserDownload(url, name);
-      return { ok: true, message: "Download started in your browser." };
-    } catch (error) { return { ok: false, error: error?.message || String(error) }; }
+    const result = await browserDownload(url, name);
+    if (result?.ok) return { ok: true, message: "Download started in your browser." };
+    return { ok: false, error: result?.error || "Your browser could not start this download." };
   }
+
   return {
     ok: false,
-    error: "Adaptive video needs the ThunderLoad desktop companion. Open the extension and choose Download to connect it."
+    error: nativePermission
+      ? "Adaptive video could not be started by the ThunderLoad engine."
+      : "Adaptive video needs the desktop companion. Open the extension popup and choose Download to grant its connection permission."
   };
 }
 

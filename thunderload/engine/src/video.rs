@@ -39,6 +39,12 @@ pub async fn inspect_video(url: &str, referer: Option<&str>) -> Result<Vec<Video
         let mut variants = parse_hls_master(&body, &parsed)?;
         if !variants.is_empty() {
             annotate_hls_variants(&mut variants, referer).await;
+            if let Some(reason) = unsupported_hls_master_reason(&body) {
+                for variant in &mut variants {
+                    variant.downloadable = false;
+                    variant.note = Some(reason.clone());
+                }
+            }
             return Ok(variants);
         }
         let reason = unsupported_hls_reason(&body);
@@ -71,7 +77,19 @@ pub async fn inspect_video(url: &str, referer: Option<&str>) -> Result<Vec<Video
     let client = client()?;
     let mut request = client.head(url);
     if let Some(referrer) = referer { request = request.header(reqwest::header::REFERER, referrer); }
-    let response = request.send().await.context("Could not inspect the URL response headers")?;
+    // A number of CDNs block HEAD even when normal downloads are allowed.
+    // Retry the metadata probe with a one-byte range GET before rejecting the URL.
+    let response = match request.send().await {
+        Ok(response) if response.status().is_success() => response,
+        _ => {
+            let mut probe = client.get(url).header(reqwest::header::RANGE, "bytes=0-0");
+            if let Some(referrer) = referer { probe = probe.header(reqwest::header::REFERER, referrer); }
+            probe.send().await
+                .context("Could not inspect the URL response headers with HEAD or a one-byte GET")?
+                .error_for_status()
+                .context("The server rejected both media inspection requests")?
+        }
+    };
     let content_type = response.headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
@@ -83,6 +101,12 @@ pub async fn inspect_video(url: &str, referer: Option<&str>) -> Result<Vec<Video
         let mut variants = parse_hls_master(&body, &parsed)?;
         if !variants.is_empty() {
             annotate_hls_variants(&mut variants, referer).await;
+            if let Some(reason) = unsupported_hls_master_reason(&body) {
+                for variant in &mut variants {
+                    variant.downloadable = false;
+                    variant.note = Some(reason.clone());
+                }
+            }
             return Ok(variants);
         }
         let reason = unsupported_hls_reason(&body);
@@ -114,6 +138,27 @@ async fn fetch_text(url: &str, referer: Option<&str>) -> Result<String> {
     Ok(request.send().await?.error_for_status()?.text().await?)
 }
 
+fn is_complete_vod_playlist(body: &str) -> bool {
+    body.lines().any(|line| line.trim() == "#EXT-X-ENDLIST")
+}
+
+fn unsupported_hls_master_reason(body: &str) -> Option<String> {
+    for line in body.lines().map(str::trim) {
+        if let Some(attributes) = line.strip_prefix("#EXT-X-SESSION-KEY:") {
+            let method = attr(attributes, "METHOD").unwrap_or_default();
+            if !method.eq_ignore_ascii_case("NONE") {
+                return Some("This HLS master uses an encryption session key; protected streams are not supported".into());
+            }
+        }
+        if let Some(attributes) = line.strip_prefix("#EXT-X-MEDIA:") {
+            if attr(attributes, "TYPE").is_some_and(|kind| kind.eq_ignore_ascii_case("AUDIO")) {
+                return Some("This HLS source has a separate audio rendition. Audio/video muxing is not available in this build".into());
+            }
+        }
+    }
+    None
+}
+
 fn unsupported_hls_reason(body: &str) -> Option<String> {
     for line in body.lines().map(str::trim) {
         if let Some(attributes) = line.strip_prefix("#EXT-X-KEY:") {
@@ -125,6 +170,12 @@ fn unsupported_hls_reason(body: &str) -> Option<String> {
         if line.starts_with("#EXT-X-BYTERANGE:") {
             return Some("HLS byte-range segments are not supported".into());
         }
+        if line.starts_with("#EXT-X-MAP:") && line.contains("BYTERANGE=") {
+            return Some("HLS initialization byte-range segments are not supported".into());
+        }
+    }
+    if !is_complete_vod_playlist(body) {
+        return Some("This is a live or unfinished HLS playlist. Only completed VOD playlists can be downloaded".into());
     }
     None
 }
@@ -239,11 +290,22 @@ fn xml_attr(input: &str, name: &str) -> Option<String> {
 }
 
 async fn unique_video_path(directory: &Path, stem: &str, extension: &str) -> Result<PathBuf> {
-    let first = directory.join(format!("{stem}.{extension}"));
-    if !fs::try_exists(&first).await.unwrap_or(false) { return Ok(first); }
-    for index in 1..10_000_u32 {
-        let candidate = directory.join(format!("{stem} ({index}).{extension}"));
-        if !fs::try_exists(&candidate).await.unwrap_or(true) { return Ok(candidate); }
+    fs::create_dir_all(directory).await?;
+    for index in 0..10_000_u32 {
+        let filename = if index == 0 {
+            format!("{stem}.{extension}")
+        } else {
+            format!("{stem} ({index}).{extension}")
+        };
+        let candidate = directory.join(filename);
+        match fs::OpenOptions::new().write(true).create_new(true).open(&candidate).await {
+            Ok(file) => {
+                drop(file);
+                return Ok(candidate);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error).with_context(|| format!("Cannot reserve {}", candidate.display())),
+        }
     }
     Err(anyhow!("Could not find a free filename for this video"))
 }
@@ -262,6 +324,11 @@ pub async fn download_hls(
 
     // If a master playlist is supplied, choose the first (highest listed) variant.
     let variants = parse_hls_master(&body, &base)?;
+    if !variants.is_empty() {
+        if let Some(reason) = unsupported_hls_master_reason(&body) {
+            return Err(anyhow!(reason));
+        }
+    }
     let media_url = variants.first().map(|v| v.url.clone()).unwrap_or_else(|| playlist_url.to_string());
     let media_base = Url::parse(&media_url)?;
     let media = if media_url == playlist_url { body } else {
@@ -269,6 +336,11 @@ pub async fn download_hls(
         if let Some(referrer) = referer { r = r.header(reqwest::header::REFERER, referrer); }
         r.send().await?.error_for_status()?.text().await?
     };
+    // The current implementation downloads finite VOD playlists. A live playlist
+    // without ENDLIST would otherwise keep the job running indefinitely.
+    if !is_complete_vod_playlist(&media) {
+        return Err(anyhow!("This is a live or unfinished HLS playlist. Only completed VOD playlists can be downloaded in this build."));
+    }
 
     let mut init_segment: Option<String> = None;
     let mut segments = Vec::new();
@@ -297,51 +369,102 @@ pub async fn download_hls(
     let stem = Path::new(&safe).file_stem().and_then(|s| s.to_str()).unwrap_or("video");
     let target = unique_video_path(&out_dir, stem, extension).await?;
     let work_dir = out_dir.join(format!(".hls-{}", Uuid::new_v4()));
-    fs::create_dir_all(&work_dir).await?;
+    let download_result = async {
+        fs::create_dir_all(&work_dir).await?;
 
-    let mut all_urls = Vec::new();
-    if let Some(init) = init_segment { all_urls.push(init); }
-    all_urls.extend(segments);
-    let total_segments = all_urls.len();
-    let completed = Arc::new(AtomicUsize::new(0));
-    let mut tasks = tokio::task::JoinSet::new();
-    for (index, segment_url) in all_urls.into_iter().enumerate() {
-        let client = client.clone();
-        let referrer = referer.map(str::to_string);
-        let path = work_dir.join(format!("segment-{index:06}"));
-        let completed = completed.clone();
-        let tx = progress_tx.clone();
-        tasks.spawn(async move {
-            let mut request = client.get(segment_url);
-            if let Some(referrer) = referrer { request = request.header(reqwest::header::REFERER, referrer); }
-            let mut response = request.send().await?.error_for_status()?;
-            let mut file = fs::File::create(&path).await?;
-            while let Some(chunk) = response.chunk().await? { file.write_all(&chunk).await?; }
-            file.flush().await?;
-            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-            let _ = tx.send(DownloadProgress { downloaded: done as u64, total: Some(total_segments as u64),
-                percent: Some(done as f64 * 100.0 / total_segments as f64), phase: "video-segments".into() });
-            Ok::<PathBuf, anyhow::Error>(path)
-        });
-        // Limit concurrent segment requests. Drain in batches to cap memory and sockets.
-        if tasks.len() >= 6 {
-            if let Some(result) = tasks.join_next().await { result??; }
+        let mut all_urls = Vec::new();
+        if let Some(init) = init_segment { all_urls.push(init); }
+        all_urls.extend(segments);
+        let total_segments = all_urls.len();
+        let completed = Arc::new(AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+        for (index, segment_url) in all_urls.into_iter().enumerate() {
+            let client = client.clone();
+            let referrer = referer.map(str::to_string);
+            let path = work_dir.join(format!("segment-{index:06}"));
+            let completed = completed.clone();
+            let tx = progress_tx.clone();
+            tasks.spawn(async move {
+                let mut request = client.get(segment_url);
+                if let Some(referrer) = referrer { request = request.header(reqwest::header::REFERER, referrer); }
+                let mut response = request.send().await?.error_for_status()?;
+                let mut file = fs::File::create(&path).await?;
+                while let Some(chunk) = response.chunk().await? { file.write_all(&chunk).await?; }
+                file.flush().await?;
+                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                let _ = tx.send(DownloadProgress { downloaded: done as u64, total: Some(total_segments as u64),
+                    percent: Some(done as f64 * 100.0 / total_segments as f64), phase: "video-segments".into() });
+                Ok::<PathBuf, anyhow::Error>(path)
+            });
+            // Bound segment concurrency to keep file descriptors and sockets predictable.
+            if tasks.len() >= 6 {
+                if let Some(result) = tasks.join_next().await { result??; }
+            }
         }
-    }
-    while let Some(result) = tasks.join_next().await { result??; }
+        while let Some(result) = tasks.join_next().await { result??; }
 
-    let temp = work_dir.join("assembled.media");
-    let mut output = fs::File::create(&temp).await?;
-    for index in 0..total_segments {
-        let mut input = fs::File::open(work_dir.join(format!("segment-{index:06}"))).await?;
-        tokio::io::copy(&mut input, &mut output).await?;
+        let temp = work_dir.join("assembled.media");
+        let mut output = fs::File::create(&temp).await?;
+        for index in 0..total_segments {
+            let mut input = fs::File::open(work_dir.join(format!("segment-{index:06}"))).await?;
+            tokio::io::copy(&mut input, &mut output).await?;
+        }
+        output.flush().await?;
+        drop(output);
+        // The target was reserved atomically before downloading. Replace only our
+        // empty reservation after every segment has been written successfully.
+        fs::remove_file(&target).await?;
+        fs::rename(&temp, &target).await?;
+        let _ = progress_tx.send(DownloadProgress { downloaded: total_segments as u64, total: Some(total_segments as u64),
+            percent: Some(100.0), phase: "complete".into() });
+        Ok::<PathBuf, anyhow::Error>(target.clone())
+    }.await;
+
+    if download_result.is_err() {
+        let _ = fs::remove_dir_all(&work_dir).await;
+        let _ = fs::remove_file(&target).await;
+    } else {
+        let _ = fs::remove_dir_all(&work_dir).await;
     }
-    output.flush().await?;
-    drop(output);
-    if fs::try_exists(&target).await.unwrap_or(false) { fs::remove_file(&target).await?; }
-    fs::rename(&temp, &target).await?;
-    let _ = fs::remove_dir_all(&work_dir).await;
-    let _ = progress_tx.send(DownloadProgress { downloaded: total_segments as u64, total: Some(total_segments as u64),
-        percent: Some(100.0), phase: "complete".into() });
-    Ok(target)
+    download_result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_complete_vod_playlist, parse_dash_representations, parse_hls_master, unsupported_hls_master_reason, unsupported_hls_reason};
+    use url::Url;
+
+    #[test]
+    fn hls_master_exposes_quality_options_highest_first() {
+        let playlist = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360\nlow.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=2400000,RESOLUTION=1280x720\nhigh.m3u8\n";
+        let base = Url::parse("https://cdn.example.test/master.m3u8").unwrap();
+        let variants = parse_hls_master(playlist, &base).unwrap();
+        assert_eq!(variants.len(), 2);
+        assert_eq!(variants[0].quality, "720p");
+        assert_eq!(variants[1].quality, "360p");
+        assert!(variants[0].url.ends_with("/high.m3u8"));
+    }
+
+    #[test]
+    fn dash_representations_are_detected_but_not_marked_downloadable() {
+        let manifest = r#"<MPD><Period><AdaptationSet><Representation id="low" bandwidth="300000" width="640" height="360"></Representation><Representation id="high" bandwidth="1200000" width="1280" height="720"></Representation></AdaptationSet></Period></MPD>"#;
+        let variants = parse_dash_representations(manifest, "https://cdn.example.test/video.mpd");
+        assert_eq!(variants.len(), 2);
+        assert_eq!(variants[0].quality, "720p");
+        assert!(!variants[0].downloadable);
+    }
+
+    #[test]
+    fn live_hls_playlist_is_not_misreported_as_a_finished_download() {
+        assert!(is_complete_vod_playlist("#EXTM3U\n#EXTINF:5,\nsegment.ts\n#EXT-X-ENDLIST"));
+        assert!(!is_complete_vod_playlist("#EXTM3U\n#EXTINF:5,\nsegment.ts"));
+        assert!(unsupported_hls_reason("#EXTM3U\n#EXTINF:5,\nsegment.ts").is_some());
+    }
+
+    #[test]
+    fn hls_session_encryption_and_separate_audio_are_not_offered_as_downloadable() {
+        assert!(unsupported_hls_master_reason("#EXTM3U\n#EXT-X-SESSION-KEY:METHOD=AES-128,URI=\"key.bin\"").is_some());
+        assert!(unsupported_hls_master_reason("#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",URI=\"audio.m3u8\"").is_some());
+        assert!(unsupported_hls_reason("#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\",BYTERANGE=\"100@0\"\n#EXT-X-ENDLIST").is_some());
+    }
 }

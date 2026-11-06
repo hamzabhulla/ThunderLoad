@@ -14,20 +14,41 @@ pub struct DownloadProgress {
     pub phase: String,
 }
 
+// Reserve the destination atomically so two simultaneous jobs cannot select
+// the same filename and overwrite one another.
 async fn next_available_path(path: &Path) -> Result<PathBuf> {
-    if !fs::try_exists(path).await.unwrap_or(false) { return Ok(path.to_path_buf()); }
     let parent = path.parent().ok_or_else(|| anyhow!("Target path has no parent folder"))?;
+    fs::create_dir_all(parent).await.with_context(|| format!("Cannot create {}", parent.display()))?;
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("download");
     let extension = path.extension().and_then(|s| s.to_str());
-    for index in 1..10_000_u32 {
-        let name = match extension {
-            Some(ext) => format!("{stem} ({index}).{ext}"),
-            None => format!("{stem} ({index})"),
+    for index in 0..10_000_u32 {
+        let candidate = if index == 0 {
+            path.to_path_buf()
+        } else {
+            let name = match extension {
+                Some(ext) => format!("{stem} ({index}).{ext}"),
+                None => format!("{stem} ({index})"),
+            };
+            parent.join(name)
         };
-        let candidate = parent.join(name);
-        if !fs::try_exists(&candidate).await.unwrap_or(true) { return Ok(candidate); }
+        match fs::OpenOptions::new().write(true).create_new(true).open(&candidate).await {
+            Ok(file) => {
+                drop(file);
+                return Ok(candidate);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error).with_context(|| format!("Cannot reserve {}", candidate.display())),
+        }
     }
     Err(anyhow!("Could not find a free filename in the download folder"))
+}
+
+fn validate_content_range(actual: &str, start: u64, end: u64, total: u64) -> Result<()> {
+    let expected = format!("bytes {start}-{end}/{total}");
+    if actual != expected {
+        return Err(anyhow!("Server returned an unexpected range: {actual}; expected {expected}"));
+    }
+    Ok(())
 }
 
 fn client() -> Result<Client> {
@@ -46,33 +67,42 @@ pub async fn download_url(
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
 ) -> Result<PathBuf> {
     let target = next_available_path(target).await?;
-    let connections = connections.clamp(1, 16);
-    let client = client()?;
-    let mut head_request = client.head(url);
-    if let Some(referrer) = referer { head_request = head_request.header(header::REFERER, referrer); }
-    let head = head_request.send().await.ok();
-    let total = head.as_ref().and_then(|r| r.content_length());
-    let supports_ranges = head.as_ref().map(|r| {
-        r.headers().get(header::ACCEPT_RANGES)
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.eq_ignore_ascii_case("bytes"))
-            .unwrap_or(false)
-    }).unwrap_or(false);
+    let result = async {
+        let connections = connections.clamp(1, 16);
+        let client = client()?;
+        let mut head_request = client.head(url);
+        if let Some(referrer) = referer { head_request = head_request.header(header::REFERER, referrer); }
+        let head = head_request.send().await.ok();
+        let total = head.as_ref().filter(|response| response.status().is_success())
+            .and_then(|response| response.content_length());
+        let supports_ranges = head.as_ref().filter(|response| response.status().is_success()).map(|response| {
+            response.headers().get(header::ACCEPT_RANGES)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.eq_ignore_ascii_case("bytes"))
+                .unwrap_or(false)
+        }).unwrap_or(false);
 
-    if supports_ranges && total.unwrap_or(0) >= 2 * 1024 * 1024 && connections > 1 {
-        match download_segmented(&client, url, &target, total.unwrap(), connections.min(16), referer, progress_tx.clone()).await {
-            Ok(path) => return Ok(path),
-            Err(_) => {
-                // Some servers advertise ranges but reject or rewrite them. Restart cleanly.
-                let _ = progress_tx.send(DownloadProgress {
-                    downloaded: 0, total, percent: Some(0.0), phase: "fallback".into()
-                });
+        if supports_ranges && total.unwrap_or(0) >= 2 * 1024 * 1024 && connections > 1 {
+            match download_segmented(&client, url, &target, total.unwrap(), connections.min(16), referer, progress_tx.clone()).await {
+                Ok(path) => return Ok(path),
+                Err(_) => {
+                    // Some servers advertise byte ranges but return invalid ranges.
+                    // Restart sequentially rather than leave a potentially corrupt file.
+                    let _ = progress_tx.send(DownloadProgress {
+                        downloaded: 0, total, percent: Some(0.0), phase: "fallback".into()
+                    });
+                }
             }
         }
-    }
-    download_sequential(&client, url, &target, total, referer, progress_tx).await
-}
+        download_sequential(&client, url, &target, total, referer, progress_tx).await
+    }.await;
 
+    if result.is_err() {
+        // The destination is an empty reservation until the transfer commits.
+        let _ = fs::remove_file(&target).await;
+    }
+    result
+}
 async fn prepare_parent(target: &Path) -> Result<()> {
     let parent = target.parent().ok_or_else(|| anyhow!("Target path has no parent folder"))?;
     fs::create_dir_all(parent).await.with_context(|| format!("Cannot create {}", parent.display()))?;
@@ -93,31 +123,45 @@ async fn download_sequential(
     if let Some(referrer) = referer { request = request.header(header::REFERER, referrer); }
     let response = request.send().await?.error_for_status()?;
     let actual_total = response.content_length().or(total);
-    let mut stream = response.bytes_stream();
-    let mut file = fs::File::create(&temp).await?;
-    let mut downloaded = 0_u64;
-    let mut last_report = Instant::now();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        file.write_all(&chunk).await?;
-        downloaded += chunk.len() as u64;
-        let percent = actual_total.filter(|n| *n > 0).map(|n| downloaded as f64 * 100.0 / n as f64);
-        if last_report.elapsed() >= std::time::Duration::from_millis(180) {
-            let _ = progress_tx.send(DownloadProgress {
-                downloaded, total: actual_total, percent, phase: "downloading".into()
-            });
-            last_report = Instant::now();
+
+    let transfer_result = async {
+        let mut stream = response.bytes_stream();
+        let mut file = fs::File::create(&temp).await?;
+        let mut downloaded = 0_u64;
+        let mut last_report = Instant::now();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            file.write_all(&chunk).await?;
+            downloaded += chunk.len() as u64;
+            let percent = actual_total.filter(|size| *size > 0)
+                .map(|size| downloaded as f64 * 100.0 / size as f64);
+            if last_report.elapsed() >= std::time::Duration::from_millis(180) {
+                let _ = progress_tx.send(DownloadProgress {
+                    downloaded, total: actual_total, percent, phase: "downloading".into()
+                });
+                last_report = Instant::now();
+            }
         }
+        file.flush().await?;
+        Ok::<u64, anyhow::Error>(downloaded)
+    }.await;
+
+    let downloaded = match transfer_result {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = fs::remove_file(&temp).await;
+            return Err(error).context("Sequential download failed; incomplete temporary file removed");
+        }
+    };
+    if let Err(error) = replace_file(&temp, target).await {
+        let _ = fs::remove_file(&temp).await;
+        return Err(error).context("Could not commit completed download; temporary file removed");
     }
-    file.flush().await?;
-    drop(file);
-    replace_file(&temp, target).await?;
     let _ = progress_tx.send(DownloadProgress {
         downloaded, total: actual_total.or(Some(downloaded)), percent: Some(100.0), phase: "complete".into()
     });
     Ok(target.to_path_buf())
 }
-
 async fn download_segmented(
     client: &Client,
     url: &str,
@@ -152,6 +196,13 @@ async fn download_segmented(
             let response = request.send().await?;
             if response.status() != StatusCode::PARTIAL_CONTENT {
                 return Err(anyhow!("Server did not honor byte range"));
+            }
+            let actual_range = response.headers().get(header::CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| anyhow!("Server omitted the Content-Range header"))?;
+            validate_content_range(actual_range, start, end, total)?;
+            if response.content_length().is_some_and(|length| length != end - start + 1) {
+                return Err(anyhow!("Server returned a range with an unexpected content length"));
             }
             let mut stream = response.bytes_stream();
             let mut file = fs::File::create(&part_path).await?;
@@ -192,19 +243,25 @@ async fn download_segmented(
     completed_parts.sort();
 
     let temp_output = work_dir.join("assembled.part");
-    let mut output = fs::File::create(&temp_output).await?;
-    for part in completed_parts {
-        let mut input = fs::File::open(part).await?;
-        tokio::io::copy(&mut input, &mut output).await?;
-    }
-    output.flush().await?;
-    drop(output);
-    let metadata = fs::metadata(&temp_output).await?;
-    if metadata.len() != total {
+    let assemble_result = async {
+        let mut output = fs::File::create(&temp_output).await?;
+        for part in completed_parts {
+            let mut input = fs::File::open(part).await?;
+            tokio::io::copy(&mut input, &mut output).await?;
+        }
+        output.flush().await?;
+        drop(output);
+        let metadata = fs::metadata(&temp_output).await?;
+        if metadata.len() != total {
+            return Err(anyhow!("Combined file size did not match the server's content length"));
+        }
+        replace_file(&temp_output, target).await?;
+        Ok::<(), anyhow::Error>(())
+    }.await;
+    if let Err(error) = assemble_result {
         let _ = fs::remove_dir_all(&work_dir).await;
-        return Err(anyhow!("Combined file size did not match the server's content length"));
+        return Err(error).context("Could not assemble segmented download; temporary parts removed");
     }
-    replace_file(&temp_output, target).await?;
     let _ = fs::remove_dir_all(&work_dir).await;
     let _ = progress_tx.send(DownloadProgress {
         downloaded: total, total: Some(total), percent: Some(100.0), phase: "complete".into()
@@ -234,4 +291,38 @@ pub fn safe_filename(input: &str, fallback: &str) -> String {
         .collect();
     let cleaned = cleaned.trim().trim_matches('.');
     if cleaned.is_empty() { fallback.to_string() } else { cleaned.to_string() }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::{next_available_path, safe_filename, validate_content_range};
+    use uuid::Uuid;
+
+    #[test]
+    fn byte_range_header_must_match_exact_requested_range() {
+        assert!(validate_content_range("bytes 0-99/1000", 0, 99, 1000).is_ok());
+        assert!(validate_content_range("bytes 0-98/1000", 0, 99, 1000).is_err());
+        assert!(validate_content_range("bytes 0-99/900", 0, 99, 1000).is_err());
+    }
+
+    #[tokio::test]
+    async fn concurrent_jobs_reserve_distinct_filenames() {
+        let directory = std::env::temp_dir().join(format!("thunderload-test-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let requested = directory.join("archive.zip");
+        let first = next_available_path(&requested).await.unwrap();
+        let second = next_available_path(&requested).await.unwrap();
+        assert_eq!(first, requested);
+        assert_eq!(second, directory.join("archive (1).zip"));
+        assert!(tokio::fs::try_exists(&first).await.unwrap());
+        assert!(tokio::fs::try_exists(&second).await.unwrap());
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    #[test]
+    fn filename_sanitization_removes_windows_path_separators() {
+        assert_eq!(safe_filename(r"..\\folder/name?.zip", "fallback"), "__folder_name_.zip");
+        assert_eq!(safe_filename("   ", "fallback"), "fallback");
+    }
 }

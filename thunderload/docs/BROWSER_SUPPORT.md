@@ -12,4 +12,8 @@ Firefox uses the separate Manifest V3 manifest (`manifest.firefox.json` becomes 
 Safari requires a WebExtension wrapped as a macOS app with Xcode tooling, followed by Apple signing/notarization and distribution. The macOS wrapper is not included in this source release. Do not advertise Safari as available until it is built and tested on macOS.
 
 ## Native messaging
-Native messaging is optional. Direct links use the browser's downloads manager without a companion app. Adaptive HLS inspection/download requires the ThunderLoad local native host. The native host's allowlist must contain the exact ID issued to each browser/store install.
+Native messaging is optional. Direct links use the browser's downloads manager without a companion app. Adaptive HLS inspection/download requires the ThunderLoad local native host.
+
+On Windows, install the desktop app, then open **Settings → Browser connection**. Select Chrome, Edge, Brave or Firefox, enter the exact extension ID, and choose **Connect browser**. Restart that browser and grant Native messaging when the extension asks. Chromium IDs must be 32 characters in the range a–p. The Firefox add-on ID in this package is `thunderload@example.com`.
+
+The desktop app copies the native host into the user's local application data directory, writes a per-browser manifest, and registers a per-user Windows registry entry. The manifest allowlists only the supplied extension ID.

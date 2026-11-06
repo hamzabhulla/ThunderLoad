@@ -50,18 +50,11 @@ Firefox release/beta requires Mozilla signing. Chrome Web Store and Edge Add-ons
 
 ## Optional native host
 
-Direct links work through the browser downloads API. HLS inspection/download uses the local native host.
+Direct file links use the browser downloads API and do not need a companion connection. HLS inspection/download uses the local native host.
 
-1. Install desktop ThunderLoad.
-2. Install the extension and copy that browser's extension ID.
-3. Run the included `register-native-host.ps1` with the relevant IDs. It copies the native executable to `%LOCALAPPDATA%\ThunderLoad\native-host` and registers selected browsers.
-4. Restart those browsers.
+On Windows, install desktop ThunderLoad, install the browser extension, then open **Settings → Browser connection**. Choose Chrome, Edge, Brave or Firefox, paste the exact extension ID and select **Connect browser**. Restart the browser and grant Native messaging in the extension popup when prompted.
 
-Example:
-```powershell
-.\register-native-host.ps1 -ChromeExtensionId "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" -FirefoxExtensionId "thunderload@example.com"
-```
-Use separate IDs for Edge, Brave, Opera and Vivaldi if installed there.
+The extension ID is required because the browser native-messaging allowlist must be restricted to the exact installed extension. Firefox's packaged ID is `thunderload@example.com`. Chromium IDs are shown on the browser's extensions developer page and contain 32 characters from `a` through `p`.
 
 ## Video limits
 HLS qualities are listed only when exposed by the site. Unencrypted HLS segments are supported; encrypted/DRM streams are not decrypted or bypassed. DASH qualities can be detected but DASH downloading/remux is future work. Blob/MSE-only, cookie-bound and signed URLs may not be exposed or may fail. Parallel connections cannot guarantee a fixed speed multiplier; results depend on server support and bandwidth.
