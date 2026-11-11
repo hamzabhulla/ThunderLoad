@@ -103,9 +103,38 @@ fn load_desktop_settings() {
     }
 }
 
+fn start_desktop_settings_watcher() {
+    #[cfg(target_os = "windows")]
+    {
+        let limiter = rate_limiter();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+            loop {
+                interval.tick().await;
+                let Some(app_data) = std::env::var_os("APPDATA") else { continue; };
+                let config_dir = std::path::PathBuf::from(app_data).join("com.thunderload.desktop");
+                if let Ok(value) = std::fs::read_to_string(config_dir.join("speed-limit.bytes")) {
+                    if let Ok(limit) = value.trim().parse::<u64>() {
+                        limiter.set_limit(limit);
+                    }
+                }
+                if let Ok(value) = std::fs::read_to_string(config_dir.join("ffmpeg.path")) {
+                    let value = value.trim();
+                    if !value.is_empty() {
+                        std::env::set_var("THUNDERLOAD_FFMPEG", value);
+                    } else {
+                        std::env::remove_var("THUNDERLOAD_FFMPEG");
+                    }
+                }
+            }
+        });
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     load_desktop_settings();
+    start_desktop_settings_watcher();
     let (incoming_tx, mut incoming_rx) = mpsc::unbounded_channel::<Value>();
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<Value>();
 
