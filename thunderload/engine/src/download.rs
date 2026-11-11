@@ -1142,7 +1142,7 @@ mod segmented_http_tests {
                         "HTTP/1.1 200 OK\r\nContent-Length: {BODY_SIZE}\r\nAccept-Ranges: bytes\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n"
                     );
                     let _ = stream.write_all(headers.as_bytes());
-                    continue;
+                    return;
                 }
                 // Count each GET range request so the fixture can assert segmented requests reliably.
                 if method != "HEAD" && range.is_some() {
@@ -1169,6 +1169,7 @@ mod segmented_http_tests {
                     );
                     if stream.write_all(headers.as_bytes()).is_ok() { let _ = stream.write_all(&request_body); }
                 }
+                });
             }
         });
         (format!("http://{address}/file.bin"), range_requests, shutdown, handle)
