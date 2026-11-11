@@ -51,6 +51,10 @@ fn validate_content_range(actual: &str, start: u64, end: u64, total: u64) -> Res
     Ok(())
 }
 
+fn parse_probe_content_range(value: &str) -> Option<u64> {
+    value.strip_prefix("bytes 0-0/")?.parse::<u64>().ok().filter(|total| *total >= 1)
+}
+
 /// Some servers support byte ranges but omit Accept-Ranges on HEAD. Probe a
 /// single byte before falling back to one connection; only trust a strict 206.
 async fn probe_range_support(client: &Client, url: &str, referer: Option<&str>) -> Option<u64> {
@@ -63,8 +67,8 @@ async fn probe_range_support(client: &Client, url: &str, referer: Option<&str>) 
         return None;
     }
     let content_range = response.headers().get(header::CONTENT_RANGE)?.to_str().ok()?;
-    let total = content_range.strip_prefix("bytes 0-0/")?.parse::<u64>().ok()?;
-    if total < 1 || response.content_length().is_some_and(|length| length != 1) {
+    let total = parse_probe_content_range(content_range)?;
+    if response.content_length().is_some_and(|length| length != 1) {
         return None;
     }
     Some(total)
@@ -103,7 +107,7 @@ pub async fn download_url(
 
         // Probe when HEAD omits Accept-Ranges (common on CDN/object-storage
         // endpoints). A valid one-byte 206 is stronger evidence than the hint.
-        if connections > 1 && !supports_ranges {
+        if connections > 1 && (!supports_ranges || total.is_none()) {
             if let Some(probed_total) = probe_range_support(&client, url, referer).await {
                 total = Some(probed_total);
                 supports_ranges = true;
@@ -202,7 +206,8 @@ async fn download_segmented(
     prepare_parent(target).await?;
     let work_dir = target.parent().unwrap().join(format!(".thunderload-{}", Uuid::new_v4()));
     fs::create_dir_all(&work_dir).await?;
-    let chunk_size = (total + connections as u64 - 1) / connections as u64;
+    let connection_count = connections.clamp(1, 16) as u64;
+    let chunk_size = total / connection_count + u64::from(total % connection_count != 0);
     let received = Arc::new(AtomicU64::new(0));
     let last_report = Arc::new(Mutex::new(Instant::now()));
     let mut tasks = tokio::task::JoinSet::new();
@@ -210,7 +215,7 @@ async fn download_segmented(
     for index in 0..connections {
         let start = index as u64 * chunk_size;
         if start >= total { break; }
-        let end = (start + chunk_size - 1).min(total - 1);
+        let end = start.saturating_add(chunk_size - 1).min(total - 1);
         let part_path = work_dir.join(format!("part-{index:03}"));
         let client = client.clone();
         let url = url.to_owned();
@@ -264,8 +269,18 @@ async fn download_segmented(
     while let Some(joined) = tasks.join_next().await {
         match joined {
             Ok(Ok(path)) => completed_parts.push(path),
-            Ok(Err(error)) => { tasks.abort_all(); let _ = fs::remove_dir_all(&work_dir).await; return Err(error); }
-            Err(error) => { tasks.abort_all(); let _ = fs::remove_dir_all(&work_dir).await; return Err(error.into()); }
+            Ok(Err(error)) => {
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+                let _ = fs::remove_dir_all(&work_dir).await;
+                return Err(error);
+            }
+            Err(error) => {
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+                let _ = fs::remove_dir_all(&work_dir).await;
+                return Err(error.into());
+            }
         }
     }
     completed_parts.sort();
@@ -332,6 +347,31 @@ mod tests {
         assert!(validate_content_range("bytes 0-99/1000", 0, 99, 1000).is_ok());
         assert!(validate_content_range("bytes 0-98/1000", 0, 99, 1000).is_err());
         assert!(validate_content_range("bytes 0-99/900", 0, 99, 1000).is_err());
+    }
+
+    #[test]
+    fn range_probe_parser_rejects_unknown_or_malformed_totals() {
+        assert_eq!(super::parse_probe_content_range("bytes 0-0/4096"), Some(4096));
+        assert_eq!(super::parse_probe_content_range("bytes 0-0/*"), None);
+        assert_eq!(super::parse_probe_content_range("bytes 1-1/4096"), None);
+        assert_eq!(super::parse_probe_content_range("bytes 0-0/0"), None);
+        assert_eq!(super::parse_probe_content_range("garbage"), None);
+    }
+
+    #[test]
+    fn segmented_chunk_boundaries_cover_the_file_without_overflow() {
+        fn ranges(total: u64, connections: u64) -> Vec<(u64, u64)> {
+            let count = connections.clamp(1, 16);
+            let chunk = total / count + u64::from(total % count != 0);
+            (0..count).filter_map(|index| {
+                let start = index * chunk;
+                if start >= total { return None; }
+                Some((start, start.saturating_add(chunk - 1).min(total - 1)))
+            }).collect()
+        }
+        assert_eq!(ranges(10, 3), vec![(0, 3), (4, 7), (8, 9)]);
+        assert_eq!(ranges(2, 16), vec![(0, 0), (1, 1)]);
+        assert_eq!(ranges(u64::MAX, 2), vec![(0, u64::MAX / 2), (u64::MAX / 2 + 1, u64::MAX - 1)]);
     }
 
     #[test]
