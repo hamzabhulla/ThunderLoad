@@ -38,6 +38,38 @@ fn timestamp_ms() -> u64 {
         .unwrap_or_default().as_millis() as u64
 }
 
+async fn wait_native_job_control(
+    receiver: &mut watch::Receiver<DownloadControl>,
+    state: &mut Value,
+    consume_pending_change: bool,
+) -> Option<DownloadControl> {
+    if consume_pending_change && receiver.changed().await.is_err() {
+        return None;
+    }
+    match *receiver.borrow() {
+        DownloadControl::Running => return Some(DownloadControl::Running),
+        DownloadControl::Cancelled => return Some(DownloadControl::Cancelled),
+        DownloadControl::Paused => {}
+    }
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(10));
+    loop {
+        tokio::select! {
+            _ = heartbeat.tick() => {
+                state["updatedAt"] = json!(timestamp_ms());
+                let _ = save_native_job_state(state).await;
+            }
+            changed = receiver.changed() => {
+                if changed.is_err() { return None; }
+                match *receiver.borrow() {
+                    DownloadControl::Running => return Some(DownloadControl::Running),
+                    DownloadControl::Cancelled => return Some(DownloadControl::Cancelled),
+                    DownloadControl::Paused => {}
+                }
+            }
+        }
+    }
+}
+
 async fn save_native_job_state(state: &Value) -> Result<()> {
     let root = default_download_dir().join(".native-jobs");
     tokio::fs::create_dir_all(&root).await?;
@@ -327,28 +359,26 @@ async fn main() -> Result<()> {
                                 state["updatedAt"] = json!(timestamp_ms());
                                 let _ = save_native_job_state(&state).await;
                                 let _ = tx.send(json!({"event": "download.paused", "jobId": job_id}));
-                                loop {
-                                    match *control_rx.borrow() {
-                                        DownloadControl::Running => {
-                                            state["status"] = json!("Downloading");
-                                            state["detail"] = json!("Resuming saved checkpoint");
-                                            state["updatedAt"] = json!(timestamp_ms());
-                                            let _ = save_native_job_state(&state).await;
-                                            continue 'job;
-                                        }
-                                        DownloadControl::Cancelled => {
-                                            cleanup_native_partial(&target).await;
-                                            state["status"] = json!("Cancelled");
-                                            state["detail"] = json!("Cancelled · partial file removed");
-                                            state["targetPath"] = Value::Null;
-                                            state["updatedAt"] = json!(timestamp_ms());
-                                            let _ = save_native_job_state(&state).await;
-                                            let _ = tx.send(json!({"event": "download.cancelled", "jobId": job_id}));
-                                            break 'job;
-                                        }
-                                        DownloadControl::Paused => {}
+                                match wait_native_job_control(&mut control_rx, &mut state, true).await {
+                                    Some(DownloadControl::Running) => {
+                                        state["status"] = json!("Downloading");
+                                        state["detail"] = json!("Resuming saved checkpoint");
+                                        state["updatedAt"] = json!(timestamp_ms());
+                                        let _ = save_native_job_state(&state).await;
+                                        continue 'job;
                                     }
-                                    if control_rx.changed().await.is_err() {
+                                    Some(DownloadControl::Cancelled) => {
+                                        cleanup_native_partial(&target).await;
+                                        state["status"] = json!("Cancelled");
+                                        state["detail"] = json!("Cancelled · partial file removed");
+                                        state["targetPath"] = Value::Null;
+                                        state["updatedAt"] = json!(timestamp_ms());
+                                        let _ = save_native_job_state(&state).await;
+                                        let _ = tx.send(json!({"event": "download.cancelled", "jobId": job_id}));
+                                        break 'job;
+                                    }
+                                    Some(DownloadControl::Paused) => unreachable!(),
+                                    None => {
                                         state["status"] = json!("Interrupted");
                                         state["detail"] = json!("Browser companion disconnected; partial checkpoint kept");
                                         state["updatedAt"] = json!(timestamp_ms());
@@ -368,29 +398,27 @@ async fn main() -> Result<()> {
                                 let _ = tx.send(json!({"event": "download.error", "jobId": job_id, "error": error.to_string()}));
                                 // Retain the native control channel so the desktop
                                 // queue can ask this browser job to Resume its checkpoint.
-                                loop {
-                                    match *control_rx.borrow() {
-                                        DownloadControl::Running => {
-                                            state["status"] = json!("Downloading");
-                                            state["error"] = Value::Null;
-                                            state["detail"] = json!("Retrying from saved checkpoint");
-                                            state["updatedAt"] = json!(timestamp_ms());
-                                            let _ = save_native_job_state(&state).await;
-                                            continue 'job;
-                                        }
-                                        DownloadControl::Cancelled => {
-                                            cleanup_native_partial(&target).await;
-                                            state["status"] = json!("Cancelled");
-                                            state["detail"] = json!("Cancelled · partial file removed");
-                                            state["targetPath"] = Value::Null;
-                                            state["updatedAt"] = json!(timestamp_ms());
-                                            let _ = save_native_job_state(&state).await;
-                                            let _ = tx.send(json!({"event": "download.cancelled", "jobId": job_id}));
-                                            break 'job;
-                                        }
-                                        DownloadControl::Paused => {}
+                                match wait_native_job_control(&mut control_rx, &mut state, false).await {
+                                    Some(DownloadControl::Running) => {
+                                        state["status"] = json!("Downloading");
+                                        state["error"] = Value::Null;
+                                        state["detail"] = json!("Retrying from saved checkpoint");
+                                        state["updatedAt"] = json!(timestamp_ms());
+                                        let _ = save_native_job_state(&state).await;
+                                        continue 'job;
                                     }
-                                    if control_rx.changed().await.is_err() {
+                                    Some(DownloadControl::Cancelled) => {
+                                        cleanup_native_partial(&target).await;
+                                        state["status"] = json!("Cancelled");
+                                        state["detail"] = json!("Cancelled · partial file removed");
+                                        state["targetPath"] = Value::Null;
+                                        state["updatedAt"] = json!(timestamp_ms());
+                                        let _ = save_native_job_state(&state).await;
+                                        let _ = tx.send(json!({"event": "download.cancelled", "jobId": job_id}));
+                                        break 'job;
+                                    }
+                                    Some(DownloadControl::Paused) => unreachable!(),
+                                    None => {
                                         state["status"] = json!("Interrupted");
                                         state["detail"] = json!("Browser companion disconnected; partial checkpoint kept");
                                         state["updatedAt"] = json!(timestamp_ms());
