@@ -1,7 +1,8 @@
 use anyhow::{anyhow, Result};
+use std::sync::{Arc, OnceLock};
 use serde_json::{json, Value};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::mpsc};
-use thunderload_engine::{default_download_dir, download_hls, download_url, inspect_video, safe_filename};
+use thunderload_engine::{default_download_dir, download_hls, download_url, inspect_video, safe_filename, GlobalRateLimiter};
 
 const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 
@@ -78,17 +79,24 @@ fn apply_native_progress(state: &mut Value, progress: &thunderload_engine::Downl
     state["updatedAt"] = json!(timestamp_ms());
 }
 
-fn load_desktop_ffmpeg_path() {
+static RATE_LIMITER: OnceLock<Arc<GlobalRateLimiter>> = OnceLock::new();
+
+fn rate_limiter() -> Arc<GlobalRateLimiter> {
+    RATE_LIMITER.get_or_init(|| Arc::new(GlobalRateLimiter::new())).clone()
+}
+
+fn load_desktop_settings() {
     #[cfg(target_os = "windows")]
     {
         if let Some(app_data) = std::env::var_os("APPDATA") {
-            let path = std::path::PathBuf::from(app_data)
-                .join("com.thunderload.desktop")
-                .join("ffmpeg.path");
-            if let Ok(value) = std::fs::read_to_string(path) {
+            let config_dir = std::path::PathBuf::from(app_data).join("com.thunderload.desktop");
+            if let Ok(value) = std::fs::read_to_string(config_dir.join("ffmpeg.path")) {
                 let value = value.trim();
-                if !value.is_empty() {
-                    std::env::set_var("THUNDERLOAD_FFMPEG", value);
+                if !value.is_empty() { std::env::set_var("THUNDERLOAD_FFMPEG", value); }
+            }
+            if let Ok(value) = std::fs::read_to_string(config_dir.join("speed-limit.bytes")) {
+                if let Ok(limit) = value.trim().parse::<u64>() {
+                    rate_limiter().set_limit(limit);
                 }
             }
         }
@@ -97,7 +105,7 @@ fn load_desktop_ffmpeg_path() {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    load_desktop_ffmpeg_path();
+    load_desktop_settings();
     let (incoming_tx, mut incoming_rx) = mpsc::unbounded_channel::<Value>();
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<Value>();
 
@@ -171,7 +179,7 @@ async fn main() -> Result<()> {
                             }
                         }
                     });
-                    let result = download_url(&url, &target, 8, referer.as_deref(), progress_tx).await;
+                    let result = download_url(&url, &target, 8, referer.as_deref(), progress_tx, rate_limiter()).await;
                     let _ = progress_handle.await;
                     match result {
                         Ok(path) => {
@@ -230,7 +238,7 @@ async fn main() -> Result<()> {
                             }
                         }
                     });
-                    let result = download_hls(&url, &filename, referer.as_deref(), progress_tx).await;
+                    let result = download_hls(&url, &filename, referer.as_deref(), progress_tx, rate_limiter()).await;
                     let _ = progress_handle.await;
                     match result {
                         Ok(path) => {
@@ -299,7 +307,7 @@ async fn main() -> Result<()> {
                     });
                     let result = thunderload_engine::download_dash(
                         &url, &representation_id, audio_representation_id.as_deref(),
-                        &filename, referer.as_deref(), progress_tx
+                        &filename, referer.as_deref(), progress_tx, rate_limiter()
                     ).await;
                     let _ = progress_handle.await;
                     match result {
