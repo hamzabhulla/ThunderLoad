@@ -1124,10 +1124,14 @@ mod segmented_http_tests {
                 });
                 if method == "HEAD" {
                     let headers = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {BODY_SIZE}\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n"
+                        "HTTP/1.1 200 OK\r\nContent-Length: {BODY_SIZE}\r\nAccept-Ranges: bytes\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n"
                     );
                     let _ = stream.write_all(headers.as_bytes());
                     continue;
+                }
+                // Count each GET range request so the fixture can assert segmented requests reliably.
+                if method != "HEAD" && range.is_some() {
+                    requests.fetch_add(1, Ordering::Relaxed);
                 }
                 let bounds = range.as_deref()
                     .and_then(|value| value.strip_prefix("bytes="))
@@ -1138,9 +1142,6 @@ mod segmented_http_tests {
                         && (validator.as_deref() == Some("\"v1\"")
                             || (*start == 0 && *end == 0 && validator.is_none()))
                 }) {
-                    if validator.is_some() {
-                        requests.fetch_add(1, Ordering::Relaxed);
-                    }
                     let payload = &body[start..=end];
                     let headers = format!(
                         "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{BODY_SIZE}\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n",
