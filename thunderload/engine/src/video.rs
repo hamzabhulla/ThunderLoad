@@ -8,7 +8,7 @@ use futures_util::StreamExt;
 use std::collections::HashMap;
 use url::Url;
 use uuid::Uuid;
-use crate::download::{default_download_dir, safe_filename, DownloadProgress};
+use crate::download::{default_download_dir, safe_filename, DownloadProgress, GlobalRateLimiter};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -940,6 +940,7 @@ pub async fn download_hls(
     filename: &str,
     referer: Option<&str>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
+    rate_limiter: Arc<GlobalRateLimiter>,
 ) -> Result<PathBuf> {
     let base = Url::parse(playlist_url)?;
     let client = client()?;
@@ -1010,6 +1011,7 @@ pub async fn download_hls(
             let path = work_dir.join(format!("segment-{index:06}"));
             let completed = completed.clone();
             let downloaded_bytes = downloaded_bytes.clone();
+            let rate_limiter = rate_limiter.clone();
             let tx = progress_tx.clone();
             tasks.spawn(async move {
                 let mut request = client.get(segment_url);
@@ -1020,6 +1022,8 @@ pub async fn download_hls(
                 while let Some(chunk) = response.chunk().await? {
                     bytes = bytes.saturating_add(chunk.len() as u64);
                     file.write_all(&chunk).await?;
+                    let wait = rate_limiter.reserve(chunk.len() as u64).await;
+                    if !wait.is_zero() { tokio::time::sleep(wait).await; }
                 }
                 file.flush().await?;
                 let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1084,6 +1088,7 @@ async fn download_dash_track(
     completed: Arc<AtomicUsize>,
     downloaded_bytes: Arc<AtomicU64>,
     total_segments: usize,
+    rate_limiter: Arc<GlobalRateLimiter>,
 ) -> Result<PathBuf> {
     let mut urls = Vec::with_capacity(track.segment_urls.len() + usize::from(track.initialization_url.is_some()));
     if let Some(initialization) = &track.initialization_url {
@@ -1102,6 +1107,7 @@ async fn download_dash_track(
         let tx = progress_tx.clone();
         let completed = completed.clone();
         let downloaded_bytes = downloaded_bytes.clone();
+        let rate_limiter = rate_limiter.clone();
         tasks.spawn(async move {
             let mut request = client.get(segment_url);
             if let Some(referrer) = referrer {
@@ -1115,6 +1121,8 @@ async fn download_dash_track(
                 let chunk = chunk?;
                 file.write_all(&chunk).await?;
                 bytes = bytes.saturating_add(chunk.len() as u64);
+                let wait = rate_limiter.reserve(chunk.len() as u64).await;
+                if !wait.is_zero() { tokio::time::sleep(wait).await; }
             }
             file.flush().await?;
             if bytes == 0 { return Err(anyhow!("DASH server returned an empty initialization/segment file")); }
@@ -1176,6 +1184,7 @@ pub async fn download_dash(
     filename: &str,
     referer: Option<&str>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
+    rate_limiter: Arc<GlobalRateLimiter>,
 ) -> Result<PathBuf> {
     let body = fetch_text(manifest_url, referer).await?;
     let document = parse_dash_document(&body)?;
@@ -1217,13 +1226,13 @@ pub async fn download_dash(
         let downloaded_bytes = Arc::new(AtomicU64::new(0));
         let video_file = download_dash_track(
             &client, &video, &work_dir, "video", referer, &progress_tx,
-            completed.clone(), downloaded_bytes.clone(), total_segments
+            completed.clone(), downloaded_bytes.clone(), total_segments, rate_limiter.clone()
         ).await?;
 
         let output_file = if let Some(audio) = &audio {
             let audio_file = download_dash_track(
                 &client, audio, &work_dir, "audio", referer, &progress_tx,
-                completed.clone(), downloaded_bytes.clone(), total_segments
+                completed.clone(), downloaded_bytes.clone(), total_segments, rate_limiter.clone()
             ).await?;
             let muxed = work_dir.join("muxed.mp4");
             let executable = std::env::var_os("THUNDERLOAD_FFMPEG").unwrap_or_else(|| "ffmpeg".into());
