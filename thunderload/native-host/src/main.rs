@@ -43,13 +43,15 @@ async fn wait_native_job_control(
     state: &mut Value,
     consume_pending_change: bool,
 ) -> Option<DownloadControl> {
-    if consume_pending_change && receiver.changed().await.is_err() {
-        return None;
-    }
-    match *receiver.borrow() {
-        DownloadControl::Running => return Some(DownloadControl::Running),
-        DownloadControl::Cancelled => return Some(DownloadControl::Cancelled),
-        DownloadControl::Paused => {}
+    if consume_pending_change {
+        if receiver.changed().await.is_err() { return None; }
+        match *receiver.borrow() {
+            DownloadControl::Running => return Some(DownloadControl::Running),
+            DownloadControl::Cancelled => return Some(DownloadControl::Cancelled),
+            DownloadControl::Paused => {}
+        }
+    } else if *receiver.borrow() == DownloadControl::Cancelled {
+        return Some(DownloadControl::Cancelled);
     }
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(10));
     loop {
@@ -283,7 +285,7 @@ async fn main() -> Result<()> {
                     }
                 };
                 let job_id = uuid::Uuid::new_v4().to_string();
-                let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
+                let (control_tx, mut control_rx) = watch::channel(DownloadControl::Running);
                 if let Ok(mut controls) = native_controls().lock() {
                     controls.insert(job_id.clone(), control_tx);
                 } else {
