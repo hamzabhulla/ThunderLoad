@@ -78,8 +78,26 @@ fn apply_native_progress(state: &mut Value, progress: &thunderload_engine::Downl
     state["updatedAt"] = json!(timestamp_ms());
 }
 
+fn load_desktop_ffmpeg_path() {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(app_data) = std::env::var_os("APPDATA") {
+            let path = std::path::PathBuf::from(app_data)
+                .join("com.thunderload.desktop")
+                .join("ffmpeg.path");
+            if let Ok(value) = std::fs::read_to_string(path) {
+                let value = value.trim();
+                if !value.is_empty() {
+                    std::env::set_var("THUNDERLOAD_FFMPEG", value);
+                }
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    load_desktop_ffmpeg_path();
     let (incoming_tx, mut incoming_rx) = mpsc::unbounded_channel::<Value>();
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<Value>();
 
