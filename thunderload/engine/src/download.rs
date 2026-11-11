@@ -1038,3 +1038,113 @@ mod resume_metadata_tests {
         assert!(!resume_identity_matches(&saved, "https://example.test/file.bin", None, Some("Thu, 22 Oct 2015 07:28:00 GMT"), None));
     }
 }
+
+#[cfg(test)]
+mod segmented_http_tests {
+    use super::{download_url, DownloadProgress};
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::{atomic::{AtomicBool, AtomicUsize, Ordering}, Arc},
+        thread,
+        time::Duration,
+    };
+    use tokio::sync::mpsc;
+
+    const BODY_SIZE: usize = 2 * 1024 * 1024 + 37;
+
+    fn spawn_segment_server() -> (String, Arc<AtomicUsize>, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let range_requests = Arc::new(AtomicUsize::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let requests = range_requests.clone();
+        let stop = shutdown.clone();
+        let body: Vec<u8> = (0..BODY_SIZE).map(|index| (index % 251) as u8).collect();
+        let handle = thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut raw = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => {
+                            raw.extend_from_slice(&buffer[..count]);
+                            if raw.windows(4).any(|window| window == b"\\r\\n\\r\\n") { break; }
+                        }
+                    }
+                }
+                let request = String::from_utf8_lossy(&raw);
+                let method = request.split_whitespace().next().unwrap_or("");
+                let range = request.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("range").then(|| value.trim().to_string())
+                });
+                let validator = request.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("if-range").then(|| value.trim().to_string())
+                });
+                if method == "HEAD" {
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\\r\\nContent-Length: {BODY_SIZE}\\r\\nETag: \\"v1\\"\\r\\nConnection: close\\r\\n\\r\\n"
+                    );
+                    let _ = stream.write_all(headers.as_bytes());
+                    continue;
+                }
+                let bounds = range.as_deref()
+                    .and_then(|value| value.strip_prefix("bytes="))
+                    .and_then(|value| value.split_once('-'))
+                    .and_then(|(start, end)| Some((start.parse::<usize>().ok()?, end.parse::<usize>().ok()?)));
+                if let Some((start, end)) = bounds.filter(|(start, end)| *start <= *end && *end < BODY_SIZE)
+                    .filter(|_| validator.as_deref() == Some("\\"v1\\""))
+                {
+                    requests.fetch_add(1, Ordering::Relaxed);
+                    let payload = &body[start..=end];
+                    let headers = format!(
+                        "HTTP/1.1 206 Partial Content\\r\\nContent-Length: {}\\r\\nContent-Range: bytes {start}-{end}/{BODY_SIZE}\\r\\nETag: \\"v1\\"\\r\\nConnection: close\\r\\n\\r\\n",
+                        payload.len()
+                    );
+                    if stream.write_all(headers.as_bytes()).is_ok() { let _ = stream.write_all(payload); }
+                } else {
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\\r\\nContent-Length: {BODY_SIZE}\\r\\nETag: \\"v1\\"\\r\\nConnection: close\\r\\n\\r\\n"
+                    );
+                    if stream.write_all(headers.as_bytes()).is_ok() { let _ = stream.write_all(&body); }
+                }
+            }
+        });
+        (format!("http://{address}/file.bin"), range_requests, shutdown, handle)
+    }
+
+    #[tokio::test]
+    async fn multi_connection_download_probes_ranges_and_assembles_exact_bytes() {
+        let (url, range_requests, shutdown, server) = spawn_segment_server();
+        let directory = std::env::temp_dir().join(format!("thunderload-segment-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<DownloadProgress>();
+        let path = download_url(&url, &directory.join("payload.bin"), 8, None, progress_tx)
+            .await.unwrap();
+        assert!(range_requests.load(Ordering::Relaxed) >= 2);
+        let bytes = tokio::fs::read(&path).await.unwrap();
+        let expected: Vec<u8> = (0..BODY_SIZE).map(|index| (index % 251) as u8).collect();
+        assert_eq!(bytes, expected);
+        let mut saw_complete = false;
+        while let Ok(progress) = progress_rx.try_recv() {
+            if progress.phase == "complete" && progress.percent == Some(100.0) { saw_complete = true; }
+        }
+        assert!(saw_complete);
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+}
+
