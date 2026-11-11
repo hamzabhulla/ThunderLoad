@@ -32,7 +32,10 @@ Do not label a build production-ready until every applicable item is complete.
 - [ ] Range requests validated against test servers and malformed Content-Range rejected.
 - [ ] Retry, timeout, cancel, partial cleanup and disk-full behavior tested.
 - [ ] HLS byte ranges, discontinuities, live playlists, fMP4, encryption rejection and quality selection tested.
-- [ ] DASH SegmentTemplate/SegmentList/BaseURL, audio/video tracks, timelines and MP4 remux completed and tested before claiming DASH downloads.
+- [ ] Verify configured FFmpeg path is loaded by both desktop and browser native-host processes; test missing/invalid binary and mux failures.
+- [x] Static DASH SegmentTemplate/SegmentTimeline, inherited templates, BaseURL resolution, audio/video representation selection and FFmpeg stream-copy mux code implemented; Windows CI fixtures must remain green.
+- [ ] End-to-end DASH download fixtures against real MPD providers, including unusual timescales, negative repeats, signed BaseURLs, and audio/video codec combinations.
+- [ ] DASH SegmentList/SegmentBase and multi-period support; DRM/ContentProtection intentionally remains unsupported.
 - [ ] Cookie/custom-header handoff is explicit and local.
 - [ ] No DRM decryption, paywall bypass or unauthorized access.
 
