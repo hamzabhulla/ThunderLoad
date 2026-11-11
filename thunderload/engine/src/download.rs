@@ -55,9 +55,15 @@ fn parse_probe_content_range(value: &str) -> Option<u64> {
     value.strip_prefix("bytes 0-0/")?.parse::<u64>().ok().filter(|total| *total >= 1)
 }
 
+#[derive(Debug, Clone)]
+struct RangeProbe {
+    total: u64,
+    if_range: Option<String>,
+}
+
 /// Some servers support byte ranges but omit Accept-Ranges on HEAD. Probe a
 /// single byte before falling back to one connection; only trust a strict 206.
-async fn probe_range_support(client: &Client, url: &str, referer: Option<&str>) -> Option<u64> {
+async fn probe_range_support(client: &Client, url: &str, referer: Option<&str>) -> Option<RangeProbe> {
     let mut request = client.get(url).header(header::RANGE, "bytes=0-0");
     if let Some(referrer) = referer {
         request = request.header(header::REFERER, referrer);
@@ -71,7 +77,15 @@ async fn probe_range_support(client: &Client, url: &str, referer: Option<&str>) 
     if response.content_length().is_some_and(|length| length != 1) {
         return None;
     }
-    Some(total)
+    let etag = response.headers().get(header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim_start().starts_with("W/"));
+    let modified = response.headers().get(header::LAST_MODIFIED)
+        .and_then(|value| value.to_str().ok());
+    Some(RangeProbe {
+        total,
+        if_range: etag.or(modified).map(str::to_owned),
+    })
 }
 
 fn client() -> Result<Client> {
@@ -104,18 +118,27 @@ pub async fn download_url(
                 .map(|value| value.eq_ignore_ascii_case("bytes"))
                 .unwrap_or(false)
         }).unwrap_or(false);
+        let mut if_range = head.as_ref().and_then(|response| {
+            let etag = response.headers().get(header::ETAG)
+                .and_then(|value| value.to_str().ok())
+                .filter(|value| !value.trim_start().starts_with("W/"));
+            let modified = response.headers().get(header::LAST_MODIFIED)
+                .and_then(|value| value.to_str().ok());
+            etag.or(modified).map(str::to_owned)
+        });
 
         // Probe when HEAD omits Accept-Ranges (common on CDN/object-storage
         // endpoints). A valid one-byte 206 is stronger evidence than the hint.
         if connections > 1 && (!supports_ranges || total.is_none()) {
-            if let Some(probed_total) = probe_range_support(&client, url, referer).await {
-                total = Some(probed_total);
+            if let Some(probe) = probe_range_support(&client, url, referer).await {
+                total = Some(probe.total);
+                if if_range.is_none() { if_range = probe.if_range; }
                 supports_ranges = true;
             }
         }
 
         if supports_ranges && total.unwrap_or(0) >= 2 * 1024 * 1024 && connections > 1 {
-            match download_segmented(&client, url, &target, total.unwrap(), connections.min(16), referer, progress_tx.clone()).await {
+            match download_segmented(&client, url, &target, total.unwrap(), connections.min(16), referer, if_range.as_deref(), progress_tx.clone()).await {
                 Ok(path) => return Ok(path),
                 Err(_) => {
                     // Some servers advertise byte ranges but return invalid ranges.
@@ -201,6 +224,7 @@ async fn download_segmented(
     total: u64,
     connections: usize,
     referer: Option<&str>,
+    if_range: Option<&str>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
 ) -> Result<PathBuf> {
     prepare_parent(target).await?;
@@ -222,10 +246,12 @@ async fn download_segmented(
         let received = received.clone();
         let last_report = last_report.clone();
         let referrer = referer.map(str::to_string);
+        let validator = if_range.map(str::to_string);
         let progress_tx = progress_tx.clone();
         tasks.spawn(async move {
             let mut request = client.get(&url).header(header::RANGE, format!("bytes={start}-{end}"));
             if let Some(referrer) = referrer { request = request.header(header::REFERER, referrer); }
+            if let Some(validator) = validator { request = request.header(header::IF_RANGE, validator); }
             let response = request.send().await?;
             if response.status() != StatusCode::PARTIAL_CONTENT {
                 return Err(anyhow!("Server did not honor byte range"));
