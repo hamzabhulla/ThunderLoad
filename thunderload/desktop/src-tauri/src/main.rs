@@ -22,8 +22,13 @@ fn rate_limiter() -> Arc<GlobalRateLimiter> {
 }
 
 #[tauri::command]
-async fn set_speed_limit(bytes_per_second: u64) -> Result<(), String> {
-    rate_limiter().set_limit(bytes_per_second);
+async fn set_speed_limit(bytes_per_second: u64, app: tauri::AppHandle) -> Result<(), String> {
+    let limit = bytes_per_second.min(1_073_741_824);
+    rate_limiter().set_limit(limit);
+    let config_dir = app.path().app_config_dir().map_err(|error| error.to_string())?;
+    tokio::fs::create_dir_all(&config_dir).await.map_err(|error| error.to_string())?;
+    tokio::fs::write(config_dir.join("speed-limit.bytes"), limit.to_string()).await
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -127,7 +132,7 @@ async fn start_hls_download(
                 let _ = progress_app.emit("download-progress", json!({ "jobId": progress_id, "progress": progress }));
             }
         });
-        match download_hls(&url, &name, None, progress_tx).await {
+        match download_hls(&url, &name, None, progress_tx, rate_limiter()).await {
             Ok(path) => { let _ = app.emit("download-complete", json!({ "jobId": job_for_task, "path": path.to_string_lossy() })); }
             Err(error) => { let _ = app.emit("download-error", json!({ "jobId": job_for_task, "error": error.to_string() })); }
         }
@@ -222,7 +227,7 @@ async fn start_dash_download(
             }
         });
         match thunderload_engine::download_dash(
-            &url, &representation_id, audio_representation_id.as_deref(), &name, None, progress_tx
+            &url, &representation_id, audio_representation_id.as_deref(), &name, None, progress_tx, rate_limiter()
         ).await {
             Ok(path) => {
                 let _ = app.emit("download-complete", json!({ "jobId": job_for_task, "path": path.to_string_lossy() }));
@@ -346,6 +351,9 @@ fn main() {
                 if let Ok(value) = std::fs::read_to_string(config_dir.join("ffmpeg.path")) {
                     let value = value.trim();
                     if !value.is_empty() { std::env::set_var("THUNDERLOAD_FFMPEG", value); }
+                }
+                if let Ok(value) = std::fs::read_to_string(config_dir.join("speed-limit.bytes")) {
+                    if let Ok(limit) = value.trim().parse::<u64>() { rate_limiter().set_limit(limit); }
                 }
             }
             Ok(())
