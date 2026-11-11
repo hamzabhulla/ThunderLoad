@@ -3,14 +3,21 @@
 **Status: release candidate / not production-ready yet.** This repository contains packaging pipelines, but the tagged Windows build must pass CI and be tested on real machines/browsers before general release. Store approval is decided by each browser vendor.
 
 ## Current source features
-- Rust HTTP/HTTPS downloader with parallel byte-range transfers (up to 16 connections) when the server explicitly supports ranges, with sequential fallback.
-- Direct browser downloads through the browser downloads API.
+- Desktop direct HTTP/HTTPS transfers use a persistent sidecar checkpoint (`.thunderload.part`). Pause flushes the checkpoint, Resume requests the remaining byte range when the server supports it, and startup recovers direct jobs that were in progress when the app closed.
+- Direct desktop transfers support Pause, Resume, Cancel and an aggregate speed cap shared across active direct, HLS and DASH transfers within each ThunderLoad process.
+- The same saved speed cap is applied to direct segmented/streaming, HLS and DASH segment transfers in the desktop and browser-native processes independently.
+- Queue entries and scheduled start times are stored in desktop local storage. On Windows, each scheduled job registers a one-time Task Scheduler wake task (`WakeToRun` / `StartWhenAvailable`) that launches ThunderLoad when due; it is cancelled when the job starts or is removed. The user must be logged in, and actual wake behavior depends on Windows power settings. Other platforms start scheduled entries while the app is running only.
+- Desktop HLS downloads support completed, unencrypted VOD playlists. HLS does not yet support Pause/Resume/Cancel, separate audio/video muxing, byte-range playlists or live playlists.
+- Browser-started direct and HLS transfers write local status files into `Downloads/ThunderLoad/.native-jobs`. The desktop queue polls these files to show browser job progress and completion. Desktop Pause/Cancel commands do not yet control native-host jobs.
+- The Rust engine retains a parallel byte-range downloader (up to 16 connections), but the checkpointed desktop transfer path currently uses one connection. Multi-connection checkpointing is not implemented.
 - On-demand scan of media URLs visible in the active tab. It starts only when the user opens the popup or uses its shortcut.
 - A compact, hover-only in-player Download control for supported video elements; no banners or automatic scans of every visited site.
-- HLS master-playlist quality discovery and unencrypted HLS segment download through the optional desktop native host.
-- DASH Representation quality detection only; DASH segment download/remux is not implemented.
+- HLS master-playlist quality discovery through the optional desktop native host.
+- Static DASH VOD downloads for MPDs using SegmentTemplate/SegmentTimeline, including inherited templates, BaseURL resolution and RepresentationID/Bandwidth/Number/Time substitutions.
+- Separate DASH audio/video AdaptationSets are downloaded and stream-copy muxed into MP4 using an externally installed FFmpeg executable. Set/verify its path in Settings → DASH video support; FFmpeg is not bundled.
+- Dynamic/live MPDs, DRM/ContentProtection, SegmentBase/SegmentList and multi-period DASH are intentionally not offered.
 - Minimal React + Tauri desktop workspace with Downloads, Queue, Video Grabber and Settings pages, plus a Windows NSIS installer configuration.
-- Native messaging is optional; ordinary direct downloads do not need the desktop app.
+- Native messaging is optional; ordinary direct browser downloads use the browser's own downloads API.
 
 ## Browser package matrix
 
@@ -50,20 +57,22 @@ Firefox release/beta requires Mozilla signing. Chrome Web Store and Edge Add-ons
 
 ## Optional native host
 
-Direct file links use the browser downloads API and do not need a companion connection. HLS inspection/download uses the local native host.
+Direct file links use the browser downloads API and do not need a companion connection. HLS and DASH inspection/download use the local native host. DASH qualities with separate audio/video tracks require FFmpeg; the desktop Settings path is persisted locally and read by the native companion on Windows.
 
 On Windows, install desktop ThunderLoad, install the browser extension, then open **Settings → Browser connection**. Choose Chrome, Edge, Brave or Firefox, paste the exact extension ID and select **Connect browser**. Restart the browser and grant Native messaging in the extension popup when prompted.
 
 The extension ID is required because the browser native-messaging allowlist must be restricted to the exact installed extension. Firefox's packaged ID is `thunderload@example.com`. Chromium IDs are shown on the browser's extensions developer page and contain 32 characters from `a` through `p`.
 
 ## Video limits
-HLS qualities are listed only when exposed by the site. Unencrypted HLS segments are supported; encrypted/DRM streams are not decrypted or bypassed. DASH qualities can be detected but DASH downloading/remux is future work. Blob/MSE-only, cookie-bound and signed URLs may not be exposed or may fail. Parallel connections cannot guarantee a fixed speed multiplier; results depend on server support and bandwidth.
+HLS qualities are listed only when exposed by the site. Completed unencrypted HLS VOD playlists can be downloaded; encrypted/DRM streams, byte-range playlists, live playlists and separate audio groups are not supported. Static DASH VOD with SegmentTemplate/SegmentTimeline can be downloaded. Separate audio/video tracks need an external FFmpeg executable for stream-copy muxing. Dynamic/live MPDs, ContentProtection/DRM, SegmentBase/SegmentList and multi-period MPDs are not supported. Blob/MSE-only, cookie-bound and signed URLs may not be exposed or may fail. Parallel connections cannot guarantee a fixed speed multiplier; results depend on server support and bandwidth.
 
 ## Production work still required
-- Persistent job database; reliable pause/resume checkpoints, cancellation and crash recovery.
-- DASH segment/template/list assembly and tested MP4 remuxing.
+- Durable transactional job database and multi-connection checkpoint resume.
+- HLS pause/resume/cancel, byte-range playlists, fMP4 and separate audio groups.
+- Broader DASH coverage for SegmentList, SegmentBase and multi-period MPDs; DRM remains unsupported by design.
 - Explicit, secure cookie/header handoff for user-authorized sessions.
-- Transfer cancellation, speed limiting and scheduled downloads; current queue concurrency and local settings are implemented in the desktop UI.
-- Desktop queue integration for extension-started jobs.
+- Validate Windows Task Scheduler wake tasks on clean Windows 10/11 VMs, including sleep/wake, missed start time, logged-out state, task cancellation and duplicate-instance races.
+- Unified pause/resume/cancel controls for HLS/DASH and browser-native jobs; direct desktop HTTP currently has checkpoint-safe controls.
+- Desktop queue control of extension-started native-host jobs; the desktop currently tracks their progress and completion.
 - Code signing, update strategy, uninstall cleanup, Windows VM testing and accessibility QA.
 - Current-version Firefox/Chromium testing, AMO/Chrome/Edge store review; separate Safari wrapper if Safari is advertised.

@@ -22,20 +22,30 @@
     return null;
   }
 
-  function sourceFor(video) {
-    const candidates = [
+  function candidateSources(video) {
+    const ownUrls = [
       video.currentSrc,
       video.src,
       ...Array.from(video.querySelectorAll("source")).map((node) => node.src)
     ];
-    for (const url of candidates) {
+    const ownSources = Array.from(new Map(ownUrls.map((url) => {
       const kind = classify(url);
-      if (kind) return { url, kind };
-    }
-    // MSE players may expose blob: as currentSrc while one HLS manifest
-    // remains visible in the page's resource list.
-    const hls = Array.from(found.values()).filter((item) => item.kind === "HLS playlist");
-    return hls.length === 1 ? { url: hls[0].url, kind: hls[0].kind } : null;
+      return kind ? [url, { url, kind }] : null;
+    }).filter(Boolean)).values());
+    if (ownSources.length) return ownSources;
+
+    // Media Source Extensions often expose a blob: URL on the video element.
+    // In that case offer discovered page media as explicit choices instead of
+    // guessing which manifest belongs to the player.
+    return Array.from(found.values())
+      .filter((item) => item.kind === "HLS playlist" || item.kind === "DASH manifest" || item.kind === "Direct media")
+      .sort((a, b) => b.discoveredAt - a.discoveredAt)
+      .slice(0, 8);
+  }
+
+  function sourceFor(video) {
+    const candidates = candidateSources(video);
+    return candidates.length === 1 ? candidates[0] : null;
   }
 
   function add(url, label) {
@@ -59,42 +69,39 @@
       'button svg{width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}',
       '.message{display:none;position:absolute;top:34px;right:0;max-width:210px;padding:6px 8px;border:1px solid rgba(205,220,238,.2);border-radius:5px;background:rgba(17,25,35,.94);color:#e4edf8;font:10px/1.35 system-ui,-apple-system,"Segoe UI",sans-serif;white-space:normal;box-shadow:0 2px 10px rgba(0,0,0,.2)}',
       '.message.show{display:block}',
+      '.choices{display:none;position:absolute;top:34px;right:0;min-width:190px;max-width:260px;max-height:190px;overflow:auto;padding:4px;border:1px solid rgba(205,220,238,.2);border-radius:6px;background:rgba(17,25,35,.97);box-shadow:0 3px 14px rgba(0,0,0,.28);pointer-events:auto}',
+      '.choices.show{display:grid;gap:3px}',
+      '.choice{display:block;width:100%;padding:7px 8px;border:0;border-radius:4px;background:transparent;color:#e4edf8;text-align:left;font:500 10px/1.35 system-ui,-apple-system,"Segoe UI",sans-serif;overflow-wrap:anywhere;cursor:pointer}',
+      '.choice:hover,.choice:focus-visible{background:rgba(87,125,168,.28);outline:none}',
+      'button:disabled{opacity:.55;cursor:wait}',
       '@media(prefers-reduced-motion:reduce){button{transition:none}}'
     ].join("\n");
     const wrap = document.createElement("div");
     wrap.className = "wrap";
     button = document.createElement("button");
     button.type = "button";
-    button.title = "Download with ThunderLoad";
-    button.setAttribute("aria-label", "Download with ThunderLoad");
-    button.innerHTML = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.5v8m-3-3 3 3 3-3M3 13.5h10"/></svg><span>Download</span>';
+    button.title = "Download this video with ThunderLoad";
+    button.setAttribute("aria-label", "Download this video with ThunderLoad");
+    button.innerHTML = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.5v8m-3-3 3 3 3-3M3 13.5h10"/></svg><span>Download this video</span>';
     status = document.createElement("div");
     status.className = "message";
-    button.addEventListener("click", async (event) => {
+    const choices = document.createElement("div");
+    choices.className = "choices";
+    button.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
       const target = activeVideo;
-      const source = target && sourceFor(target);
-      if (!source) { showStatus("This video does not expose a downloadable media URL."); return; }
-      button.disabled = true;
-      showStatus("Preparing download…");
-      try {
-        const result = await chrome.runtime.sendMessage({
-          type: "QUICK_DOWNLOAD_MEDIA",
-          url: source.url,
-          kind: source.kind,
-          pageUrl: location.href,
-          filename: target.getAttribute("data-filename") || ""
-        });
-        if (!result?.ok) throw new Error(result?.error || "Could not start the download.");
-        showStatus(result.message || "Download added.");
-      } catch (error) {
-        showStatus(error?.message || String(error));
-      } finally {
-        button.disabled = false;
+      if (!target) { showStatus("Move your pointer over a video first."); return; }
+      const candidates = candidateSources(target);
+      if (!candidates.length) {
+        showStatus("No downloadable media URL is exposed by this player. DRM or protected streams may not be accessible.");
+      } else if (candidates.length > 1) {
+        showChoices(candidates, target);
+      } else {
+        inspectForQualities(candidates[0], target);
       }
     });
-    wrap.append(button, status);
+    wrap.append(button, status, choices);
     overlayRoot.append(style, wrap);
     document.documentElement.append(buttonHost);
     overlayRoot.wrap = wrap;
@@ -104,16 +111,102 @@
 
   function showStatus(message) {
     if (!status) return;
+    const choices = overlayRoot?.querySelector(".choices");
+    choices?.classList.remove("show");
     status.textContent = message;
     status.classList.add("show");
     clearTimeout(showStatus.timer);
-    showStatus.timer = setTimeout(() => status?.classList.remove("show"), 3000);
+    showStatus.timer = setTimeout(() => status?.classList.remove("show"), 3500);
+  }
+
+  function showChoices(candidates, target) {
+    const choices = overlayRoot?.querySelector(".choices");
+    if (!choices) return;
+    status?.classList.remove("show");
+    choices.replaceChildren();
+    for (const source of candidates) {
+      const item = document.createElement("button");
+      item.type = "button";
+      item.className = "choice";
+      let detail = source.displayQuality || source.kind;
+      try {
+        const parsed = new URL(source.url);
+        if (!source.displayQuality) detail += " · " + parsed.hostname + parsed.pathname.slice(-34);
+      } catch (_) {}
+      item.textContent = detail;
+      item.title = source.url;
+      item.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (source.selectedVariant || source.displayQuality) startDownload(source, target);
+        else inspectForQualities(source, target);
+      });
+      choices.append(item);
+    }
+    choices.classList.add("show");
+  }
+
+  async function inspectForQualities(source, target) {
+    if (!source || !target) return;
+    if (source.kind === "Direct media") {
+      const height = target.videoHeight;
+      const width = target.videoWidth;
+      const label = width && height ? `Video quality: ${height}p (${width}×${height})` : "Direct video file";
+      showChoices([{ ...source, displayQuality: label }], target);
+      return;
+    }
+    showStatus("Checking available video qualities…");
+    try {
+      const result = await chrome.runtime.sendMessage({
+        type: "INSPECT_MEDIA",
+        url: source.url,
+        pageUrl: location.href
+      });
+      const variants = (result?.variants || []).filter((item) => item?.downloadable && item?.url);
+      if (!result?.ok || !variants.length) {
+        showStatus(result?.error || "No selectable quality was exposed. Trying the detected stream…");
+        startDownload(source, target);
+        return;
+      }
+      const options = variants.map((variant) => ({
+        ...source,
+        selectedVariant: variant,
+        displayQuality: variant.quality || (variant.height ? variant.height + "p" : variant.bandwidth ? Math.round(variant.bandwidth / 1000) + " kbps" : variant.kind.toUpperCase())
+      }));
+      showChoices(options, target);
+    } catch (error) {
+      showStatus(error?.message || "Could not inspect video qualities.");
+    }
+  }
+
+  async function startDownload(source, target) {
+    if (!source || !target || !button) return;
+    const choices = overlayRoot?.querySelector(".choices");
+    choices?.classList.remove("show");
+    button.disabled = true;
+    showStatus("Preparing download…");
+    try {
+      const result = await chrome.runtime.sendMessage({
+        type: "QUICK_DOWNLOAD_MEDIA",
+        url: source.url,
+        kind: source.kind,
+        selectedVariant: source.selectedVariant || null,
+        pageUrl: location.href,
+        filename: target.getAttribute("data-filename") || ""
+      });
+      if (!result?.ok) throw new Error(result?.error || "Could not start the download.");
+      showStatus(result.message || "Download added.");
+    } catch (error) {
+      showStatus(error?.message || String(error));
+    } finally {
+      button.disabled = false;
+    }
   }
 
   function positionOverlay(video) {
     if (!buttonHost || !overlayRoot?.wrap || !video?.isConnected) return;
     const rect = video.getBoundingClientRect();
-    if (rect.width < 180 || rect.height < 100 || rect.bottom < 0 || rect.top > innerHeight) {
+    if (rect.width < 64 || rect.height < 48 || rect.bottom < 0 || rect.top > innerHeight) {
       overlayRoot.wrap.style.display = "none";
       return;
     }
@@ -138,9 +231,8 @@
     video.dataset.thunderLoadAttached = "1";
     const show = () => {
       const source = sourceFor(video);
-      if (!source || source.kind === "DASH manifest") return;
+      if (source) add(source.url, "Video " + (index + 1));
       activeVideo = video;
-      add(source.url, "Video " + (index + 1));
       ensureOverlay();
       clearTimeout(hideTimer);
       positionOverlay(video);
@@ -212,12 +304,11 @@
       const hovered = activeVideo || Array.from(document.querySelectorAll("video")).find((video) => video.matches(":hover"));
       if (hovered && !activeVideo) {
         const source = sourceFor(hovered);
-        if (source && source.kind !== "DASH manifest") {
-          activeVideo = hovered;
-          ensureOverlay();
-          clearTimeout(hideTimer);
-          positionOverlay(hovered);
-        }
+        if (source) add(source.url, "Video");
+        activeVideo = hovered;
+        ensureOverlay();
+        clearTimeout(hideTimer);
+        positionOverlay(hovered);
       }
     });
     resourceObserver.observe({ type: "resource", buffered: true });

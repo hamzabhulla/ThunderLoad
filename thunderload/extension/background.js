@@ -71,7 +71,7 @@ function safeFilenameFromUrl(url, fallback = "download.bin") {
   } catch (_) { return fallback; }
 }
 
-async function quickDownloadMedia({ url, kind, pageUrl, filename }) {
+async function quickDownloadMedia({ url, kind, pageUrl, filename, selectedVariant }) {
   const name = filename || safeFilenameFromUrl(url, kind === "HLS playlist" ? "video.mp4" : "download.bin");
   const nativePermission = await hasNativePermission();
 
@@ -83,13 +83,17 @@ async function quickDownloadMedia({ url, kind, pageUrl, filename }) {
       const variants = Array.isArray(inspected.data?.variants) ? inspected.data.variants : [];
       const downloadable = variants.filter((item) => item?.downloadable && item?.url);
       downloadable.sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bandwidth || 0) - (a.bandwidth || 0));
-      const selected = downloadable[0];
+      const selected = selectedVariant && selectedVariant.downloadable && selectedVariant.url
+        ? selectedVariant
+        : downloadable[0];
       if (selected) {
-        const action = selected.kind === "hls" ? "video.download" : "download.start";
+        const action = selected.kind === "hls" ? "video.download" : selected.kind === "dash" ? "dash.download" : "download.start";
         const result = await requestNative(action, {
           url: selected.url,
-          filename: selected.kind === "hls" ? (name.replace(/\.[^.]+$/, "") + ".mp4") : name,
-          referer: pageUrl || ""
+          filename: selected.kind === "hls" || selected.kind === "dash" ? (name.replace(/\.[^.]+$/, "") + ".mp4") : name,
+          referer: pageUrl || "",
+          representationId: selected.representationId,
+          audioRepresentationId: selected.audioRepresentationId || ""
         });
         if (result?.ok) {
           return { ok: true, message: selected.quality && variants.length > 1
@@ -151,6 +155,14 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message?.type === "NATIVE_REQUEST") {
     requestNative(message.action, message.payload || {}).then(sendResponse);
+    return true;
+  }
+  if (message?.type === "INSPECT_MEDIA") {
+    requestNative("video.inspect", { url: message.url, referer: message.pageUrl || "" }).then((result) => {
+      sendResponse(result?.ok
+        ? { ok: true, variants: Array.isArray(result.data?.variants) ? result.data.variants : [] }
+        : { ok: false, error: result?.error || "The desktop engine could not inspect this stream." });
+    });
     return true;
   }
   if (message?.type === "QUICK_DOWNLOAD_MEDIA") {

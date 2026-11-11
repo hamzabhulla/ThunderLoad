@@ -49,16 +49,12 @@ function render() {
     info.append(el("div", "source-title", source.label || "Media source"), el("div", "kind", source.kind || "Media"));
     head.append(info);
     card.append(head);
-    if (source.kind === "DASH manifest") {
-      card.append(el("div", "quality-empty", "DASH detected · downloading is not available yet."));
-      sourceList.append(card);
-      continue;
-    }
+    
     const actions = el("div", "source-actions");
     const download = el("button", "primary", "Download");
     download.addEventListener("click", () => quickDownload(source, card, download));
     actions.append(download);
-    if (source.kind === "HLS playlist") {
+    if (source.kind === "HLS playlist" || source.kind === "DASH manifest") {
       const more = el("button", "secondary", "Other qualities");
       more.addEventListener("click", () => {
         const current = card.querySelector(".quality-list");
@@ -90,7 +86,7 @@ async function quickDownload(source, card, button) {
       variants.sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bandwidth || 0) - (a.bandwidth || 0));
       const selected = variants[0];
       if (!selected) throw new Error(inspected.data?.variants?.[0]?.note || "No downloadable quality is exposed.");
-      const action = selected.kind === "hls" ? "video.download" : "download.start";
+      const action = selected.kind === "hls" ? "video.download" : selected.kind === "dash" ? "dash.download" : "download.start";
       await startVariant(selected, source, action);
       return;
     }
@@ -118,7 +114,9 @@ async function startVariant(variant, source, action) {
   const result = await requestNative(action, {
     url: variant.url,
     referer: pageUrl,
-    filename: variant.kind === "hls" ? (filename.replace(/\.[^.]+$/, "") + ".mp4") : filename
+    filename: variant.kind === "hls" || variant.kind === "dash" ? (filename.replace(/\.[^.]+$/, "") + ".mp4") : filename,
+    representationId: variant.representationId,
+    audioRepresentationId: variant.audioRepresentationId || ""
   });
   if (!result?.ok) throw new Error(result?.error || "Could not start the selected quality.");
   showToast("Downloading " + (variant.quality || "media") + " in ThunderLoad.");
@@ -147,7 +145,7 @@ async function inspectSource(source, card, button) {
       download.addEventListener("click", async () => {
         download.disabled = true;
         try {
-          await startVariant(variant, source, variant.kind === "hls" ? "video.download" : "download.start");
+          await startVariant(variant, source, variant.kind === "hls" ? "video.download" : variant.kind === "dash" ? "dash.download" : "download.start");
         } catch (error) { showToast(error?.message || String(error)); }
         finally { download.disabled = false; }
       });

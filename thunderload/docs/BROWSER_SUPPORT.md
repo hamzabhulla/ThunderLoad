@@ -12,7 +12,7 @@ Firefox uses the separate Manifest V3 manifest (`manifest.firefox.json` becomes 
 Safari requires a WebExtension wrapped as a macOS app with Xcode tooling, followed by Apple signing/notarization and distribution. The macOS wrapper is not included in this source release. Do not advertise Safari as available until it is built and tested on macOS.
 
 ## Native messaging
-Native messaging is optional. Direct links use the browser's downloads manager without a companion app. Adaptive HLS inspection/download requires the ThunderLoad local native host.
+Native messaging is optional. Direct links use the browser's downloads manager without a companion app. Adaptive HLS and static DASH inspection/download require the ThunderLoad local native host. Static DASH with separate audio/video also requires FFmpeg; install FFmpeg and verify its executable path in desktop Settings → DASH video support. The native host reads the saved FFmpeg path and speed cap from the local desktop configuration and refreshes them while connected.
 
 On Windows, install the desktop app, then open **Settings → Browser connection**. Select Chrome, Edge, Brave or Firefox, enter the exact extension ID, and choose **Connect browser**. Restart that browser and grant Native messaging when the extension asks. Chromium IDs must be 32 characters in the range a–p. The Firefox add-on ID in this package is `thunderload@example.com`.
 
