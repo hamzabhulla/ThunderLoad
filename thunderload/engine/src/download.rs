@@ -114,6 +114,7 @@ pub async fn download_url(
     connections: usize,
     referer: Option<&str>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
+    rate_limiter: Arc<GlobalRateLimiter>,
 ) -> Result<PathBuf> {
     let target = next_available_path(target).await?;
     let result = async {
@@ -150,7 +151,7 @@ pub async fn download_url(
         }
 
         if supports_ranges && total.unwrap_or(0) >= 2 * 1024 * 1024 && connections > 1 {
-            match download_segmented(&client, url, &target, total.unwrap(), connections.min(16), referer, if_range.as_deref(), progress_tx.clone()).await {
+            match download_segmented(&client, url, &target, total.unwrap(), connections.min(16), referer, if_range.as_deref(), progress_tx.clone(), rate_limiter.clone()).await {
                 Ok(path) => return Ok(path),
                 Err(_) => {
                     // Some servers advertise byte ranges but return invalid ranges.
@@ -161,7 +162,7 @@ pub async fn download_url(
                 }
             }
         }
-        download_sequential(&client, url, &target, total, referer, progress_tx).await
+        download_sequential(&client, url, &target, total, referer, progress_tx, rate_limiter).await
     }.await;
 
     if result.is_err() {
@@ -183,6 +184,7 @@ async fn download_sequential(
     total: Option<u64>,
     referer: Option<&str>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
+    rate_limiter: Arc<GlobalRateLimiter>,
 ) -> Result<PathBuf> {
     prepare_parent(target).await?;
     let temp = target.with_extension(format!("{}{}.part", target.extension().and_then(|x| x.to_str()).unwrap_or("file"), Uuid::new_v4()));
@@ -200,6 +202,8 @@ async fn download_sequential(
             let chunk = chunk?;
             file.write_all(&chunk).await?;
             downloaded += chunk.len() as u64;
+            let wait = rate_limiter.reserve(chunk.len() as u64).await;
+            if !wait.is_zero() { tokio::time::sleep(wait).await; }
             let percent = actual_total.filter(|size| *size > 0)
                 .map(|size| downloaded as f64 * 100.0 / size as f64);
             if last_report.elapsed() >= std::time::Duration::from_millis(180) {
@@ -238,6 +242,7 @@ async fn download_segmented(
     referer: Option<&str>,
     if_range: Option<&str>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
+    rate_limiter: Arc<GlobalRateLimiter>,
 ) -> Result<PathBuf> {
     prepare_parent(target).await?;
     let work_dir = target.parent().unwrap().join(format!(".thunderload-{}", Uuid::new_v4()));
@@ -260,6 +265,7 @@ async fn download_segmented(
         let referrer = referer.map(str::to_string);
         let validator = if_range.map(str::to_string);
         let progress_tx = progress_tx.clone();
+        let rate_limiter = rate_limiter.clone();
         tasks.spawn(async move {
             let mut request = client.get(&url).header(header::RANGE, format!("bytes={start}-{end}"));
             if let Some(referrer) = referrer { request = request.header(header::REFERER, referrer); }
@@ -287,6 +293,8 @@ async fn download_segmented(
                 let chunk = chunk?;
                 file.write_all(&chunk).await?;
                 local_bytes += chunk.len() as u64;
+                let wait = rate_limiter.reserve(chunk.len() as u64).await;
+                if !wait.is_zero() { tokio::time::sleep(wait).await; }
                 let sum = received.fetch_add(chunk.len() as u64, Ordering::Relaxed) + chunk.len() as u64;
                 if let Ok(mut last) = last_report.lock() {
                     if last.elapsed() >= std::time::Duration::from_millis(180) || sum == total {
@@ -1171,7 +1179,8 @@ mod segmented_http_tests {
         assert_eq!(probe.if_range.as_deref(), Some("\"v1\""));
         let path = directory.join("payload.bin");
         let result = download_segmented(
-            &client, &url, &path, probe.total, 8, None, probe.if_range.as_deref(), progress_tx
+            &client, &url, &path, probe.total, 8, None, probe.if_range.as_deref(), progress_tx,
+            Arc::new(GlobalRateLimiter::new())
         ).await;
         shutdown.store(true, Ordering::Relaxed);
         server.join().unwrap();
