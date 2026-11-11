@@ -1133,10 +1133,14 @@ mod segmented_http_tests {
                     .and_then(|value| value.strip_prefix("bytes="))
                     .and_then(|value| value.split_once('-'))
                     .and_then(|(start, end)| Some((start.parse::<usize>().ok()?, end.parse::<usize>().ok()?)));
-                if let Some((start, end)) = bounds.filter(|(start, end)| *start <= *end && *end < BODY_SIZE)
-                    .filter(|_| validator.as_deref() == Some("\\"v1\\""))
-                {
-                    requests.fetch_add(1, Ordering::Relaxed);
+                if let Some((start, end)) = bounds.filter(|(start, end)| {
+                    *start <= *end && *end < BODY_SIZE
+                        && (validator.as_deref() == Some("\\\"v1\\\"")
+                            || (*start == 0 && *end == 0 && validator.is_none()))
+                }) {
+                    if validator.is_some() {
+                        requests.fetch_add(1, Ordering::Relaxed);
+                    }
                     let payload = &body[start..=end];
                     let headers = format!(
                         "HTTP/1.1 206 Partial Content\\r\\nContent-Length: {}\\r\\nContent-Range: bytes {start}-{end}/{BODY_SIZE}\\r\\nETag: \\"v1\\"\\r\\nConnection: close\\r\\n\\r\\n",
