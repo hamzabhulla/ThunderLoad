@@ -704,7 +704,7 @@ fn expand_dash_template(
             let width: usize = format_spec.parse().context("Invalid DASH Number format width")?;
             format!("{number:0width$}")
         } else {
-            return Err(anyhow!("Unsupported DASH template token $"+token+"$"));
+            return Err(anyhow!("Unsupported DASH template token ${token}$"));
         };
         output.push_str(&value);
         cursor = start + close + 2;
