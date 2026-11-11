@@ -562,10 +562,6 @@ struct ResumeMetadata {
     total: Option<u64>,
 }
 
-fn header_string(response: &reqwest::Response, name: header::HeaderName) -> Option<String> {
-    response.headers().get(name).and_then(|value| value.to_str().ok()).map(str::to_owned)
-}
-
 fn resume_identity_matches(
     saved: &ResumeMetadata,
     url: &str,
@@ -1078,7 +1074,7 @@ mod resume_metadata_tests {
 
 #[cfg(test)]
 mod segmented_http_tests {
-    use super::{client, download_segmented, probe_range_support, DownloadProgress};
+    use super::{client, download_segmented, probe_range_support, DownloadProgress, GlobalRateLimiter};
     use std::{
         io::{Read, Write},
         net::TcpListener,
