@@ -393,12 +393,12 @@ mod tests {
     }
     #[test]
     fn range_validator_rejects_a_changed_etag_or_last_modified() {
-        let mut headers = header::HeaderMap::new();
-        headers.insert(header::ETAG, header::HeaderValue::from_static("\"v1\""));
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::ETAG, reqwest::header::HeaderValue::from_static("\"v1\""));
         assert!(super::response_matches_validator(&headers, "\"v1\""));
         assert!(!super::response_matches_validator(&headers, "\"v2\""));
-        headers.remove(header::ETAG);
-        headers.insert(header::LAST_MODIFIED, header::HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"));
+        headers.remove(reqwest::header::ETAG);
+        headers.insert(reqwest::header::LAST_MODIFIED, reqwest::header::HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"));
         assert!(super::response_matches_validator(&headers, "Wed, 21 Oct 2015 07:28:00 GMT"));
         assert!(!super::response_matches_validator(&headers, "Thu, 22 Oct 2015 07:28:00 GMT"));
     }
