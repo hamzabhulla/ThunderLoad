@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::{path::{Path, PathBuf}, sync::{atomic::{AtomicUsize, Ordering}, Arc}};
+use std::{path::{Path, PathBuf}, sync::{atomic::{AtomicU64, AtomicUsize, Ordering}, Arc}};
 use tokio::{fs, io::AsyncWriteExt, process::Command as TokioCommand, sync::mpsc};
 use quick_xml::{events::Event, Reader};
 use futures_util::StreamExt;
@@ -1002,12 +1002,14 @@ pub async fn download_hls(
         all_urls.extend(segments);
         let total_segments = all_urls.len();
         let completed = Arc::new(AtomicUsize::new(0));
+        let downloaded_bytes = Arc::new(AtomicU64::new(0));
         let mut tasks = tokio::task::JoinSet::new();
         for (index, segment_url) in all_urls.into_iter().enumerate() {
             let client = client.clone();
             let referrer = referer.map(str::to_string);
             let path = work_dir.join(format!("segment-{index:06}"));
             let completed = completed.clone();
+            let downloaded_bytes = downloaded_bytes.clone();
             let tx = progress_tx.clone();
             tasks.spawn(async move {
                 let mut request = client.get(segment_url);
@@ -1017,7 +1019,8 @@ pub async fn download_hls(
                 while let Some(chunk) = response.chunk().await? { file.write_all(&chunk).await?; }
                 file.flush().await?;
                 let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                let _ = tx.send(DownloadProgress { downloaded: done as u64, total: Some(total_segments as u64),
+                let transferred = downloaded_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+                let _ = tx.send(DownloadProgress { downloaded: transferred, total: None,
                     percent: Some(done as f64 * 100.0 / total_segments as f64), phase: "video-segments".into() });
                 Ok::<PathBuf, anyhow::Error>(path)
             });
@@ -1040,7 +1043,7 @@ pub async fn download_hls(
         // empty reservation after every segment has been written successfully.
         fs::remove_file(&target).await?;
         fs::rename(&temp, &target).await?;
-        let _ = progress_tx.send(DownloadProgress { downloaded: total_segments as u64, total: Some(total_segments as u64),
+        let _ = progress_tx.send(DownloadProgress { downloaded: downloaded_bytes.load(Ordering::Relaxed), total: None,
             percent: Some(100.0), phase: "complete".into() });
         Ok::<PathBuf, anyhow::Error>(target.clone())
     }.await;
@@ -1075,6 +1078,7 @@ async fn download_dash_track(
     referer: Option<&str>,
     progress_tx: &mpsc::UnboundedSender<DownloadProgress>,
     completed: Arc<AtomicUsize>,
+    downloaded_bytes: Arc<AtomicU64>,
     total_segments: usize,
 ) -> Result<PathBuf> {
     let mut urls = Vec::with_capacity(track.segment_urls.len() + usize::from(track.initialization_url.is_some()));
@@ -1093,6 +1097,7 @@ async fn download_dash_track(
         let path = work_dir.join(format!("{prefix}-{index:06}.segment"));
         let tx = progress_tx.clone();
         let completed = completed.clone();
+        let downloaded_bytes = downloaded_bytes.clone();
         tasks.spawn(async move {
             let mut request = client.get(segment_url);
             if let Some(referrer) = referrer {
@@ -1110,9 +1115,10 @@ async fn download_dash_track(
             file.flush().await?;
             if bytes == 0 { return Err(anyhow!("DASH server returned an empty initialization/segment file")); }
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            let transferred = downloaded_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
             let _ = tx.send(DownloadProgress {
-                downloaded: done as u64,
-                total: Some(total_segments as u64),
+                downloaded: transferred,
+                total: None,
                 percent: Some(done as f64 * 100.0 / total_segments.max(1) as f64),
                 phase: "dash-segments".into(),
             });
@@ -1204,15 +1210,16 @@ pub async fn download_dash(
         fs::create_dir_all(&work_dir).await?;
         let client = client()?;
         let completed = Arc::new(AtomicUsize::new(0));
+        let downloaded_bytes = Arc::new(AtomicU64::new(0));
         let video_file = download_dash_track(
             &client, &video, &work_dir, "video", referer, &progress_tx,
-            completed.clone(), total_segments
+            completed.clone(), downloaded_bytes.clone(), total_segments
         ).await?;
 
         let output_file = if let Some(audio) = &audio {
             let audio_file = download_dash_track(
                 &client, audio, &work_dir, "audio", referer, &progress_tx,
-                completed.clone(), total_segments
+                completed.clone(), downloaded_bytes.clone(), total_segments
             ).await?;
             let muxed = work_dir.join("muxed.mp4");
             let executable = std::env::var_os("THUNDERLOAD_FFMPEG").unwrap_or_else(|| "ffmpeg".into());
@@ -1241,8 +1248,8 @@ pub async fn download_dash(
         fs::rename(&output_file, &target).await
             .with_context(|| format!("Could not move the assembled DASH file to {}", target.display()))?;
         let _ = progress_tx.send(DownloadProgress {
-            downloaded: total_segments as u64,
-            total: Some(total_segments as u64),
+            downloaded: downloaded_bytes.load(Ordering::Relaxed),
+            total: None,
             percent: Some(100.0),
             phase: "complete".into(),
         });
