@@ -1070,7 +1070,7 @@ mod resume_metadata_tests {
 
 #[cfg(test)]
 mod segmented_http_tests {
-    use super::{download_url, DownloadProgress};
+    use super::{client, download_segmented, probe_range_support, DownloadProgress};
     use std::{
         io::{Read, Write},
         net::TcpListener,
@@ -1165,11 +1165,19 @@ mod segmented_http_tests {
         let directory = std::env::temp_dir().join(format!("thunderload-segment-{}", uuid::Uuid::new_v4()));
         tokio::fs::create_dir_all(&directory).await.unwrap();
         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<DownloadProgress>();
-        let result = download_url(&url, &directory.join("payload.bin"), 8, None, progress_tx).await;
+        let client = client().unwrap();
+        let probe = probe_range_support(&client, &url, None).await.unwrap();
+        assert_eq!(probe.total, BODY_SIZE as u64);
+        assert_eq!(probe.if_range.as_deref(), Some("\"v1\""));
+        let path = directory.join("payload.bin");
+        let result = download_segmented(
+            &client, &url, &path, probe.total, 8, None, probe.if_range.as_deref(), progress_tx
+        ).await;
         shutdown.store(true, Ordering::Relaxed);
         server.join().unwrap();
-        let path = result.unwrap();
-        assert!(range_requests.load(Ordering::Relaxed) >= 2);
+        result.unwrap();
+        // One probe request plus eight independent chunk requests.
+        assert!(range_requests.load(Ordering::Relaxed) >= 9, "expected probe + 8 chunk Range requests; observed {}", range_requests.load(Ordering::Relaxed));
         let bytes = tokio::fs::read(&path).await.unwrap();
         let expected: Vec<u8> = (0..BODY_SIZE).map(|index| (index % 251) as u8).collect();
         assert_eq!(bytes, expected);
