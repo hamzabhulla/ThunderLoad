@@ -1,8 +1,8 @@
 use anyhow::{anyhow, Result};
-use std::sync::{Arc, OnceLock};
+use std::{collections::HashMap, sync::{Arc, Mutex, OnceLock}};
 use serde_json::{json, Value};
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::mpsc};
-use thunderload_engine::{default_download_dir, download_hls, download_url, inspect_video, safe_filename, GlobalRateLimiter};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::{mpsc, watch}};
+use thunderload_engine::{default_download_dir, download_hls, download_url, download_url_resumable, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, DownloadControl, DownloadOutcome, GlobalRateLimiter};
 
 const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 
@@ -80,6 +80,52 @@ fn apply_native_progress(state: &mut Value, progress: &thunderload_engine::Downl
 }
 
 static RATE_LIMITER: OnceLock<Arc<GlobalRateLimiter>> = OnceLock::new();
+static NATIVE_CONTROLS: OnceLock<Mutex<HashMap<String, watch::Sender<DownloadControl>>>> = OnceLock::new();
+
+fn native_controls() -> &'static Mutex<HashMap<String, watch::Sender<DownloadControl>>> {
+    NATIVE_CONTROLS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+async fn cleanup_native_partial(target: &std::path::Path) {
+    let _ = tokio::fs::remove_file(partial_download_path(target)).await;
+    let _ = tokio::fs::remove_file(partial_download_metadata_path(target)).await;
+    let _ = tokio::fs::remove_file(target).await;
+}
+
+fn start_native_job_control_watcher() {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
+        loop {
+            interval.tick().await;
+            let directory = default_download_dir().join(".native-jobs");
+            let Ok(mut entries) = tokio::fs::read_dir(&directory).await else { continue; };
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if entry.path().extension().and_then(|value| value.to_str()) != Some("control") {
+                    continue;
+                }
+                let Some(job_id) = entry.path().file_stem().and_then(|value| value.to_str()).map(str::to_owned) else {
+                    let _ = tokio::fs::remove_file(entry.path()).await;
+                    continue;
+                };
+                let action = tokio::fs::read_to_string(entry.path()).await.unwrap_or_default();
+                let _ = tokio::fs::remove_file(entry.path()).await;
+                let control = match action.trim() {
+                    "pause" => Some(DownloadControl::Paused),
+                    "resume" => Some(DownloadControl::Running),
+                    "cancel" => Some(DownloadControl::Cancelled),
+                    _ => None,
+                };
+                if let Some(control) = control {
+                    if let Ok(controls) = native_controls().lock() {
+                        if let Some(sender) = controls.get(&job_id) {
+                            let _ = sender.send(control);
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
 
 fn rate_limiter() -> Arc<GlobalRateLimiter> {
     RATE_LIMITER.get_or_init(|| Arc::new(GlobalRateLimiter::new())).clone()
@@ -150,6 +196,7 @@ fn start_desktop_settings_watcher(mut has_saved_ffmpeg: bool) {
 async fn main() -> Result<()> {
     let has_saved_ffmpeg = load_desktop_settings();
     start_desktop_settings_watcher(has_saved_ffmpeg);
+    start_native_job_control_watcher();
     let (incoming_tx, mut incoming_rx) = mpsc::unbounded_channel::<Value>();
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<Value>();
 
