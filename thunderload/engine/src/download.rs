@@ -1131,8 +1131,10 @@ mod segmented_http_tests {
         let directory = std::env::temp_dir().join(format!("thunderload-segment-{}", uuid::Uuid::new_v4()));
         tokio::fs::create_dir_all(&directory).await.unwrap();
         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<DownloadProgress>();
-        let path = download_url(&url, &directory.join("payload.bin"), 8, None, progress_tx)
-            .await.unwrap();
+        let result = download_url(&url, &directory.join("payload.bin"), 8, None, progress_tx).await;
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        let path = result.unwrap();
         assert!(range_requests.load(Ordering::Relaxed) >= 2);
         let bytes = tokio::fs::read(&path).await.unwrap();
         let expected: Vec<u8> = (0..BODY_SIZE).map(|index| (index % 251) as u8).collect();
@@ -1142,8 +1144,6 @@ mod segmented_http_tests {
             if progress.phase == "complete" && progress.percent == Some(100.0) { saw_complete = true; }
         }
         assert!(saw_complete);
-        shutdown.store(true, Ordering::Relaxed);
-        server.join().unwrap();
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 }
