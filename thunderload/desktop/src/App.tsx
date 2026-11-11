@@ -24,11 +24,13 @@ function readItems(): Item[] {
   try {
     const saved = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
     if (!Array.isArray(saved)) return [];
-    return saved.map((item: Item) => item.status === "Downloading" || item.status === "Pausing"
-      ? item.kind === "direct" && item.targetPath
-        ? { ...item, status: "Queued", detail: "Recovering saved partial download…" }
-        : { ...item, status: "Interrupted", detail: "App closed before a resumable checkpoint was created" }
-      : item);
+    return saved.map((item: Item) => item.source === "native"
+      ? item
+      : item.status === "Downloading" || item.status === "Pausing"
+        ? item.kind === "direct" && item.targetPath
+          ? { ...item, status: "Queued", detail: "Recovering saved partial download…" }
+          : { ...item, status: "Interrupted", detail: "App closed before a resumable checkpoint was created" }
+        : item);
   } catch { return []; }
 }
 function readSetting(key: string, fallback: number, allowed: number[]): number {
@@ -117,7 +119,7 @@ export default function App() {
           name: job.name || "Browser download",
           url: job.url || "",
           kind: job.kind === "hls" ? "hls" : job.kind === "dash" ? "dash" : "direct",
-          status: (["Downloading", "Completed", "Failed", "Interrupted"].includes(job.status || "") ? job.status : "Failed") as Status,
+          status: (["Downloading", "Paused", "Completed", "Failed", "Interrupted", "Cancelled"].includes(job.status || "") ? job.status : "Failed") as Status,
           percent: Math.max(0, Math.min(100, job.percent || 0)),
           downloaded: job.downloaded || 0,
           total: job.total ?? undefined,
@@ -198,7 +200,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
 
   useEffect(() => {
     const slots = Math.max(0, parallel - active);
-    const next = items.filter((item) => item.status === "Queued" && (!item.scheduledAt || item.scheduledAt <= clock)).slice(0, slots);
+    const next = items.filter((item) => item.source !== "native" && item.status === "Queued" && (!item.scheduledAt || item.scheduledAt <= clock)).slice(0, slots);
     if (!next.length) return;
     const ids = new Set(next.map((item) => item.id));
     setItems((current) => current.map((item) => ids.has(item.id) ? { ...item, status: "Downloading", detail: "Starting transfer…" } : item));
@@ -266,11 +268,38 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
   }
   async function pause(item: Item) {
     try {
-      await invoke("pause_download", { jobId: item.id });
-      setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, status: "Pausing", detail: "Pausing · saving checkpoint…" } : entry));
+      if (item.source === "native") {
+        await invoke("control_native_download", { jobId: item.id.replace(/^native-/, ""), action: "pause" });
+      } else {
+        await invoke("pause_download", { jobId: item.id });
+      }
+      setItems((current) => current.map((entry) => entry.id === item.id
+        ? { ...entry, status: "Pausing", detail: "Pausing · saving checkpoint…" }
+        : entry));
     } catch (error) { setNotice(String(error)); }
   }
-  function resume(item: Item) {
+  async function resume(item: Item) {
+    if (item.source === "native" && item.kind === "direct" && item.targetPath) {
+      if (item.status === "Interrupted") {
+        // The browser companion has exited. Hand its persistent checkpoint
+        // to the desktop engine so the user can still continue the download.
+        await invoke("dismiss_native_download", { jobId: item.id.replace(/^native-/, "") }).catch(() => {});
+        const recovered: Item = {
+          ...item, id: crypto.randomUUID(), source: undefined, status: "Queued",
+          detail: "Recovering browser checkpoint in desktop engine", error: undefined
+        };
+        setItems((current) => [recovered, ...current.filter((entry) => entry.id !== item.id)]);
+        setNotice("Browser checkpoint moved to the desktop queue.");
+        return;
+      }
+      try {
+        await invoke("control_native_download", { jobId: item.id.replace(/^native-/, ""), action: "resume" });
+        setItems((current) => current.map((entry) => entry.id === item.id
+          ? { ...entry, status: "Downloading", error: undefined, detail: "Resume requested · continuing saved checkpoint" }
+          : entry));
+      } catch (error) { setNotice(String(error)); }
+      return;
+    }
     if (item.kind !== "direct") { retry(item); return; }
     setItems((current) => current.map((entry) => entry.id === item.id
       ? { ...entry, status: "Queued", error: undefined, detail: "Resume queued from saved checkpoint" }
@@ -279,6 +308,24 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
   async function cancel(item: Item) {
     if (item.scheduledAt) {
       await invoke("cancel_app_wake", { jobId: item.id }).catch(() => {});
+    }
+    if (item.source === "native" && item.kind === "direct") {
+      try {
+        if (item.status === "Interrupted" && item.targetPath) {
+          // No native process owns this checkpoint anymore; delete it locally.
+          await invoke("cancel_download", { jobId: item.id, targetPath: item.targetPath });
+          await invoke("dismiss_native_download", { jobId: item.id.replace(/^native-/, "") }).catch(() => {});
+          setItems((current) => current.map((entry) => entry.id === item.id
+            ? { ...entry, status: "Cancelled", targetPath: undefined, downloaded: 0, percent: 0, detail: "Cancelled · checkpoint removed" }
+            : entry));
+        } else {
+          await invoke("control_native_download", { jobId: item.id.replace(/^native-/, ""), action: "cancel" });
+          setItems((current) => current.map((entry) => entry.id === item.id
+            ? { ...entry, status: "Cancelling", detail: "Cancelling browser download…" }
+            : entry));
+        }
+      } catch (error) { setNotice(String(error)); }
+      return;
     }
     if (item.kind !== "direct" || !item.targetPath) {
       setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, status: "Cancelled", detail: "Cancelled" } : entry));
@@ -296,7 +343,15 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     if (item?.scheduledAt) {
       await invoke("cancel_app_wake", { jobId: item.id }).catch(() => {});
     }
+    if (item?.source === "native" && item.kind === "direct"
+        && ["Downloading", "Pausing", "Paused", "Failed"].includes(item.status)) {
+      await cancel(item);
+      return;
+    }
     if (item?.source === "native") {
+      if (item.targetPath && item.status !== "Completed") {
+        await invoke("cancel_download", { jobId: item.id, targetPath: item.targetPath }).catch(() => {});
+      }
       await invoke("dismiss_native_download", { jobId: item.id.replace(/^native-/, "") }).catch(() => {});
     } else if (item?.targetPath && item.kind === "direct" && item.status !== "Completed") {
       await invoke("cancel_download", { jobId: item.id, targetPath: item.targetPath }).catch(() => {});
@@ -304,8 +359,12 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     setItems((current) => current.filter((entry) => entry.id !== id || entry.status === "Downloading" || entry.status === "Pausing"));
   }
   function retry(item: Item) {
+    if (item.source === "native" && item.kind === "direct" && item.targetPath) {
+      void resume(item);
+      return;
+    }
     if (item.source === "native") { add(item.url, item.name, item.kind, item.representationId, item.audioRepresentationId); return; }
-    if (item.kind === "direct" && item.targetPath) { resume(item); return; }
+    if (item.kind === "direct" && item.targetPath) { void resume(item); return; }
     add(item.url, item.name, item.kind, item.representationId, item.audioRepresentationId);
   }
   async function clearFinished() {
@@ -369,11 +428,11 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
         {item.error && <div className="error-text">{item.error}</div>}
       </div>
       <div className="transfer-actions">
-        {item.status === "Downloading" && item.kind === "direct" && item.source !== "native" && <button className="quiet-button transfer-control" onClick={() => void pause(item)}>Pause</button>}
+        {item.status === "Downloading" && item.kind === "direct" && <button className="quiet-button transfer-control" onClick={() => void pause(item)}>Pause</button>}
         {item.status === "Paused" && <button className="quiet-button transfer-control" onClick={() => resume(item)}>Resume</button>}
         {(item.status === "Failed" || item.status === "Interrupted") && <button className="quiet-button transfer-control" onClick={() => retry(item)}>{item.kind === "direct" && item.targetPath ? "Resume" : "Retry"}</button>}
-        {(item.status === "Downloading" || item.status === "Pausing" || item.status === "Paused" || item.status === "Failed" || item.status === "Interrupted" || item.status === "Queued") && item.kind === "direct" && item.source !== "native" && <button className="quiet-button transfer-control" onClick={() => void cancel(item)}>Cancel</button>}
-        {item.status !== "Downloading" && item.status !== "Pausing" && item.status !== "Cancelling" && (item.source !== "native" || item.status === "Completed" || item.status === "Failed" || item.status === "Interrupted") && <button className="remove-button" title="Remove" aria-label="Remove" onClick={() => void remove(item.id)}>×</button>}
+        {(item.status === "Downloading" || item.status === "Pausing" || item.status === "Paused" || item.status === "Failed" || item.status === "Interrupted" || item.status === "Queued") && item.kind === "direct" && <button className="quiet-button transfer-control" onClick={() => void cancel(item)}>Cancel</button>}
+        {item.status !== "Downloading" && item.status !== "Pausing" && item.status !== "Cancelling" && (item.source !== "native" || item.status === "Completed" || item.status === "Cancelled" || item.status === "Failed" || item.status === "Interrupted") && <button className="remove-button" title="Remove" aria-label="Remove" onClick={() => void remove(item.id)}>×</button>}
       </div>
     </article>)}</div>;
   }
