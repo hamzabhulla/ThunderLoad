@@ -460,13 +460,23 @@ async fn control_native_download(job_id: String, action: String) -> Result<(), S
 
 #[tauri::command]
 async fn dismiss_native_download(job_id: String) -> Result<(), String> {
-    let id = safe_filename(&job_id, "job");
-    let path = default_download_dir().join(".native-jobs").join(format!("{id}.json"));
-    match tokio::fs::remove_file(path).await {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.to_string()),
+    if job_id.is_empty() || job_id.len() > 64
+        || !job_id.chars().all(|character| character.is_ascii_alphanumeric() || character == '-') {
+        return Err("Invalid browser download identifier.".into());
     }
+    let directory = default_download_dir().join(".native-jobs");
+    for path in [
+        directory.join(format!("{job_id}.json")),
+        directory.join(format!("{job_id}.control")),
+        directory.join(format!("{job_id}.control.tmp")),
+    ] {
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => {},
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
