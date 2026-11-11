@@ -204,6 +204,9 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     setItems((current) => current.map((item) => ids.has(item.id) ? { ...item, status: "Downloading", detail: "Starting transfer…" } : item));
     next.forEach(async (item) => {
       try {
+        if (item.scheduledAt) {
+          void invoke("cancel_app_wake", { jobId: item.id }).catch(() => {});
+        }
         if (item.kind === "hls") {
           await invoke("start_hls_download", { jobId: item.id, url: item.url, filename: item.name });
         } else if (item.kind === "dash") {
@@ -236,19 +239,29 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
         else if (pathname.endsWith(".mpd")) kind = "dash";
       }
     } catch { setNotice("That URL is not valid."); return; }
+    const scheduledAt = scheduleAt ? new Date(scheduleAt).getTime() : undefined;
+    if (scheduledAt !== undefined && (!Number.isFinite(scheduledAt) || scheduledAt <= Date.now())) {
+      setNotice("Choose a future start time, or clear the schedule field.");
+      return;
+    }
     const suggested = nameFromUrl(clean);
     const item: Item = {
       id: crypto.randomUUID(), name: (saveAs || "").trim() || (kind === "hls" || kind === "dash" ? "video.mp4" : suggested),
       url: clean, kind, status: "Queued", percent: 0, downloaded: 0,
       representationId, audioRepresentationId,
-      detail: scheduleAt && new Date(scheduleAt).getTime() > Date.now()
-        ? "Scheduled for " + new Date(scheduleAt).toLocaleString()
-        : "Waiting in queue",
+      detail: scheduledAt ? "Scheduled for " + new Date(scheduledAt).toLocaleString() : "Waiting in queue",
       createdAt: Date.now(),
-      scheduledAt: scheduleAt ? new Date(scheduleAt).getTime() : undefined
+      scheduledAt
     };
-    setItems((current) => [item, ...current]);
-    setNotice("Added to queue.");
+    const updated = [item, ...items];
+    try { localStorage.setItem(HISTORY_KEY, JSON.stringify(updated)); } catch { /* Queue effect retries persistence. */ }
+    setItems(updated);
+    setNotice(scheduledAt ? "Added to queue. Registering Windows wake task…" : "Added to queue.");
+    if (scheduledAt) {
+      void invoke<string>("schedule_app_wake", { jobId: item.id, localDateTime: scheduleAt })
+        .then((status) => setNotice(status))
+        .catch((error) => setNotice("Queued locally, but Windows could not register a wake task: " + String(error)));
+    }
     setUrl(""); setFilename(""); setScheduleAt("");
   }
   async function pause(item: Item) {
@@ -264,6 +277,9 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       : entry));
   }
   async function cancel(item: Item) {
+    if (item.scheduledAt) {
+      await invoke("cancel_app_wake", { jobId: item.id }).catch(() => {});
+    }
     if (item.kind !== "direct" || !item.targetPath) {
       setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, status: "Cancelled", detail: "Cancelled" } : entry));
       return;
@@ -277,6 +293,9 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
   }
   async function remove(id: string) {
     const item = items.find((entry) => entry.id === id);
+    if (item?.scheduledAt) {
+      await invoke("cancel_app_wake", { jobId: item.id }).catch(() => {});
+    }
     if (item?.source === "native") {
       await invoke("dismiss_native_download", { jobId: item.id.replace(/^native-/, "") }).catch(() => {});
     } else if (item?.targetPath && item.kind === "direct" && item.status !== "Completed") {
@@ -291,6 +310,8 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
   }
   async function clearFinished() {
     const finished = items.filter((item) => item.status === "Completed" || item.status === "Cancelled");
+    await Promise.all(finished.filter((item) => item.scheduledAt)
+      .map((item) => invoke("cancel_app_wake", { jobId: item.id }).catch(() => {})));
     await Promise.all(finished.filter((item) => item.source === "native")
       .map((item) => invoke("dismiss_native_download", { jobId: item.id.replace(/^native-/, "") }).catch(() => {})));
     setItems((current) => current.filter((item) => item.status !== "Completed" && item.status !== "Cancelled"));
