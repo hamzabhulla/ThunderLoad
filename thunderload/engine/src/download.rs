@@ -51,6 +51,18 @@ fn validate_content_range(actual: &str, start: u64, end: u64, total: u64) -> Res
     Ok(())
 }
 
+fn response_matches_validator(headers: &header::HeaderMap, validator: &str) -> bool {
+    let name = if validator.trim_start().starts_with('"') {
+        header::ETAG
+    } else {
+        header::LAST_MODIFIED
+    };
+    headers.get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(|actual| actual == validator)
+        .unwrap_or(true)
+}
+
 fn parse_probe_content_range(value: &str) -> Option<u64> {
     value.strip_prefix("bytes 0-0/")?.parse::<u64>().ok().filter(|total| *total >= 1)
 }
@@ -253,6 +265,9 @@ async fn download_segmented(
             if let Some(referrer) = referrer { request = request.header(header::REFERER, referrer); }
             if let Some(validator) = validator { request = request.header(header::IF_RANGE, validator); }
             let response = request.send().await?;
+            if validator.as_deref().is_some_and(|expected| !response_matches_validator(response.headers(), expected)) {
+                return Err(anyhow!("The media resource changed during the segmented download"));
+            }
             if response.status() != StatusCode::PARTIAL_CONTENT {
                 return Err(anyhow!("Server did not honor byte range"));
             }
@@ -374,6 +389,18 @@ mod tests {
         assert!(validate_content_range("bytes 0-98/1000", 0, 99, 1000).is_err());
         assert!(validate_content_range("bytes 0-99/900", 0, 99, 1000).is_err());
     }
+    #[test]
+    fn range_validator_rejects_a_changed_etag_or_last_modified() {
+        let mut headers = header::HeaderMap::new();
+        headers.insert(header::ETAG, header::HeaderValue::from_static("\"v1\""));
+        assert!(super::response_matches_validator(&headers, "\"v1\""));
+        assert!(!super::response_matches_validator(&headers, "\"v2\""));
+        headers.remove(header::ETAG);
+        headers.insert(header::LAST_MODIFIED, header::HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"));
+        assert!(super::response_matches_validator(&headers, "Wed, 21 Oct 2015 07:28:00 GMT"));
+        assert!(!super::response_matches_validator(&headers, "Thu, 22 Oct 2015 07:28:00 GMT"));
+    }
+
 
     #[test]
     fn range_probe_parser_rejects_unknown_or_malformed_totals() {
