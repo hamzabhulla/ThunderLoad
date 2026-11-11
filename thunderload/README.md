@@ -5,6 +5,7 @@
 ## Current source features
 - Desktop direct HTTP/HTTPS transfers use a persistent sidecar checkpoint (`.thunderload.part`). Pause flushes the checkpoint, Resume requests the remaining byte range when the server supports it, and startup recovers direct jobs that were in progress when the app closed.
 - Direct desktop transfers support Pause, Resume, Cancel and an aggregate speed cap shared across active desktop direct downloads.
+- The same saved speed cap is applied to direct segmented/streaming, HLS and DASH segment transfers in the desktop and browser-native processes independently.
 - Queue entries and scheduled start times are stored in desktop local storage. Scheduled entries start at their local selected time while the desktop app is running; no Windows Task Scheduler/background wake-up is installed.
 - Desktop HLS downloads support completed, unencrypted VOD playlists. HLS does not yet support Pause/Resume/Cancel, separate audio/video muxing, byte-range playlists or live playlists.
 - Browser-started direct and HLS transfers write local status files into `Downloads/ThunderLoad/.native-jobs`. The desktop queue polls these files to show browser job progress and completion. Desktop Pause/Cancel commands do not yet control native-host jobs.
