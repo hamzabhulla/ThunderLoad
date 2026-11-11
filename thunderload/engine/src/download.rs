@@ -1135,7 +1135,7 @@ mod segmented_http_tests {
                     .and_then(|(start, end)| Some((start.parse::<usize>().ok()?, end.parse::<usize>().ok()?)));
                 if let Some((start, end)) = bounds.filter(|(start, end)| {
                     *start <= *end && *end < BODY_SIZE
-                        && (validator.as_deref() == Some("\\"v1\\"")
+                        && (validator.as_deref() == Some("\"v1\"") == Some("\\"v1\\"")
                             || (*start == 0 && *end == 0 && validator.is_none()))
                 }) {
                     if validator.is_some() {
