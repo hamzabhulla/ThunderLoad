@@ -80,9 +80,9 @@
     wrap.className = "wrap";
     button = document.createElement("button");
     button.type = "button";
-    button.title = "Download with ThunderLoad";
-    button.setAttribute("aria-label", "Download with ThunderLoad");
-    button.innerHTML = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.5v8m-3-3 3 3 3-3M3 13.5h10"/></svg><span>Download</span>';
+    button.title = "Download this video with ThunderLoad";
+    button.setAttribute("aria-label", "Download this video with ThunderLoad");
+    button.innerHTML = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.5v8m-3-3 3 3 3-3M3 13.5h10"/></svg><span>Download this video</span>';
     status = document.createElement("div");
     status.className = "message";
     const choices = document.createElement("div");
@@ -98,7 +98,7 @@
       } else if (candidates.length > 1) {
         showChoices(candidates, target);
       } else {
-        startDownload(candidates[0], target);
+        inspectForQualities(candidates[0], target);
       }
     });
     wrap.append(button, status, choices);
@@ -128,21 +128,54 @@
       const item = document.createElement("button");
       item.type = "button";
       item.className = "choice";
-      let detail = source.kind;
+      let detail = source.displayQuality || source.kind;
       try {
         const parsed = new URL(source.url);
-        detail += " · " + parsed.hostname + parsed.pathname.slice(-34);
+        if (!source.displayQuality) detail += " · " + parsed.hostname + parsed.pathname.slice(-34);
       } catch (_) {}
       item.textContent = detail;
       item.title = source.url;
       item.addEventListener("click", (event) => {
         event.preventDefault();
         event.stopPropagation();
-        startDownload(source, target);
+        inspectForQualities(source, target);
       });
       choices.append(item);
     }
     choices.classList.add("show");
+  }
+
+  async function inspectForQualities(source, target) {
+    if (!source || !target) return;
+    if (source.kind === "Direct media") {
+      const height = target.videoHeight;
+      const width = target.videoWidth;
+      const label = width && height ? `Video quality: ${height}p (${width}×${height})` : "Direct video file";
+      showChoices([{ ...source, displayQuality: label }], target);
+      return;
+    }
+    showStatus("Checking available video qualities…");
+    try {
+      const result = await chrome.runtime.sendMessage({
+        type: "INSPECT_MEDIA",
+        url: source.url,
+        pageUrl: location.href
+      });
+      const variants = (result?.variants || []).filter((item) => item?.downloadable && item?.url);
+      if (!result?.ok || !variants.length) {
+        showStatus(result?.error || "No selectable quality was exposed. Trying the detected stream…");
+        startDownload(source, target);
+        return;
+      }
+      const options = variants.map((variant) => ({
+        ...source,
+        selectedVariant: variant,
+        displayQuality: variant.quality || (variant.height ? variant.height + "p" : variant.bandwidth ? Math.round(variant.bandwidth / 1000) + " kbps" : variant.kind.toUpperCase())
+      }));
+      showChoices(options, target);
+    } catch (error) {
+      showStatus(error?.message || "Could not inspect video qualities.");
+    }
   }
 
   async function startDownload(source, target) {
@@ -156,6 +189,7 @@
         type: "QUICK_DOWNLOAD_MEDIA",
         url: source.url,
         kind: source.kind,
+        selectedVariant: source.selectedVariant || null,
         pageUrl: location.href,
         filename: target.getAttribute("data-filename") || ""
       });
