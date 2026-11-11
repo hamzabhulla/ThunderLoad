@@ -1085,6 +1085,7 @@ mod resume_metadata_tests {
 #[cfg(test)]
 mod segmented_http_tests {
     use super::{client, download_segmented, probe_range_support, DownloadProgress, GlobalRateLimiter};
+    use reqwest::Client;
     use std::{
         io::{Read, Write},
         net::TcpListener,
