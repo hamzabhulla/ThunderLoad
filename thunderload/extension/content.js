@@ -138,7 +138,8 @@
       item.addEventListener("click", (event) => {
         event.preventDefault();
         event.stopPropagation();
-        inspectForQualities(source, target);
+        if (source.selectedVariant || source.displayQuality) startDownload(source, target);
+        else inspectForQualities(source, target);
       });
       choices.append(item);
     }
