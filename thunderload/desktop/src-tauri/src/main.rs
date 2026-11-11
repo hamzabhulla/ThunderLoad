@@ -421,6 +421,42 @@ async fn get_native_downloads() -> Result<Vec<Value>, String> {
 }
 
 #[tauri::command]
+async fn control_native_download(job_id: String, action: String) -> Result<(), String> {
+    if job_id.is_empty() || job_id.len() > 64
+        || !job_id.chars().all(|character| character.is_ascii_alphanumeric() || character == '-') {
+        return Err("Invalid browser download identifier.".into());
+    }
+    if !["pause", "resume", "cancel"].contains(&action.as_str()) {
+        return Err("Unknown native download control action.".into());
+    }
+    let directory = default_download_dir().join(".native-jobs");
+    let job_path = directory.join(format!("{job_id}.json"));
+    let bytes = tokio::fs::read(&job_path).await
+        .map_err(|_| "The browser download record is no longer available.".to_string())?;
+    let job: Value = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    let status = job.get("status").and_then(Value::as_str).unwrap_or("");
+    let allowed = match action.as_str() {
+        "pause" => status == "Downloading",
+        "resume" => status == "Paused",
+        "cancel" => status == "Downloading" || status == "Paused",
+        _ => false,
+    };
+    if !allowed {
+        return Err(format!("Cannot {action} a browser download while it is {status}."));
+    }
+
+    tokio::fs::create_dir_all(&directory).await.map_err(|error| error.to_string())?;
+    let command_path = directory.join(format!("{job_id}.control"));
+    let temporary = directory.join(format!("{job_id}.control.tmp"));
+    tokio::fs::write(&temporary, action.as_bytes()).await.map_err(|error| error.to_string())?;
+    if tokio::fs::try_exists(&command_path).await.unwrap_or(false) {
+        tokio::fs::remove_file(&command_path).await.map_err(|error| error.to_string())?;
+    }
+    tokio::fs::rename(&temporary, &command_path).await.map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
 async fn dismiss_native_download(job_id: String) -> Result<(), String> {
     let id = safe_filename(&job_id, "job");
     let path = default_download_dir().join(".native-jobs").join(format!("{id}.json"));
@@ -458,7 +494,7 @@ fn main() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![inspect_video_url, start_download, pause_download, cancel_download, set_speed_limit, schedule_app_wake, cancel_app_wake, start_hls_download, start_dash_download, get_ffmpeg_path, set_ffmpeg_path, get_native_downloads, dismiss_native_download, register_native_host, open_download_folder])
+        .invoke_handler(tauri::generate_handler![inspect_video_url, start_download, pause_download, cancel_download, set_speed_limit, schedule_app_wake, cancel_app_wake, start_hls_download, start_dash_download, get_ffmpeg_path, set_ffmpeg_path, get_native_downloads, control_native_download, dismiss_native_download, register_native_host, open_download_folder])
         .run(tauri::generate_context!())
         .expect("error while running ThunderLoad desktop app");
 }
