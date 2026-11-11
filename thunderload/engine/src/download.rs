@@ -959,8 +959,9 @@ mod resumable_http_tests {
         let limiter = Arc::new(GlobalRateLimiter::new());
         let url = url.to_string();
         let target = target.to_path_buf();
+        let task_target = target.clone();
         let task = tokio::spawn(async move {
-            download_url_resumable(&url, &target, None, control_rx, limiter, progress_tx).await
+            download_url_resumable(&url, &task_target, None, control_rx, limiter, progress_tx).await
         });
         let part = partial_download_path(&target);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
@@ -1115,6 +1116,7 @@ mod segmented_http_tests {
                     Err(_) => break,
                 };
                 let request_body = body.clone();
+                let request_counter = requests.clone();
                 thread::spawn(move || {
                 let mut raw = Vec::new();
                 let mut buffer = [0_u8; 1024];
@@ -1146,7 +1148,7 @@ mod segmented_http_tests {
                 }
                 // Count each GET range request so the fixture can assert segmented requests reliably.
                 if method != "HEAD" && range.is_some() {
-                    requests.fetch_add(1, Ordering::Relaxed);
+                    request_counter.fetch_add(1, Ordering::Relaxed);
                 }
                 let bounds = range.as_deref()
                     .and_then(|value| value.strip_prefix("bytes="))
