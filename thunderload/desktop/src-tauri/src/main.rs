@@ -37,6 +37,15 @@ fn valid_scheduler_job_id(value: &str) -> bool {
         && value.chars().all(|character| character.is_ascii_alphanumeric() || character == '-')
 }
 
+fn valid_local_datetime_shape(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 16
+        && bytes[4] == b'-' && bytes[7] == b'-' && bytes[10] == b'T' && bytes[13] == b':'
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            [4, 7, 10, 13].contains(&index) || byte.is_ascii_digit()
+        })
+}
+
 fn powershell_literal(value: &str) -> String {
     value.replace('\'', "''")
 }
@@ -50,12 +59,7 @@ async fn schedule_app_wake(
     if !valid_scheduler_job_id(&job_id) {
         return Err("Invalid scheduled job identifier.".into());
     }
-    let bytes = local_date_time.as_bytes();
-    if bytes.len() != 16
-        || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' || bytes[13] != b':'
-        || !bytes.iter().enumerate().all(|(index, byte)| {
-            [4, 7, 10, 13].contains(&index) || byte.is_ascii_digit()
-        }) {
+    if !valid_local_datetime_shape(&local_date_time) {
         return Err("Scheduled time must use YYYY-MM-DDTHH:mm local time.".into());
     }
 
@@ -457,4 +461,33 @@ fn main() {
         .invoke_handler(tauri::generate_handler![inspect_video_url, start_download, pause_download, cancel_download, set_speed_limit, schedule_app_wake, cancel_app_wake, start_hls_download, start_dash_download, get_ffmpeg_path, set_ffmpeg_path, get_native_downloads, dismiss_native_download, register_native_host, open_download_folder])
         .run(tauri::generate_context!())
         .expect("error while running ThunderLoad desktop app");
+}
+
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::{powershell_literal, valid_local_datetime_shape, valid_scheduler_job_id};
+
+    #[test]
+    fn scheduler_job_ids_allow_only_short_safe_identifiers() {
+        assert!(valid_scheduler_job_id("9fa8dd1a-69a1-43d2-9fa4-10b4c2b0ad32"));
+        assert!(valid_scheduler_job_id("download-42"));
+        assert!(!valid_scheduler_job_id(""));
+        assert!(!valid_scheduler_job_id("name'; Start-Process calc; '"));
+        assert!(!valid_scheduler_job_id("../outside"));
+        assert!(!valid_scheduler_job_id("a".repeat(65).as_str()));
+    }
+
+    #[test]
+    fn schedule_datetime_requires_the_local_minute_format() {
+        assert!(valid_local_datetime_shape("2026-11-12T09:35"));
+        assert!(!valid_local_datetime_shape("2026/11/12 09:35"));
+        assert!(!valid_local_datetime_shape("2026-11-12T09:3"));
+        assert!(!valid_local_datetime_shape("2026-11-12T09:35Z"));
+    }
+
+    #[test]
+    fn powershell_literals_escape_single_quotes() {
+        assert_eq!(powershell_literal("C:\\Tools\\User's App\\ThunderLoad.exe"), "C:\\Tools\\User''s App\\ThunderLoad.exe");
+    }
 }
