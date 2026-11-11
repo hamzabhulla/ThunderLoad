@@ -399,12 +399,14 @@ async fn get_native_downloads() -> Result<Vec<Value>, String> {
             let updated = job.get("updatedAt").and_then(Value::as_u64).unwrap_or(0);
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default().as_millis() as u64;
-            // Native host refreshes its heartbeat every ten seconds. A stale
-            // "Downloading" entry therefore means the host process exited.
-            if status == "Downloading" && updated > 0 && now.saturating_sub(updated) > 45_000 {
+            // The companion refreshes active, paused and retryable jobs every
+            // ten seconds. A stale heartbeat means the native host has exited;
+            // direct jobs can then hand their checkpoint to the desktop engine.
+            if ["Downloading", "Paused", "Failed"].contains(&status)
+                && updated > 0 && now.saturating_sub(updated) > 45_000 {
                 job["status"] = json!("Interrupted");
-                job["detail"] = json!("Browser native host stopped. Retry this URL to start again.");
-                job["error"] = json!("The browser companion disconnected before completion.");
+                job["detail"] = json!("Browser companion disconnected. Resume can continue the saved direct-download checkpoint.");
+                job["error"] = json!("The native host stopped before this job finished.");
                 job["updatedAt"] = json!(now);
                 if let Ok(bytes) = serde_json::to_vec(&job) {
                     let temporary = entry.path().with_extension("json.tmp");
