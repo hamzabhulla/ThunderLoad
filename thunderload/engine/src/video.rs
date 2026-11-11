@@ -687,8 +687,11 @@ fn expand_dash_template(
             cursor = start + 2;
             continue;
         }
-        let Some(close) = template[start + 1..].find('
-        let token = &template[start + 1..close];
+        let remainder = &template[start + 1..];
+        let Some(close) = remainder.find('$') else {
+            return Err(anyhow!("Unclosed DASH template token"));
+        };
+        let token = &remainder[..close];
         let value = if token == "RepresentationID" {
             representation.id.clone()
         } else if token == "Bandwidth" {
@@ -701,10 +704,10 @@ fn expand_dash_template(
             let width: usize = format_spec.parse().context("Invalid DASH Number format width")?;
             format!("{number:0width$}")
         } else {
-            return Err(anyhow!("Unsupported DASH template token $" .to_string() + token + "$"));
+            return Err(anyhow!("Unsupported DASH template token $"+token+"$"));
         };
         output.push_str(&value);
-        cursor = close + 1;
+        cursor = start + close + 2;
     }
     output.push_str(&template[cursor..]);
     Ok(output)
