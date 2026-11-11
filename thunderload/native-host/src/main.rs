@@ -238,60 +238,171 @@ async fn main() -> Result<()> {
             "download.start" => {
                 let url = message.get("url").and_then(Value::as_str).unwrap_or("").to_string();
                 let filename = output_name(message.get("filename"), "download.bin");
-                let job_id = uuid::Uuid::new_v4().to_string();
-                let target = default_download_dir().join(&filename);
                 let referer = message.get("referer").and_then(Value::as_str).map(str::to_string);
+                if !(url.starts_with("http://") || url.starts_with("https://")) {
+                    let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": "Only HTTP and HTTPS download URLs are supported"}));
+                    continue;
+                }
+                let target = match reserve_download_path(&default_download_dir().join(&filename)).await {
+                    Ok(path) => path,
+                    Err(error) => {
+                        let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": error.to_string()}));
+                        continue;
+                    }
+                };
+                let job_id = uuid::Uuid::new_v4().to_string();
+                let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
+                if let Ok(mut controls) = native_controls().lock() {
+                    controls.insert(job_id.clone(), control_tx);
+                } else {
+                    cleanup_native_partial(&target).await;
+                    let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": "Native download control registry is unavailable"}));
+                    continue;
+                }
+
                 let tx = outgoing_tx.clone();
                 let mut state = native_job_state(&job_id, &filename, &url, "direct");
+                state["targetPath"] = json!(target.to_string_lossy().to_string());
                 let _ = save_native_job_state(&state).await;
                 let _ = outgoing_tx.send(json!({"id": id, "ok": true, "data": {"accepted": true, "jobId": job_id}}));
                 tokio::spawn(async move {
-                    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
-                    let tx_progress = tx.clone();
-                    let progress_job = job_id.clone();
-                    let progress_state = state.clone();
-                    let progress_handle = tokio::spawn(async move {
-                        let mut state = progress_state;
-                        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(10));
-                        loop {
-                            tokio::select! {
-                                _ = heartbeat.tick() => {
-                                    state["updatedAt"] = json!(timestamp_ms());
-                                    let _ = save_native_job_state(&state).await;
-                                }
-                                progress = progress_rx.recv() => match progress {
-                                    Some(progress) => {
-                                        apply_native_progress(&mut state, &progress);
-                                        let _ = save_native_job_state(&state).await;
-                                        let _ = tx_progress.send(json!({"event": "download.progress", "jobId": progress_job, "progress": progress}));
+                    'job: loop {
+                        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+                        let tx_progress = tx.clone();
+                        let progress_job = job_id.clone();
+                        let mut progress_state = load_native_job_state(&job_id, state.clone()).await;
+                        let progress_handle = tokio::spawn(async move {
+                            let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(10));
+                            loop {
+                                tokio::select! {
+                                    _ = heartbeat.tick() => {
+                                        progress_state["updatedAt"] = json!(timestamp_ms());
+                                        let _ = save_native_job_state(&progress_state).await;
                                     }
-                                    None => break,
+                                    progress = progress_rx.recv() => match progress {
+                                        Some(progress) => {
+                                            apply_native_progress(&mut progress_state, &progress);
+                                            let _ = save_native_job_state(&progress_state).await;
+                                            let _ = tx_progress.send(json!({"event": "download.progress", "jobId": progress_job, "progress": progress}));
+                                        }
+                                        None => break,
+                                    }
+                                }
+                            }
+                        });
+
+                        let result = download_url_resumable(
+                            &url, &target, referer.as_deref(), control_rx.clone(),
+                            rate_limiter(), progress_tx
+                        ).await;
+                        let _ = progress_handle.await;
+
+                        match result {
+                            Ok(DownloadOutcome::Completed) => {
+                                state = load_native_job_state(&job_id, state).await;
+                                state["status"] = json!("Completed");
+                                state["percent"] = json!(100);
+                                state["detail"] = json!("Download complete");
+                                state["targetPath"] = json!(target.to_string_lossy().to_string());
+                                state["updatedAt"] = json!(timestamp_ms());
+                                let _ = save_native_job_state(&state).await;
+                                let _ = tx.send(json!({"event": "download.complete", "jobId": job_id, "path": target.to_string_lossy()}));
+                                break 'job;
+                            }
+                            Ok(DownloadOutcome::Cancelled) => {
+                                state = load_native_job_state(&job_id, state).await;
+                                state["status"] = json!("Cancelled");
+                                state["detail"] = json!("Cancelled · partial file removed");
+                                state["targetPath"] = Value::Null;
+                                state["updatedAt"] = json!(timestamp_ms());
+                                let _ = save_native_job_state(&state).await;
+                                let _ = tx.send(json!({"event": "download.cancelled", "jobId": job_id}));
+                                break 'job;
+                            }
+                            Ok(DownloadOutcome::Paused) => {
+                                state = load_native_job_state(&job_id, state).await;
+                                state["status"] = json!("Paused");
+                                state["detail"] = json!("Paused · partial checkpoint saved");
+                                state["targetPath"] = json!(target.to_string_lossy().to_string());
+                                state["updatedAt"] = json!(timestamp_ms());
+                                let _ = save_native_job_state(&state).await;
+                                let _ = tx.send(json!({"event": "download.paused", "jobId": job_id}));
+                                loop {
+                                    match *control_rx.borrow() {
+                                        DownloadControl::Running => {
+                                            state["status"] = json!("Downloading");
+                                            state["detail"] = json!("Resuming saved checkpoint");
+                                            state["updatedAt"] = json!(timestamp_ms());
+                                            let _ = save_native_job_state(&state).await;
+                                            continue 'job;
+                                        }
+                                        DownloadControl::Cancelled => {
+                                            cleanup_native_partial(&target).await;
+                                            state["status"] = json!("Cancelled");
+                                            state["detail"] = json!("Cancelled · partial file removed");
+                                            state["targetPath"] = Value::Null;
+                                            state["updatedAt"] = json!(timestamp_ms());
+                                            let _ = save_native_job_state(&state).await;
+                                            let _ = tx.send(json!({"event": "download.cancelled", "jobId": job_id}));
+                                            break 'job;
+                                        }
+                                        DownloadControl::Paused => {}
+                                    }
+                                    if control_rx.changed().await.is_err() {
+                                        state["status"] = json!("Interrupted");
+                                        state["detail"] = json!("Browser companion disconnected; partial checkpoint kept");
+                                        state["updatedAt"] = json!(timestamp_ms());
+                                        let _ = save_native_job_state(&state).await;
+                                        break 'job;
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                state = load_native_job_state(&job_id, state).await;
+                                state["status"] = json!("Failed");
+                                state["error"] = json!(error.to_string());
+                                state["detail"] = json!("Transfer interrupted · partial checkpoint kept");
+                                state["targetPath"] = json!(target.to_string_lossy().to_string());
+                                state["updatedAt"] = json!(timestamp_ms());
+                                let _ = save_native_job_state(&state).await;
+                                let _ = tx.send(json!({"event": "download.error", "jobId": job_id, "error": error.to_string()}));
+                                // Retain the native control channel so the desktop
+                                // queue can ask this browser job to Resume its checkpoint.
+                                loop {
+                                    match *control_rx.borrow() {
+                                        DownloadControl::Running => {
+                                            state["status"] = json!("Downloading");
+                                            state["error"] = Value::Null;
+                                            state["detail"] = json!("Retrying from saved checkpoint");
+                                            state["updatedAt"] = json!(timestamp_ms());
+                                            let _ = save_native_job_state(&state).await;
+                                            continue 'job;
+                                        }
+                                        DownloadControl::Cancelled => {
+                                            cleanup_native_partial(&target).await;
+                                            state["status"] = json!("Cancelled");
+                                            state["detail"] = json!("Cancelled · partial file removed");
+                                            state["targetPath"] = Value::Null;
+                                            state["updatedAt"] = json!(timestamp_ms());
+                                            let _ = save_native_job_state(&state).await;
+                                            let _ = tx.send(json!({"event": "download.cancelled", "jobId": job_id}));
+                                            break 'job;
+                                        }
+                                        DownloadControl::Paused => {}
+                                    }
+                                    if control_rx.changed().await.is_err() {
+                                        state["status"] = json!("Interrupted");
+                                        state["detail"] = json!("Browser companion disconnected; partial checkpoint kept");
+                                        state["updatedAt"] = json!(timestamp_ms());
+                                        let _ = save_native_job_state(&state).await;
+                                        break 'job;
+                                    }
                                 }
                             }
                         }
-                    });
-                    let result = download_url(&url, &target, 8, referer.as_deref(), progress_tx, rate_limiter()).await;
-                    let _ = progress_handle.await;
-                    match result {
-                        Ok(path) => {
-                            state = load_native_job_state(&job_id, state).await;
-                            state["status"] = json!("Completed");
-                            state["percent"] = json!(100);
-                            state["detail"] = json!("Download complete");
-                            state["targetPath"] = json!(path.to_string_lossy().to_string());
-                            state["updatedAt"] = json!(timestamp_ms());
-                            let _ = save_native_job_state(&state).await;
-                            let _ = tx.send(json!({"event": "download.complete", "jobId": job_id, "path": path.to_string_lossy()}));
-                        }
-                        Err(error) => {
-                            state = load_native_job_state(&job_id, state).await;
-                            state["status"] = json!("Failed");
-                            state["error"] = json!(error.to_string());
-                            state["detail"] = json!("Download failed");
-                            state["updatedAt"] = json!(timestamp_ms());
-                            let _ = save_native_job_state(&state).await;
-                            let _ = tx.send(json!({"event": "download.error", "jobId": job_id, "error": error.to_string()}));
-                        }
+                    }
+                    if let Ok(mut controls) = native_controls().lock() {
+                        controls.remove(&job_id);
                     }
                 });
             }
