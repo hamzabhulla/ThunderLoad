@@ -32,6 +32,102 @@ async fn set_speed_limit(bytes_per_second: u64, app: tauri::AppHandle) -> Result
     Ok(())
 }
 
+fn valid_scheduler_job_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 64
+        && value.chars().all(|character| character.is_ascii_alphanumeric() || character == '-')
+}
+
+fn powershell_literal(value: &str) -> String {
+    value.replace(''', "''")
+}
+
+#[tauri::command]
+async fn schedule_app_wake(
+    job_id: String,
+    local_date_time: String,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    if !valid_scheduler_job_id(&job_id) {
+        return Err("Invalid scheduled job identifier.".into());
+    }
+    let bytes = local_date_time.as_bytes();
+    if bytes.len() != 16
+        || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' || bytes[13] != b':'
+        || !bytes.iter().enumerate().all(|(index, byte)| {
+            [4, 7, 10, 13].contains(&index) || byte.is_ascii_digit()
+        }) {
+        return Err("Scheduled time must use YYYY-MM-DDTHH:mm local time.".into());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+        let executable = powershell_literal(&executable.to_string_lossy());
+        let task_name = format!("ThunderLoad-{job_id}");
+        let script_dir = app.path().app_config_dir().map_err(|error| error.to_string())?.join("scheduled");
+        tokio::fs::create_dir_all(&script_dir).await.map_err(|error| error.to_string())?;
+        let script_path = script_dir.join(format!("wake-{job_id}.ps1"));
+        let script = format!(
+            "$exe = '{executable}'\nif (-not (Get-Process -Name 'ThunderLoad' -ErrorAction SilentlyContinue)) {{ Start-Process -FilePath $exe }}\n"
+        );
+        tokio::fs::write(&script_path, script).await.map_err(|error| error.to_string())?;
+
+        let task_name_ps = powershell_literal(&task_name);
+        let script_path_ps = powershell_literal(&script_path.to_string_lossy());
+        let datetime_ps = powershell_literal(&local_date_time);
+        let command = format!(
+            "$when = [datetime]::ParseExact('{datetime_ps}', 'yyyy-MM-ddTHH:mm', [Globalization.CultureInfo]::InvariantCulture);              if ($when -le (Get-Date)) {{ throw 'The scheduled time must be in the future.' }};              $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File \"{script_path_ps}\"';              $trigger = New-ScheduledTaskTrigger -Once -At $when;              $settings = New-ScheduledTaskSettingsSet -WakeToRun -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries;              $principal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited;              Register-ScheduledTask -TaskName '{task_name_ps}' -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null"
+        );
+        let result = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &command])
+            .output()
+            .map_err(|error| format!("Could not start Windows Task Scheduler: {error}"))?;
+        if !result.status.success() {
+            let _ = tokio::fs::remove_file(&script_path).await;
+            let stderr = String::from_utf8_lossy(&result.stderr).trim().to_string();
+            return Err(if stderr.is_empty() {
+                "Windows Task Scheduler refused the wake task.".into()
+            } else {
+                format!("Windows Task Scheduler: {stderr}")
+            });
+        }
+        Ok(format!("Windows wake task registered for {local_date_time}. Wake from sleep depends on your Windows power settings."))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (local_date_time, app);
+        Err("OS-level scheduled launch is currently supported on Windows only.".into())
+    }
+}
+
+#[tauri::command]
+async fn cancel_app_wake(job_id: String, app: tauri::AppHandle) -> Result<(), String> {
+    if !valid_scheduler_job_id(&job_id) {
+        return Err("Invalid scheduled job identifier.".into());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let task_name = powershell_literal(&format!("ThunderLoad-{job_id}"));
+        let command = format!("Unregister-ScheduledTask -TaskName '{task_name}' -Confirm:$false -ErrorAction SilentlyContinue");
+        let result = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &command])
+            .output()
+            .map_err(|error| format!("Could not update Windows Task Scheduler: {error}"))?;
+        if !result.status.success() {
+            return Err(String::from_utf8_lossy(&result.stderr).trim().to_string());
+        }
+        if let Ok(config_dir) = app.path().app_config_dir() {
+            let _ = tokio::fs::remove_file(config_dir.join("scheduled").join(format!("wake-{job_id}.ps1"))).await;
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app;
+        Err("OS-level scheduled launch is currently supported on Windows only.".into())
+    }
+}
+
 #[tauri::command]
 async fn pause_download(job_id: String) -> Result<(), String> {
     let controls = job_controls().lock().map_err(|_| "Download control lock is unavailable")?;
@@ -358,7 +454,7 @@ fn main() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![inspect_video_url, start_download, pause_download, cancel_download, set_speed_limit, start_hls_download, start_dash_download, get_ffmpeg_path, set_ffmpeg_path, get_native_downloads, dismiss_native_download, register_native_host, open_download_folder])
+        .invoke_handler(tauri::generate_handler![inspect_video_url, start_download, pause_download, cancel_download, set_speed_limit, schedule_app_wake, cancel_app_wake, start_hls_download, start_dash_download, get_ffmpeg_path, set_ffmpeg_path, get_native_downloads, dismiss_native_download, register_native_host, open_download_folder])
         .run(tauri::generate_context!())
         .expect("error while running ThunderLoad desktop app");
 }
