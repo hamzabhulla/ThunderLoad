@@ -263,7 +263,9 @@ async fn download_segmented(
         tasks.spawn(async move {
             let mut request = client.get(&url).header(header::RANGE, format!("bytes={start}-{end}"));
             if let Some(referrer) = referrer { request = request.header(header::REFERER, referrer); }
-            if let Some(validator) = validator { request = request.header(header::IF_RANGE, validator); }
+            if let Some(validator_value) = validator.as_deref() {
+                request = request.header(header::IF_RANGE, validator_value);
+            }
             let response = request.send().await?;
             if validator.as_deref().is_some_and(|expected| !response_matches_validator(response.headers(), expected)) {
                 return Err(anyhow!("The media resource changed during the segmented download"));
