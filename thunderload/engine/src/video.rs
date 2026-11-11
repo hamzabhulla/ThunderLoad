@@ -1016,7 +1016,11 @@ pub async fn download_hls(
                 if let Some(referrer) = referrer { request = request.header(reqwest::header::REFERER, referrer); }
                 let mut response = request.send().await?.error_for_status()?;
                 let mut file = fs::File::create(&path).await?;
-                while let Some(chunk) = response.chunk().await? { file.write_all(&chunk).await?; }
+                let mut bytes = 0_u64;
+                while let Some(chunk) = response.chunk().await? {
+                    bytes = bytes.saturating_add(chunk.len() as u64);
+                    file.write_all(&chunk).await?;
+                }
                 file.flush().await?;
                 let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                 let transferred = downloaded_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
