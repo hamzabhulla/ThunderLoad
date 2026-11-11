@@ -442,13 +442,13 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       <div className="brand"><div className="brand-mark">↯</div><div><strong>ThunderLoad</strong><small>DOWNLOAD MANAGER</small></div></div>
       <div className="nav-caption">WORKSPACE</div>
       <nav>
-        <button className={"nav-item " + (page === "downloads" ? "selected" : "")} onClick={() => setPage("downloads")}><span>↓</span>Downloads</button>
-        <button className={"nav-item " + (page === "queue" ? "selected" : "")} onClick={() => setPage("queue")}><span>≡</span>Queue{queued > 0 && <em>{queued}</em>}</button>
-        <button className={"nav-item " + (page === "video" ? "selected" : "")} onClick={() => setPage("video")}><span>▷</span>Video grabber</button>
+        <button title="Downloads" aria-label="Downloads" className={"nav-item " + (page === "downloads" ? "selected" : "")} onClick={() => setPage("downloads")}><span>↓</span>Downloads</button>
+        <button title="Queue" aria-label="Queue" className={"nav-item " + (page === "queue" ? "selected" : "")} onClick={() => setPage("queue")}><span>≡</span>Queue{queued > 0 && <em>{queued}</em>}</button>
+        <button title="Video grabber" aria-label="Video grabber" className={"nav-item " + (page === "video" ? "selected" : "")} onClick={() => setPage("video")}><span>▷</span>Video grabber</button>
       </nav>
       <div className="sidebar-bottom">
         <div className="engine-line"><i />Local engine</div>
-        <button className={"nav-item " + (page === "settings" ? "selected" : "")} onClick={() => setPage("settings")}><span>⚙</span>Settings</button>
+        <button title="Settings" aria-label="Settings" className={"nav-item " + (page === "settings" ? "selected" : "")} onClick={() => setPage("settings")}><span>⚙</span>Settings</button>
         <div className="version">ThunderLoad · 0.2.0</div>
       </div>
     </aside>
