@@ -85,14 +85,18 @@ fn rate_limiter() -> Arc<GlobalRateLimiter> {
     RATE_LIMITER.get_or_init(|| Arc::new(GlobalRateLimiter::new())).clone()
 }
 
-fn load_desktop_settings() {
+fn load_desktop_settings() -> bool {
+    let mut has_saved_ffmpeg = false;
     #[cfg(target_os = "windows")]
     {
         if let Some(app_data) = std::env::var_os("APPDATA") {
             let config_dir = std::path::PathBuf::from(app_data).join("com.thunderload.desktop");
             if let Ok(value) = std::fs::read_to_string(config_dir.join("ffmpeg.path")) {
                 let value = value.trim();
-                if !value.is_empty() { std::env::set_var("THUNDERLOAD_FFMPEG", value); }
+                if !value.is_empty() {
+                    std::env::set_var("THUNDERLOAD_FFMPEG", value);
+                    has_saved_ffmpeg = true;
+                }
             }
             if let Ok(value) = std::fs::read_to_string(config_dir.join("speed-limit.bytes")) {
                 if let Ok(limit) = value.trim().parse::<u64>() {
@@ -101,9 +105,10 @@ fn load_desktop_settings() {
             }
         }
     }
+    has_saved_ffmpeg
 }
 
-fn start_desktop_settings_watcher() {
+fn start_desktop_settings_watcher(mut has_saved_ffmpeg: bool) {
     #[cfg(target_os = "windows")]
     {
         let limiter = rate_limiter();
@@ -118,23 +123,33 @@ fn start_desktop_settings_watcher() {
                         limiter.set_limit(limit);
                     }
                 }
-                if let Ok(value) = std::fs::read_to_string(config_dir.join("ffmpeg.path")) {
-                    let value = value.trim();
-                    if !value.is_empty() {
-                        std::env::set_var("THUNDERLOAD_FFMPEG", value);
-                    } else {
-                        std::env::remove_var("THUNDERLOAD_FFMPEG");
+                match std::fs::read_to_string(config_dir.join("ffmpeg.path")) {
+                    Ok(value) if !value.trim().is_empty() => {
+                        std::env::set_var("THUNDERLOAD_FFMPEG", value.trim());
+                        has_saved_ffmpeg = true;
                     }
+                    Ok(_) => {
+                        std::env::remove_var("THUNDERLOAD_FFMPEG");
+                        has_saved_ffmpeg = false;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound && has_saved_ffmpeg => {
+                        // The user cleared the saved setting while this companion was running.
+                        std::env::remove_var("THUNDERLOAD_FFMPEG");
+                        has_saved_ffmpeg = false;
+                    }
+                    Err(_) => {}
                 }
             }
         });
     }
+    #[cfg(not(target_os = "windows"))]
+    let _ = has_saved_ffmpeg;
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    load_desktop_settings();
-    start_desktop_settings_watcher();
+    let has_saved_ffmpeg = load_desktop_settings();
+    start_desktop_settings_watcher(has_saved_ffmpeg);
     let (incoming_tx, mut incoming_rx) = mpsc::unbounded_channel::<Value>();
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<Value>();
 
