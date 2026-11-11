@@ -1108,7 +1108,7 @@ mod segmented_http_tests {
                         Ok(0) | Err(_) => break,
                         Ok(count) => {
                             raw.extend_from_slice(&buffer[..count]);
-                            if raw.windows(4).any(|window| window == b"\\r\\n\\r\\n") { break; }
+                            if raw.windows(4).any(|window| window == b"\r\n\r\n") { break; }
                         }
                     }
                 }
@@ -1124,7 +1124,7 @@ mod segmented_http_tests {
                 });
                 if method == "HEAD" {
                     let headers = format!(
-                        "HTTP/1.1 200 OK\\r\\nContent-Length: {BODY_SIZE}\\r\\nETag: \\"v1\\"\\r\\nConnection: close\\r\\n\\r\\n"
+                        "HTTP/1.1 200 OK\r\nContent-Length: {BODY_SIZE}\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n"
                     );
                     let _ = stream.write_all(headers.as_bytes());
                     continue;
@@ -1135,7 +1135,7 @@ mod segmented_http_tests {
                     .and_then(|(start, end)| Some((start.parse::<usize>().ok()?, end.parse::<usize>().ok()?)));
                 if let Some((start, end)) = bounds.filter(|(start, end)| {
                     *start <= *end && *end < BODY_SIZE
-                        && (validator.as_deref() == Some("\\\"v1\\\"")
+                        && (validator.as_deref() == Some("\\"v1\\"")
                             || (*start == 0 && *end == 0 && validator.is_none()))
                 }) {
                     if validator.is_some() {
@@ -1143,13 +1143,13 @@ mod segmented_http_tests {
                     }
                     let payload = &body[start..=end];
                     let headers = format!(
-                        "HTTP/1.1 206 Partial Content\\r\\nContent-Length: {}\\r\\nContent-Range: bytes {start}-{end}/{BODY_SIZE}\\r\\nETag: \\"v1\\"\\r\\nConnection: close\\r\\n\\r\\n",
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{BODY_SIZE}\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n",
                         payload.len()
                     );
                     if stream.write_all(headers.as_bytes()).is_ok() { let _ = stream.write_all(payload); }
                 } else {
                     let headers = format!(
-                        "HTTP/1.1 200 OK\\r\\nContent-Length: {BODY_SIZE}\\r\\nETag: \\"v1\\"\\r\\nConnection: close\\r\\n\\r\\n"
+                        "HTTP/1.1 200 OK\r\nContent-Length: {BODY_SIZE}\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n"
                     );
                     if stream.write_all(headers.as_bytes()).is_ok() { let _ = stream.write_all(&body); }
                 }
