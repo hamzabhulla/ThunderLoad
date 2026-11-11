@@ -51,6 +51,25 @@ fn validate_content_range(actual: &str, start: u64, end: u64, total: u64) -> Res
     Ok(())
 }
 
+/// Some servers support byte ranges but omit Accept-Ranges on HEAD. Probe a
+/// single byte before falling back to one connection; only trust a strict 206.
+async fn probe_range_support(client: &Client, url: &str, referer: Option<&str>) -> Option<u64> {
+    let mut request = client.get(url).header(header::RANGE, "bytes=0-0");
+    if let Some(referrer) = referer {
+        request = request.header(header::REFERER, referrer);
+    }
+    let response = request.send().await.ok()?;
+    if response.status() != StatusCode::PARTIAL_CONTENT {
+        return None;
+    }
+    let content_range = response.headers().get(header::CONTENT_RANGE)?.to_str().ok()?;
+    let total = content_range.strip_prefix("bytes 0-0/")?.parse::<u64>().ok()?;
+    if total < 1 || response.content_length().is_some_and(|length| length != 1) {
+        return None;
+    }
+    Some(total)
+}
+
 fn client() -> Result<Client> {
     Ok(Client::builder()
         .user_agent("ThunderLoad/0.1 (download manager)")
@@ -73,14 +92,23 @@ pub async fn download_url(
         let mut head_request = client.head(url);
         if let Some(referrer) = referer { head_request = head_request.header(header::REFERER, referrer); }
         let head = head_request.send().await.ok();
-        let total = head.as_ref().filter(|response| response.status().is_success())
+        let mut total = head.as_ref().filter(|response| response.status().is_success())
             .and_then(|response| response.content_length());
-        let supports_ranges = head.as_ref().filter(|response| response.status().is_success()).map(|response| {
+        let mut supports_ranges = head.as_ref().filter(|response| response.status().is_success()).map(|response| {
             response.headers().get(header::ACCEPT_RANGES)
                 .and_then(|value| value.to_str().ok())
                 .map(|value| value.eq_ignore_ascii_case("bytes"))
                 .unwrap_or(false)
         }).unwrap_or(false);
+
+        // Probe when HEAD omits Accept-Ranges (common on CDN/object-storage
+        // endpoints). A valid one-byte 206 is stronger evidence than the hint.
+        if connections > 1 && !supports_ranges {
+            if let Some(probed_total) = probe_range_support(&client, url, referer).await {
+                total = Some(probed_total);
+                supports_ranges = true;
+            }
+        }
 
         if supports_ranges && total.unwrap_or(0) >= 2 * 1024 * 1024 && connections > 1 {
             match download_segmented(&client, url, &target, total.unwrap(), connections.min(16), referer, progress_tx.clone()).await {
@@ -304,6 +332,17 @@ mod tests {
         assert!(validate_content_range("bytes 0-99/1000", 0, 99, 1000).is_ok());
         assert!(validate_content_range("bytes 0-98/1000", 0, 99, 1000).is_err());
         assert!(validate_content_range("bytes 0-99/900", 0, 99, 1000).is_err());
+    }
+
+    #[test]
+    fn one_byte_probe_requires_a_concrete_resource_length() {
+        fn parse_probe(value: &str) -> Option<u64> {
+            value.strip_prefix("bytes 0-0/")?.parse::<u64>().ok().filter(|total| *total >= 1)
+        }
+        assert_eq!(parse_probe("bytes 0-0/4096"), Some(4096));
+        assert_eq!(parse_probe("bytes 0-0/*"), None);
+        assert_eq!(parse_probe("bytes 1-1/4096"), None);
+        assert_eq!(parse_probe("bytes 0-0/0"), None);
     }
 
     #[tokio::test]
