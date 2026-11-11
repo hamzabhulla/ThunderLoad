@@ -4,9 +4,9 @@
 
 ## Current source features
 - Desktop direct HTTP/HTTPS transfers use a persistent sidecar checkpoint (`.thunderload.part`). Pause flushes the checkpoint, Resume requests the remaining byte range when the server supports it, and startup recovers direct jobs that were in progress when the app closed.
-- Direct desktop transfers support Pause, Resume, Cancel and an aggregate speed cap shared across active desktop direct downloads.
+- Direct desktop transfers support Pause, Resume, Cancel and an aggregate speed cap shared across active direct, HLS and DASH transfers within each ThunderLoad process.
 - The same saved speed cap is applied to direct segmented/streaming, HLS and DASH segment transfers in the desktop and browser-native processes independently.
-- Queue entries and scheduled start times are stored in desktop local storage. Scheduled entries start at their local selected time while the desktop app is running; no Windows Task Scheduler/background wake-up is installed.
+- Queue entries and scheduled start times are stored in desktop local storage. On Windows, each scheduled job registers a one-time Task Scheduler wake task (`WakeToRun` / `StartWhenAvailable`) that launches ThunderLoad when due; it is cancelled when the job starts or is removed. The user must be logged in, and actual wake behavior depends on Windows power settings. Other platforms start scheduled entries while the app is running only.
 - Desktop HLS downloads support completed, unencrypted VOD playlists. HLS does not yet support Pause/Resume/Cancel, separate audio/video muxing, byte-range playlists or live playlists.
 - Browser-started direct and HLS transfers write local status files into `Downloads/ThunderLoad/.native-jobs`. The desktop queue polls these files to show browser job progress and completion. Desktop Pause/Cancel commands do not yet control native-host jobs.
 - The Rust engine retains a parallel byte-range downloader (up to 16 connections), but the checkpointed desktop transfer path currently uses one connection. Multi-connection checkpointing is not implemented.
@@ -71,8 +71,8 @@ HLS qualities are listed only when exposed by the site. Completed unencrypted HL
 - HLS pause/resume/cancel, byte-range playlists, fMP4 and separate audio groups.
 - Broader DASH coverage for SegmentList, SegmentBase and multi-period MPDs; DRM remains unsupported by design.
 - Explicit, secure cookie/header handoff for user-authorized sessions.
-- Windows Task Scheduler integration for scheduled downloads while the desktop app is closed; current schedules start only while the app is running.
-- HLS/DASH segment-level speed limiting and unified pause/resume/cancel controls.
+- Validate Windows Task Scheduler wake tasks on clean Windows 10/11 VMs, including sleep/wake, missed start time, logged-out state, task cancellation and duplicate-instance races.
+- Unified pause/resume/cancel controls for HLS/DASH and browser-native jobs; direct desktop HTTP currently has checkpoint-safe controls.
 - Desktop queue control of extension-started native-host jobs; the desktop currently tracks their progress and completion.
 - Code signing, update strategy, uninstall cleanup, Windows VM testing and accessibility QA.
 - Current-version Firefox/Chromium testing, AMO/Chrome/Edge store review; separate Safari wrapper if Safari is advertised.

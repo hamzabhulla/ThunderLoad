@@ -12,9 +12,11 @@ Do not label a build production-ready until every applicable item is complete.
 - [x] Desktop direct-HTTP queue history persists locally.
 - [x] Direct-HTTP checkpoint pause/resume, cancel and startup recovery are implemented; automated tests and Windows CI must pass for each release.
 - [ ] Multi-connection resume and HLS pause/resume/cancel implemented and tested.
-- [ ] Scheduled jobs integrated with Windows Task Scheduler for operation when the app is closed.
+- [x] Windows one-time Task Scheduler wake task registration/cancellation is implemented with WakeToRun and StartWhenAvailable settings.
+- [ ] Validate scheduled wake, missed triggers, logged-out behavior, cancellation and duplicate-launch handling on clean Windows 10/11 VMs; wake still depends on Windows power settings.
 - [ ] Browser-native jobs controllable (pause/resume/cancel) from the desktop queue, not only tracked.
 - [ ] Test checkpoint recovery across server range support changes, ETag changes, disk-full and force-kill scenarios.
+- [ ] Verify aggregate speed cap across concurrent direct, HLS and DASH segment downloads in both desktop and browser-native processes.
 - [ ] Update channel, rollback, checksums and release provenance documented.
 
 ## Browser extension
