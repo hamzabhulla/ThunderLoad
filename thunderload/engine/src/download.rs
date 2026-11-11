@@ -872,7 +872,7 @@ mod resumable_http_tests {
     };
     use tokio::sync::{mpsc, watch};
 
-    const BODY_SIZE: usize = 32 * 1024;
+    const BODY_SIZE: usize = 512 * 1024;
 
     fn spawn_range_server() -> (String, Arc<AtomicUsize>, Arc<AtomicBool>, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -946,7 +946,7 @@ mod resumable_http_tests {
                 if stream.write_all(headers.as_bytes()).is_err() { continue; }
                 for chunk in payload.chunks(1024) {
                     if stream.write_all(chunk).is_err() { break; }
-                    thread::sleep(Duration::from_millis(5));
+                    thread::sleep(Duration::from_millis(12));
                 }
             }
         });
@@ -962,7 +962,16 @@ mod resumable_http_tests {
         let task = tokio::spawn(async move {
             download_url_resumable(&url, &target, None, control_rx, limiter, progress_tx).await
         });
-        tokio::time::sleep(Duration::from_millis(45)).await;
+        let part = partial_download_path(&target);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let written = tokio::fs::metadata(&part).await.map(|metadata| metadata.len()).unwrap_or(0);
+            if written > 0 { break; }
+            assert!(tokio::time::Instant::now() < deadline, "download never wrote its first checkpoint bytes");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Leave enough time for a partial body, but never depend on an exact CI timing.
+        tokio::time::sleep(Duration::from_millis(25)).await;
         control_tx.send(DownloadControl::Paused).unwrap();
         let outcome = task.await.unwrap().unwrap();
         (outcome, control_tx)
@@ -1094,7 +1103,7 @@ mod segmented_http_tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let requests = range_requests.clone();
         let stop = shutdown.clone();
-        let body: Vec<u8> = (0..BODY_SIZE).map(|index| (index % 251) as u8).collect();
+        let body = Arc::new((0..BODY_SIZE).map(|index| (index % 251) as u8).collect::<Vec<u8>>());
         let handle = thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 let (mut stream, _) = match listener.accept() {
@@ -1105,6 +1114,8 @@ mod segmented_http_tests {
                     }
                     Err(_) => break,
                 };
+                let request_body = body.clone();
+                thread::spawn(move || {
                 let mut raw = Vec::new();
                 let mut buffer = [0_u8; 1024];
                 loop {
@@ -1146,7 +1157,7 @@ mod segmented_http_tests {
                         && (validator.as_deref() == Some("\"v1\"")
                             || (*start == 0 && *end == 0 && validator.is_none()))
                 }) {
-                    let payload = &body[start..=end];
+                    let payload = &request_body[start..=end];
                     let headers = format!(
                         "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{BODY_SIZE}\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n",
                         payload.len()
@@ -1156,7 +1167,7 @@ mod segmented_http_tests {
                     let headers = format!(
                         "HTTP/1.1 200 OK\r\nContent-Length: {BODY_SIZE}\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n"
                     );
-                    if stream.write_all(headers.as_bytes()).is_ok() { let _ = stream.write_all(&body); }
+                    if stream.write_all(headers.as_bytes()).is_ok() { let _ = stream.write_all(&request_body); }
                 }
             }
         });
