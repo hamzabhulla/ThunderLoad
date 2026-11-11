@@ -437,8 +437,8 @@ async fn control_native_download(job_id: String, action: String) -> Result<(), S
     let status = job.get("status").and_then(Value::as_str).unwrap_or("");
     let allowed = match action.as_str() {
         "pause" => status == "Downloading",
-        "resume" => status == "Paused",
-        "cancel" => status == "Downloading" || status == "Paused",
+        "resume" => status == "Paused" || status == "Failed",
+        "cancel" => status == "Downloading" || status == "Paused" || status == "Failed",
         _ => false,
     };
     if !allowed {
