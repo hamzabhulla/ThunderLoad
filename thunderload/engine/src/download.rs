@@ -1183,7 +1183,16 @@ mod segmented_http_tests {
         let directory = std::env::temp_dir().join(format!("thunderload-segment-{}", uuid::Uuid::new_v4()));
         tokio::fs::create_dir_all(&directory).await.unwrap();
         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<DownloadProgress>();
-        let client = client().unwrap();
+        // The tiny TCP fixture closes every socket after one response. Disable
+        // idle pooling here so the test validates independent concurrent ranges
+        // instead of relying on connection-reuse behaviour of the mock server.
+        let client = Client::builder()
+            .user_agent("ThunderLoad-test")
+            .http1_only()
+            .pool_max_idle_per_host(0)
+            .connect_timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
         let probe = probe_range_support(&client, &url, None).await.unwrap();
         assert_eq!(probe.total, BODY_SIZE as u64);
         assert_eq!(probe.if_range.as_deref(), Some("\"v1\""));
