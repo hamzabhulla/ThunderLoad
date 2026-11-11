@@ -38,7 +38,7 @@ fn valid_scheduler_job_id(value: &str) -> bool {
 }
 
 fn powershell_literal(value: &str) -> String {
-    value.replace(''', "''")
+    value.replace('\'', "''")
 }
 
 #[tauri::command]
