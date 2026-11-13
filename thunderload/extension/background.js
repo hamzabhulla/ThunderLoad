@@ -177,6 +177,35 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 api.tabs.onRemoved.addListener((tabId) => sourcesByTab.delete(tabId));
+
+// IDM-style network backstop: catch media the DOM scan cannot see
+// (fetch/XHR-loaded streams, cross-origin iframes). Observation only —
+// nothing is blocked, modified or redirected. The classifier mirrors the
+// extension used by content.js so both paths report the same kinds.
+const NETWORK_MEDIA_EXT = /\.(?:m3u8|mpd|mp4|m4v|mov|webm|mkv|avi|mp3|m4a|aac|wav)(?:$|[?#])/i;
+const NETWORK_SEGMENT_EXT = /\.(?:ts|m4s|cmfv|cmfa)(?:$|[?#])/i;
+function classifyNetworkResponse(url, headers) {
+  if (!url || !/^https?:\/\//i.test(url)) return null;
+  const contentType = (headers || []).find((header) => header.name?.toLowerCase() === "content-type")?.value?.toLowerCase() || "";
+  if (/\.m3u8(?:$|[?#])/i.test(url) || contentType.includes("application/x-mpegurl") || contentType.includes("application/vnd.apple.mpegurl")) return "HLS playlist";
+  if (/\.mpd(?:$|[?#])/i.test(url) || contentType.includes("application/dash+xml")) return "DASH manifest";
+  if (NETWORK_SEGMENT_EXT.test(url)) return null;
+  if (contentType.startsWith("video/") || contentType.startsWith("audio/")) return "Direct media";
+  if (NETWORK_MEDIA_EXT.test(url)) return "Direct media";
+  return null;
+}
+function recordNetworkSource(tabId, url, kind) {
+  if (typeof tabId !== "number" || tabId < 0) return;
+  const map = new Map((sourcesByTab.get(tabId) || []).map((item) => [item.url, item]));
+  if (!map.has(url)) map.set(url, { url, kind, label: kind, discoveredAt: Date.now() });
+  sourcesByTab.set(tabId, Array.from(map.values()).slice(0, 80));
+}
+if (api.webRequest?.onHeadersReceived) {
+  api.webRequest.onHeadersReceived.addListener((details) => {
+    const kind = classifyNetworkResponse(details.url, details.responseHeaders || []);
+    if (kind) recordNetworkSource(details.tabId, details.url, kind);
+  }, { urls: ["<all_urls>"], types: ["xmlhttprequest", "media", "other"] }, ["responseHeaders"]);
+}
 api.tabs.onUpdated.addListener((tabId, changeInfo) => { if (changeInfo.status === "loading") sourcesByTab.delete(tabId); });
 api.commands?.onCommand.addListener(async (command) => {
   if (command !== "scan-media") return;

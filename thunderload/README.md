@@ -10,8 +10,8 @@
 - Desktop HLS downloads support completed, unencrypted VOD playlists. HLS does not yet support Pause/Resume/Cancel, separate audio/video muxing, byte-range playlists or live playlists.
 - Browser-started direct and HLS transfers write local status files into `Downloads/ThunderLoad/.native-jobs`. The desktop queue polls these files to show browser job progress and completion. Desktop Pause/Cancel commands do not yet control native-host jobs.
 - The Rust engine retains a parallel byte-range downloader (up to 16 connections), but the checkpointed desktop transfer path currently uses one connection. Multi-connection checkpointing is not implemented.
-- On-demand scan of media URLs visible in the active tab. It starts only when the user opens the popup or uses its shortcut.
-- A compact, hover-only in-player Download control for supported video elements; no banners or automatic scans of every visited site.
+- Automatic scan of media URLs visible on every visited page. The extension watches for video elements and media traffic, and shows a hover-only in-player Download control over each video; the popup lists everything found on the active tab, and Alt+Shift+D still forces a re-scan.
+- A compact, hover-only in-player Download control for supported video elements; no banners. Automatic detection needs broad host access (`<all_urls>` + `webRequest`): the content script must run on every page and the background must observe media traffic to catch streams the DOM scan cannot see. The earlier minimal-permission stance is intentionally given up for this feature.
 - HLS master-playlist quality discovery through the optional desktop native host.
 - Static DASH VOD downloads for MPDs using SegmentTemplate/SegmentTimeline, including inherited templates, BaseURL resolution and RepresentationID/Bandwidth/Number/Time substitutions.
 - Separate DASH audio/video AdaptationSets are downloaded and stream-copy muxed into MP4 using an externally installed FFmpeg executable. Set/verify its path in Settings → DASH video support; FFmpeg is not bundled.
@@ -49,9 +49,14 @@ NSIS setup output: `target/release/bundle/nsis/`. GitHub Actions can build the i
 
 ## Browser packages
 
-Run `scripts/package-extensions.ps1` in PowerShell. Outputs go to `dist/extensions/`:
+Run `scripts/package-extensions.ps1` in PowerShell, or `node scripts/package-extensions.mjs` on any platform. Outputs go to `dist/extensions/`:
 - `ThunderLoad-Chromium.zip`
 - `ThunderLoad-Firefox.zip`
+- `ThunderLoad-Firefox.xpi` (byte-identical copy of the Firefox ZIP)
+
+No `.crx` is produced: Chrome refuses to install a `.crx` from outside the Web Store, so the developer-mode path is ZIP + Load unpacked.
+
+Developer-mode install (no store listing needed): in desktop ThunderLoad, open **Settings → Browser extension files** and download the package for your browser. Chromium (Chrome/Edge/Brave/Opera): extract the ZIP, open `chrome://extensions` (`edge://extensions`, `brave://extensions`, `opera://extensions`), turn Developer mode on, click **Load unpacked** and select the extracted folder. Firefox: open `about:addons`, click the gear icon, choose **Install Add-on From File** and select the `.xpi`.
 
 Firefox release/beta requires Mozilla signing. Chrome Web Store and Edge Add-ons each have their own listing and review process.
 

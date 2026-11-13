@@ -23,6 +23,14 @@ jobs:
           node --check thunderload/extension/content.js
           node --check thunderload/extension/popup.js
           node thunderload/scripts/validate-extension.mjs
+      - name: Package browser extensions
+        # Must run before ANY cargo command touches the desktop crate: the
+        # Tauri build script (tauri-build) validates the bundled resource
+        # files (see tauri.conf.json) whenever it runs — including during
+        # cargo check / cargo test, not only at installer build time. The
+        # packager only needs the extension sources, so it can run first.
+        shell: pwsh
+        run: .\thunderload\scripts\package-extensions.ps1
       - name: Build native host required by the installer
         working-directory: thunderload
         run: cargo build --release -p thunderload-host
@@ -58,6 +66,7 @@ jobs:
           & "thunderload/scripts/package-extensions.ps1"
           Copy-Item "thunderload/dist/extensions/ThunderLoad-Chromium.zip" $Out
           Copy-Item "thunderload/dist/extensions/ThunderLoad-Firefox.zip" $Out
+          Copy-Item "thunderload/dist/extensions/ThunderLoad-Firefox.xpi" $Out
           $Checksums = Join-Path $Out "SHA256SUMS.txt"
           Get-ChildItem $Out -File | ForEach-Object {
             $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()

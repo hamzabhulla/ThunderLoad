@@ -34,7 +34,9 @@
     "resources": {
       "../../target/release/thunderload-host.exe": "native-host/thunderload-host.exe",
       "../../native-host/register-native-host.ps1": "native-host/register-native-host.ps1",
-      "../../native-host/unregister-native-host.ps1": "native-host/unregister-native-host.ps1"
+      "../../native-host/unregister-native-host.ps1": "native-host/unregister-native-host.ps1",
+      "../../dist/extensions/ThunderLoad-Chromium.zip": "extensions/ThunderLoad-Chromium.zip",
+      "../../dist/extensions/ThunderLoad-Firefox.xpi": "extensions/ThunderLoad-Firefox.xpi"
     },
     "windows": {
       "webviewInstallMode": {

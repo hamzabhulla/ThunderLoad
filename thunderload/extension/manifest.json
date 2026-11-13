@@ -3,10 +3,19 @@
   "name": "ThunderLoad Download Manager",
   "short_name": "ThunderLoad",
   "version": "0.2.0",
-  "description": "A quiet, lightweight download companion with on-demand media detection and optional desktop acceleration.",
+  "description": "A quiet, lightweight download companion with automatic media detection and optional desktop acceleration.",
   "minimum_chrome_version": "116",
-  "permissions": ["activeTab", "scripting", "downloads", "contextMenus"],
+  "permissions": ["activeTab", "scripting", "downloads", "contextMenus", "webRequest"],
   "optional_permissions": ["nativeMessaging"],
+  "host_permissions": ["<all_urls>"],
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
   "background": { "service_worker": "background.js" },
   "action": {
     "default_title": "Scan page with ThunderLoad",

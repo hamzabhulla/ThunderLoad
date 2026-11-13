@@ -37,6 +37,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "Extension manifest validation failed"
           }
+      - name: Package browser extensions
+        # Must run before ANY cargo command touches the desktop crate: the
+        # Tauri build script (tauri-build) validates the bundled resource
+        # files (see tauri.conf.json) whenever it runs — including during
+        # cargo check / cargo test, not only at installer build time. The
+        # packager only needs the extension sources, so it can run first.
+        shell: pwsh
+        run: .\thunderload\scripts\package-extensions.ps1
       - name: Build native host required by Tauri resources
         working-directory: thunderload
         run: cargo build --release -p thunderload-host
@@ -55,9 +63,6 @@ jobs:
       - name: Build Windows NSIS installer
         working-directory: thunderload/desktop
         run: npm run tauri -- build
-      - name: Package browser extensions
-        shell: pwsh
-        run: .\thunderload\scripts\package-extensions.ps1
       - name: Upload preview build artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -66,5 +71,6 @@ jobs:
             thunderload/target/release/bundle/nsis/*.exe
             thunderload/target/release/thunderload-host.exe
             thunderload/dist/extensions/*.zip
+            thunderload/dist/extensions/*.xpi
           if-no-files-found: error
           retention-days: 14
