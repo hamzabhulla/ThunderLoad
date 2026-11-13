@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { save } from "@tauri-apps/plugin-dialog";
 
 type Page = "downloads" | "queue" | "video" | "settings";
 type Kind = "direct" | "hls" | "dash";
@@ -77,6 +78,8 @@ export default function App() {
   const [nativeExtensionId, setNativeExtensionId] = useState("");
   const [nativeSetupStatus, setNativeSetupStatus] = useState("");
   const [nativeSettingUp, setNativeSettingUp] = useState(false);
+  const [extensionFileStatus, setExtensionFileStatus] = useState("");
+  const [extensionFileSaving, setExtensionFileSaving] = useState(false);
   const [ffmpegPath, setFfmpegPath] = useState("ffmpeg");
   const [ffmpegStatus, setFfmpegStatus] = useState("");
   const [ffmpegSaving, setFfmpegSaving] = useState(false);
@@ -413,6 +416,25 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       setNativeSettingUp(false);
     }
   }
+  async function downloadExtensionFile(kind: "chromium" | "firefox") {
+    const isFirefox = kind === "firefox";
+    const fileName = isFirefox ? "ThunderLoad-Firefox.xpi" : "ThunderLoad-Chromium.zip";
+    setExtensionFileSaving(true);
+    setExtensionFileStatus("Choose where to save " + fileName + "…");
+    try {
+      const destination = await save({
+        defaultPath: fileName,
+        filters: [{ name: isFirefox ? "Firefox add-on" : "Chromium extension package", extensions: [isFirefox ? "xpi" : "zip"] }]
+      });
+      if (!destination) { setExtensionFileStatus(""); return; }
+      const saved = await invoke<string>("save_extension_file", { browser: kind, destination });
+      setExtensionFileStatus("Saved " + fileName + " to " + saved + ".");
+    } catch (error) {
+      setExtensionFileStatus(String(error));
+    } finally {
+      setExtensionFileSaving(false);
+    }
+  }
   async function openFolder() {
     try { await invoke("open_download_folder"); }
     catch (error) { setNotice("Could not open download folder: " + String(error)); }
@@ -543,6 +565,20 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
             </div>
             {nativeSetupStatus && <div className="notice native-host-notice">{nativeSetupStatus}</div>}
             <p className="footnote">Copy the ID from the browser's Extensions page. After registration, restart the browser and allow Native messaging in the ThunderLoad extension.</p>
+          </div>
+          <div className="rule" />
+          <div className="settings-section">
+            <div><h2>Browser extension files</h2><p>Download the extension package for your browser and load it in developer mode. No store listing is needed for this path.</p></div>
+            <div className="setting-row">
+              <div><strong>Chrome · Edge · Brave · Opera — ThunderLoad-Chromium.zip</strong><small>Extract the ZIP, then open chrome://extensions (Edge: edge://extensions, Brave: brave://extensions, Opera: opera://extensions), turn Developer mode on, click “Load unpacked” and select the extracted folder.</small></div>
+              <button className="secondary-button" onClick={() => downloadExtensionFile("chromium")} disabled={extensionFileSaving}>Download ZIP</button>
+            </div>
+            <div className="setting-row">
+              <div><strong>Firefox — ThunderLoad-Firefox.xpi</strong><small>Open about:addons, click the gear icon, choose “Install Add-on From File” and select the .xpi file.</small></div>
+              <button className="secondary-button" onClick={() => downloadExtensionFile("firefox")} disabled={extensionFileSaving}>Download XPI</button>
+            </div>
+            <p className="footnote">Firefox release only accepts Mozilla-signed add-ons, so until the AMO-signed build exists this file loads on Firefox Developer Edition or Nightly (with xpinstall.signatures.required switched off). It is not promised to work on release Firefox today.</p>
+            {extensionFileStatus && <div className="notice native-host-notice">{extensionFileStatus}</div>}
           </div>
           <div className="rule" />
           <div className="settings-section"><div><h2>About</h2><p>Local desktop transfer engine · Version 0.2.0</p></div><div className="about-line"><span>Supported media</span><strong>Direct files · HLS VOD · Static DASH VOD</strong></div><div className="about-line"><span>Direct downloads</span><strong>Pause · Resume · Cancel · Speed limit · Schedule</strong></div><div className="about-line"><span>Still in development</span><strong>Multi-connection resume · HLS pause · Live/multi-period DASH</strong></div></div>

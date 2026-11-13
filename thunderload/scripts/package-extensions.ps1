@@ -14,5 +14,9 @@ try {
   Remove-Item (Join-Path $Firefox "manifest.json") -Force
   Move-Item (Join-Path $Firefox "manifest.firefox.json") (Join-Path $Firefox "manifest.json")
   Compress-Archive -Path (Join-Path $Firefox "*") -DestinationPath (Join-Path $Output "ThunderLoad-Firefox.zip") -Force
+  # An .xpi is a ZIP with a different extension; the desktop app serves the
+  # .xpi for Firefox (see save_extension_file). The Tauri bundler lists the
+  # .xpi as a resource, so it must exist before the installer build runs.
+  Copy-Item (Join-Path $Output "ThunderLoad-Firefox.zip") (Join-Path $Output "ThunderLoad-Firefox.xpi") -Force
   Write-Host "Extension packages written to $Output"
 } finally { Remove-Item $Stage -Recurse -Force -ErrorAction SilentlyContinue }

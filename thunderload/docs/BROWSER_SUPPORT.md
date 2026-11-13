@@ -5,8 +5,14 @@ ThunderLoad ships browser-specific packages, not one universal extension file.
 ## Chromium family
 The Chromium Manifest V3 package is the starting point for Chrome, Microsoft Edge, Brave, Opera and Vivaldi. Upload it to each applicable browser's store or unpack it for manual testing. Each store may require its own listing, screenshots, privacy disclosures, review and signing. Test direct downloads, media detection and native messaging in each browser before advertising support.
 
+### Developer-mode install (no store needed)
+Download `ThunderLoad-Chromium.zip` from desktop ThunderLoad (**Settings → Browser extension files**), or build it with `node scripts/package-extensions.mjs`. Extract the ZIP, open `chrome://extensions` (`edge://extensions`, `brave://extensions`, `opera://extensions`), turn Developer mode on, click **Load unpacked** and select the extracted folder. The extension then detects videos on every page automatically and shows its hover Download button over each video. No `.crx` is offered: Chrome refuses to install a `.crx` from outside the Web Store.
+
 ## Firefox
 Firefox uses the separate Manifest V3 manifest (`manifest.firefox.json` becomes `manifest.json` when packaged). Submit the Firefox ZIP to addons.mozilla.org (AMO). Release and Beta Firefox require Mozilla-signed add-ons; Chrome Web Store approval does not approve the Firefox add-on.
+
+### Developer-mode install (no store needed)
+Download `ThunderLoad-Firefox.xpi` from desktop ThunderLoad (**Settings → Browser extension files**), or build it with `node scripts/package-extensions.mjs`. Open `about:addons`, click the gear icon, choose **Install Add-on From File** and select the `.xpi`. Release Firefox only accepts Mozilla-signed add-ons, so until the AMO-signed build exists this file loads on Firefox Developer Edition or Nightly (with `xpinstall.signatures.required` switched off). It is not promised to work on release Firefox today.
 
 ## Safari
 Safari requires a WebExtension wrapped as a macOS app with Xcode tooling, followed by Apple signing/notarization and distribution. The macOS wrapper is not included in this source release. Do not advertise Safari as available until it is built and tested on macOS.

@@ -301,6 +301,40 @@ async fn register_native_host(
 }
 
 #[tauri::command]
+async fn save_extension_file(
+    browser: String,
+    destination: String,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    // Copies a bundled extension package to a user-picked location. The
+    // frontend shows the save dialog (dialog plugin); this command only
+    // reads the packaged resource and writes the bytes, following the
+    // resource_dir pattern used by register_native_host.
+    let browser = browser.trim().to_ascii_lowercase();
+    let resource = match browser.as_str() {
+        "firefox" => "extensions/ThunderLoad-Firefox.xpi",
+        "chromium" | "chrome" | "edge" | "brave" | "opera" => "extensions/ThunderLoad-Chromium.zip",
+        _ => return Err("Choose Chrome, Edge, Brave, Opera or Firefox.".into()),
+    };
+    let source = app.path().resource_dir().map_err(|error| error.to_string())?.join(resource);
+    if !source.is_file() {
+        return Err(format!("Extension package was not found in this install: {}", source.display()));
+    }
+    let destination = PathBuf::from(destination);
+    if destination.file_name().is_none() {
+        return Err("Choose a file name for the extension package.".into());
+    }
+    let bytes = tokio::fs::read(&source).await.map_err(|error| error.to_string())?;
+    if let Some(parent) = destination.parent() {
+        if !parent.as_os_str().is_empty() {
+            tokio::fs::create_dir_all(parent).await.map_err(|error| error.to_string())?;
+        }
+    }
+    tokio::fs::write(&destination, bytes).await.map_err(|error| error.to_string())?;
+    Ok(destination.to_string_lossy().to_string())
+}
+
+#[tauri::command]
 async fn start_dash_download(
     job_id: String,
     url: String,
@@ -494,6 +528,7 @@ async fn open_download_folder() -> Result<(), String> {
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             if let Ok(config_dir) = app.path().app_config_dir() {
                 if let Ok(value) = std::fs::read_to_string(config_dir.join("ffmpeg.path")) {
@@ -506,7 +541,7 @@ fn main() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![inspect_video_url, start_download, pause_download, cancel_download, set_speed_limit, schedule_app_wake, cancel_app_wake, start_hls_download, start_dash_download, get_ffmpeg_path, set_ffmpeg_path, get_native_downloads, control_native_download, dismiss_native_download, register_native_host, open_download_folder])
+        .invoke_handler(tauri::generate_handler![inspect_video_url, start_download, pause_download, cancel_download, set_speed_limit, schedule_app_wake, cancel_app_wake, start_hls_download, start_dash_download, get_ffmpeg_path, set_ffmpeg_path, get_native_downloads, control_native_download, dismiss_native_download, register_native_host, open_download_folder, save_extension_file])
         .run(tauri::generate_context!())
         .expect("error while running ThunderLoad desktop app");
 }
