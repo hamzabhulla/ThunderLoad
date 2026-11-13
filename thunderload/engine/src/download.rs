@@ -91,12 +91,22 @@ async fn probe_range_support(client: &Client, url: &str, referer: Option<&str>) 
     }
     let etag = response.headers().get(header::ETAG)
         .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.trim_start().starts_with("W/"));
+        .filter(|value| !value.trim_start().starts_with("W/"))
+        .map(str::to_owned);
     let modified = response.headers().get(header::LAST_MODIFIED)
-        .and_then(|value| value.to_str().ok());
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    // Drain the single probe byte instead of dropping the response with an
+    // unread body: a connection abandoned mid-body can never go idle
+    // cleanly, and hyper reports buffered bytes on such a connection as
+    // "received unexpected message from connection" on the next send using
+    // that client. Draining also lets the default pooled client reuse the
+    // probe connection. A drain failure changes nothing: the probe's
+    // contract is the headers, which are already validated above.
+    let _ = response.bytes().await;
     Some(RangeProbe {
         total,
-        if_range: etag.or(modified).map(str::to_owned),
+        if_range: etag.or(modified),
     })
 }
 
@@ -123,8 +133,15 @@ pub async fn download_url(
         let mut head_request = client.head(url);
         if let Some(referrer) = referer { head_request = head_request.header(header::REFERER, referrer); }
         let head = head_request.send().await.ok();
+        // Read the total from the Content-Length header, NOT from
+        // response.content_length(): for a HEAD response hyper reports the
+        // body size, which is always 0 (a HEAD response has no body), so
+        // using content_length() here would make the segmented path below
+        // unreachable and every download fall back to sequential.
         let mut total = head.as_ref().filter(|response| response.status().is_success())
-            .and_then(|response| response.content_length());
+            .and_then(|response| response.headers().get(header::CONTENT_LENGTH))
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
         let mut supports_ranges = head.as_ref().filter(|response| response.status().is_success()).map(|response| {
             response.headers().get(header::ACCEPT_RANGES)
                 .and_then(|value| value.to_str().ok())
@@ -1084,7 +1101,10 @@ mod resume_metadata_tests {
 
 #[cfg(test)]
 mod segmented_http_tests {
-    use super::{client, download_segmented, probe_range_support, DownloadProgress, GlobalRateLimiter};
+    use super::{
+        client, download_segmented, download_url, probe_range_support, DownloadProgress,
+        GlobalRateLimiter,
+    };
     use reqwest::Client;
     use std::{
         io::{Read, Write},
@@ -1116,62 +1136,100 @@ mod segmented_http_tests {
                     }
                     Err(_) => break,
                 };
+                // Accepted sockets inherit the listener's non-blocking mode
+                // on Windows: serve this connection blocking, so a request
+                // that has not arrived yet is waited for, not misread as
+                // an empty request.
+                let _ = stream.set_nonblocking(false);
                 let request_body = body.clone();
                 let request_counter = requests.clone();
                 thread::spawn(move || {
-                let mut raw = Vec::new();
-                let mut buffer = [0_u8; 1024];
-                loop {
-                    match stream.read(&mut buffer) {
-                        Ok(0) | Err(_) => break,
-                        Ok(count) => {
-                            raw.extend_from_slice(&buffer[..count]);
-                            if raw.windows(4).any(|window| window == b"\r\n\r\n") { break; }
+                    // Serve sequential requests on this connection (HTTP/1.1
+                    // keep-alive) until the client closes it. The old
+                    // fixture answered after a single read and closed the
+                    // socket; on Windows that read could return WouldBlock
+                    // and be misread as an empty request, so the server
+                    // spoke before the client had sent anything — hyper
+                    // reports such unsolicited bytes as "received unexpected
+                    // message from connection", the exact Windows CI error.
+                    loop {
+                        let mut raw = Vec::new();
+                        let mut buffer = [0_u8; 1024];
+                        let head_complete = loop {
+                            match stream.read(&mut buffer) {
+                                Ok(0) => break false,
+                                Ok(count) => {
+                                    raw.extend_from_slice(&buffer[..count]);
+                                    if raw.windows(4).any(|window| window == b"\r\n\r\n") {
+                                        break true;
+                                    }
+                                }
+                                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                    thread::sleep(Duration::from_millis(1));
+                                }
+                                Err(_) => break false,
+                            }
+                        };
+                        if !head_complete {
+                            return;
+                        }
+                        let request = String::from_utf8_lossy(&raw);
+                        let method = request.split_whitespace().next().unwrap_or("");
+                        let range = request.lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("range").then(|| value.trim().to_string())
+                        });
+                        let validator = request.lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("if-range").then(|| value.trim().to_string())
+                        });
+                        if method == "HEAD" {
+                            let headers = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {BODY_SIZE}\r\nAccept-Ranges: bytes\r\nETag: \"v1\"\r\n\r\n"
+                            );
+                            if stream.write_all(headers.as_bytes()).is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                        // Count each GET range request so the fixture can assert segmented requests reliably.
+                        if method != "HEAD" && range.is_some() {
+                            request_counter.fetch_add(1, Ordering::Relaxed);
+                        }
+                        let bounds = range.as_deref()
+                            .and_then(|value| value.strip_prefix("bytes="))
+                            .and_then(|value| value.split_once('-'))
+                            .and_then(|(start, end)| Some((start.parse::<usize>().ok()?, end.parse::<usize>().ok()?)));
+                        let mut response = Vec::new();
+                        if let Some((start, end)) = bounds.filter(|(start, end)| {
+                            *start <= *end && *end < BODY_SIZE
+                                && (validator.as_deref() == Some("\"v1\"")
+                                    || (*start == 0 && *end == 0 && validator.is_none()))
+                        }) {
+                            let payload = &request_body[start..=end];
+                            response.extend_from_slice(
+                                format!(
+                                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{BODY_SIZE}\r\nETag: \"v1\"\r\n\r\n",
+                                    payload.len()
+                                )
+                                .as_bytes(),
+                            );
+                            response.extend_from_slice(payload);
+                        } else {
+                            response.extend_from_slice(
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Length: {BODY_SIZE}\r\nETag: \"v1\"\r\n\r\n"
+                                )
+                                .as_bytes(),
+                            );
+                            response.extend_from_slice(&request_body);
+                        }
+                        // One write for head + body: a split write followed
+                        // by an immediate close can truncate the body.
+                        if stream.write_all(&response).is_err() {
+                            return;
                         }
                     }
-                }
-                let request = String::from_utf8_lossy(&raw);
-                let method = request.split_whitespace().next().unwrap_or("");
-                let range = request.lines().find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("range").then(|| value.trim().to_string())
-                });
-                let validator = request.lines().find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("if-range").then(|| value.trim().to_string())
-                });
-                if method == "HEAD" {
-                    let headers = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {BODY_SIZE}\r\nAccept-Ranges: bytes\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n"
-                    );
-                    let _ = stream.write_all(headers.as_bytes());
-                    return;
-                }
-                // Count each GET range request so the fixture can assert segmented requests reliably.
-                if method != "HEAD" && range.is_some() {
-                    request_counter.fetch_add(1, Ordering::Relaxed);
-                }
-                let bounds = range.as_deref()
-                    .and_then(|value| value.strip_prefix("bytes="))
-                    .and_then(|value| value.split_once('-'))
-                    .and_then(|(start, end)| Some((start.parse::<usize>().ok()?, end.parse::<usize>().ok()?)));
-                if let Some((start, end)) = bounds.filter(|(start, end)| {
-                    *start <= *end && *end < BODY_SIZE
-                        && (validator.as_deref() == Some("\"v1\"")
-                            || (*start == 0 && *end == 0 && validator.is_none()))
-                }) {
-                    let payload = &request_body[start..=end];
-                    let headers = format!(
-                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{BODY_SIZE}\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n",
-                        payload.len()
-                    );
-                    if stream.write_all(headers.as_bytes()).is_ok() { let _ = stream.write_all(payload); }
-                } else {
-                    let headers = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {BODY_SIZE}\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n"
-                    );
-                    if stream.write_all(headers.as_bytes()).is_ok() { let _ = stream.write_all(&request_body); }
-                }
                 });
             }
         });
@@ -1184,9 +1242,9 @@ mod segmented_http_tests {
         let directory = std::env::temp_dir().join(format!("thunderload-segment-{}", uuid::Uuid::new_v4()));
         tokio::fs::create_dir_all(&directory).await.unwrap();
         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<DownloadProgress>();
-        // The tiny TCP fixture closes every socket after one response. Disable
-        // idle pooling here so the test validates independent concurrent ranges
-        // instead of relying on connection-reuse behaviour of the mock server.
+        // Disable idle pooling here so the test validates independent
+        // concurrent ranges: each of the 8 chunk requests must open its
+        // own connection instead of sharing one through the pool.
         let client = Client::builder()
             .user_agent("ThunderLoad-test")
             .http1_only()
@@ -1215,6 +1273,69 @@ mod segmented_http_tests {
             if progress.phase == "complete" && progress.percent == Some(100.0) { saw_complete = true; }
         }
         assert!(saw_complete);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn download_url_end_to_end_uses_head_and_segmented_ranges() {
+        // Regression cover for the production path: the default pooled
+        // client against the keep-alive fixture (HEAD, then 8 concurrent
+        // ranges). The probe is skipped here because HEAD already
+        // advertises ranges; probe_range_support itself is covered by the
+        // test above.
+        let (url, range_requests, shutdown, server) = spawn_segment_server();
+        let directory = std::env::temp_dir().join(format!("thunderload-download-url-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel::<DownloadProgress>();
+        let target = directory.join("payload.bin");
+        let result = download_url(
+            &url,
+            &target,
+            8,
+            None,
+            progress_tx,
+            Arc::new(GlobalRateLimiter::new()),
+        )
+        .await;
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        let path = result.unwrap();
+        assert_eq!(path, target);
+        assert!(range_requests.load(Ordering::Relaxed) >= 8, "expected 8 chunk Range requests; observed {}", range_requests.load(Ordering::Relaxed));
+        let bytes = tokio::fs::read(&path).await.unwrap();
+        let expected: Vec<u8> = (0..BODY_SIZE).map(|index| (index % 251) as u8).collect();
+        assert_eq!(bytes, expected);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn probe_then_segmented_reuses_pooled_connection() {
+        // Guards the probe drain in probe_range_support on the pooled
+        // path: the probe's connection must go idle cleanly so the
+        // segmented phase can reuse this client (and its pooled
+        // connection) without hyper reporting unexpected bytes.
+        let (url, range_requests, shutdown, server) = spawn_segment_server();
+        let directory = std::env::temp_dir().join(format!("thunderload-probe-pooled-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel::<DownloadProgress>();
+        let pooled = client().unwrap();
+        let probe = probe_range_support(&pooled, &url, None).await.unwrap();
+        assert_eq!(probe.total, BODY_SIZE as u64);
+        assert_eq!(probe.if_range.as_deref(), Some("\"v1\""));
+        let path = directory.join("payload.bin");
+        let result = download_segmented(
+            &pooled, &url, &path, probe.total, 8, None, probe.if_range.as_deref(), progress_tx,
+            Arc::new(GlobalRateLimiter::new()),
+        )
+        .await;
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        result.unwrap();
+        // One probe request plus eight independent chunk requests.
+        assert!(range_requests.load(Ordering::Relaxed) >= 9, "expected probe + 8 chunk Range requests; observed {}", range_requests.load(Ordering::Relaxed));
+        let bytes = tokio::fs::read(&path).await.unwrap();
+        let expected: Vec<u8> = (0..BODY_SIZE).map(|index| (index % 251) as u8).collect();
+        assert_eq!(bytes, expected);
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 }
