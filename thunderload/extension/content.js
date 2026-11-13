@@ -12,6 +12,7 @@
   let button = null;
   let status = null;
   let overlayRoot = null;
+  let overlayUnavailable = false;
 
   function classify(url) {
     if (!url || !/^https?:\/\//i.test(url)) return null;
@@ -57,10 +58,20 @@
   }
 
   function ensureOverlay() {
-    if (buttonHost) return;
+    if (buttonHost || overlayUnavailable) return;
     buttonHost = document.createElement("div");
     buttonHost.style.cssText = "all:initial;position:fixed;inset:0;z-index:2147483646;pointer-events:none;";
-    overlayRoot = buttonHost.attachShadow({ mode: "closed" });
+    try {
+      overlayRoot = buttonHost.attachShadow({ mode: "closed" });
+    } catch (_) {
+      // Auto-injection also runs on non-HTML documents (feeds, SVG, XML),
+      // where a shadow root cannot be created. Skip the overlay quietly;
+      // discovered sources still reach the popup and the background.
+      overlayUnavailable = true;
+      buttonHost = null;
+      overlayRoot = null;
+      return;
+    }
     const style = document.createElement("style");
     style.textContent = [
       '.wrap{position:fixed;display:none;pointer-events:none;z-index:2147483647}',
