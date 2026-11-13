@@ -35,6 +35,12 @@ jobs:
       - name: Build desktop frontend
         working-directory: thunderload/desktop
         run: npm run build
+      - name: Package browser extensions
+        # Must run before the Tauri build: the extension ZIPs/XPI are bundled
+        # as desktop resources (see tauri.conf.json) and the bundler fails
+        # when a listed resource file does not exist yet.
+        shell: pwsh
+        run: .\thunderload\scripts\package-extensions.ps1
       - name: Build Windows NSIS installer
         working-directory: thunderload/desktop
         run: npm run tauri -- build
@@ -58,6 +64,7 @@ jobs:
           & "thunderload/scripts/package-extensions.ps1"
           Copy-Item "thunderload/dist/extensions/ThunderLoad-Chromium.zip" $Out
           Copy-Item "thunderload/dist/extensions/ThunderLoad-Firefox.zip" $Out
+          Copy-Item "thunderload/dist/extensions/ThunderLoad-Firefox.xpi" $Out
           $Checksums = Join-Path $Out "SHA256SUMS.txt"
           Get-ChildItem $Out -File | ForEach-Object {
             $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
