@@ -3,7 +3,7 @@ use std::{collections::HashMap, path::{Path, PathBuf}, process::Command, sync::{
 use std::os::unix::fs::PermissionsExt;
 use serde_json::{json, Value};
 use tauri::{Emitter, Manager};
-use thunderload_engine::{dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_resumable, download_url_resumable, grab_page_media as engine_grab_page_media, hls_work_dir, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, store_file_name, DownloadControl, DownloadOutcome, GlobalRateLimiter, JobKind, JobOrigin, JobRecord, JobState, JobStore, PageMediaList, SessionHeaders};
+use thunderload_engine::{dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_resumable, download_url_resumable, grab_page_media as engine_grab_page_media, hls_work_dir, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, store_file_name, DownloadControl, DownloadOutcome, DownloadProgress, GlobalRateLimiter, JobKind, JobOrigin, JobRecord, JobState, JobStore, PageMediaList, SessionHeaders};
 use tokio::{process::Command as TokioCommand, sync::{mpsc, watch}};
 
 #[tauri::command]
@@ -153,7 +153,7 @@ async fn finish_desktop_download(
             let _ = app.emit("download-cancelled", json!({ "jobId": job_id }));
             if let Ok(mut controls) = job_controls().lock() { controls.remove(job_id); }
         }
-        Err(error) if cancelled_while_finishing => {
+        Err(_error) if cancelled_while_finishing => {
             delete_desktop_resume_files(target).await;
             with_job_store(|store| {
                 let _ = store.update_state(job_id, JobState::Cancelled, Some("Cancelled"), None);
@@ -614,7 +614,7 @@ async fn start_download(
     let limit = rate_limiter();
     let task_target = target.clone();
     tauri::async_runtime::spawn(async move {
-        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<DownloadProgress>();
         let progress_app = app_for_task.clone();
         let progress_id = job_for_task.clone();
         tauri::async_runtime::spawn(async move {
@@ -680,7 +680,7 @@ async fn start_hls_download(
     let app_for_task = app.clone();
     let task_target = target.clone();
     tauri::async_runtime::spawn(async move {
-        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<DownloadProgress>();
         let progress_app = app_for_task.clone();
         let progress_id = job_for_task.clone();
         tauri::async_runtime::spawn(async move {
@@ -993,7 +993,7 @@ async fn start_dash_download(
     let app_for_task = app.clone();
     let task_target = target.clone();
     tauri::async_runtime::spawn(async move {
-        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<DownloadProgress>();
         let progress_app = app_for_task.clone();
         let progress_id = job_for_task.clone();
         tauri::async_runtime::spawn(async move {
