@@ -1,7 +1,7 @@
 use std::{collections::HashMap, path::PathBuf, process::Command, sync::{Arc, Mutex, OnceLock}};
 use serde_json::{json, Value};
 use tauri::{Emitter, Manager};
-use thunderload_engine::{default_download_dir, download_hls, download_url_resumable, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, DownloadControl, DownloadOutcome, GlobalRateLimiter};
+use thunderload_engine::{default_download_dir, download_hls_resumable, download_url_resumable, hls_work_dir, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, DownloadControl, DownloadOutcome, GlobalRateLimiter};
 use tokio::{process::Command as TokioCommand, sync::{mpsc, watch}};
 
 #[tauri::command]
@@ -140,14 +140,20 @@ async fn pause_download(job_id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn cancel_download(job_id: String, target_path: String) -> Result<(), String> {
+async fn cancel_download(job_id: String, target_path: String, app: tauri::AppHandle) -> Result<(), String> {
     let sender = job_controls().lock().map_err(|_| "Download control lock is unavailable")?.remove(&job_id);
     let actively_running = sender.map(|sender| sender.send(DownloadControl::Cancelled).is_ok()).unwrap_or(false);
     if !actively_running {
         let target = PathBuf::from(target_path);
         let _ = tokio::fs::remove_file(partial_download_path(&target)).await;
         let _ = tokio::fs::remove_file(partial_download_metadata_path(&target)).await;
+        let _ = tokio::fs::remove_dir_all(hls_work_dir(&target)).await;
         let _ = tokio::fs::remove_file(&target).await;
+        // No task is alive to report the cancellation (e.g. the job was
+        // already Paused, so its task ended), so emit it here — otherwise
+        // the UI would stay on "Cancelling" forever. When the task is
+        // alive it emits the event itself, so this never double-emits.
+        let _ = app.emit("download-cancelled", json!({ "jobId": job_id }));
     }
     Ok(())
 }
@@ -216,13 +222,29 @@ async fn start_hls_download(
     job_id: String,
     url: String,
     filename: String,
+    target_path: Option<String>,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err("Only HTTP and HTTPS playlist URLs are supported".into());
     }
     let name = safe_filename(&filename, "video.mp4");
+    // Resume reuses the paused job's target so the on-disk HLS checkpoint
+    // is found; a fresh job reserves a new target, as before. The
+    // target_path argument is optional for existing callers. The target
+    // path is returned (like start_download) so the frontend learns it
+    // at start and can offer Cancel while the job is running.
+    let target = match target_path {
+        Some(path) => PathBuf::from(path),
+        None => reserve_download_path(&default_download_dir().join(name)).await.map_err(|error| error.to_string())?,
+    };
+    let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
+    {
+        let mut controls = job_controls().lock().map_err(|_| "Download control lock is unavailable")?;
+        controls.insert(job_id.clone(), control_tx);
+    }
     let job_for_task = job_id.clone();
+    let task_target = target.clone();
     tauri::async_runtime::spawn(async move {
         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
         let progress_app = app.clone();
@@ -232,12 +254,26 @@ async fn start_hls_download(
                 let _ = progress_app.emit("download-progress", json!({ "jobId": progress_id, "progress": progress }));
             }
         });
-        match download_hls(&url, &name, None, progress_tx, rate_limiter()).await {
-            Ok(path) => { let _ = app.emit("download-complete", json!({ "jobId": job_for_task, "path": path.to_string_lossy() })); }
-            Err(error) => { let _ = app.emit("download-error", json!({ "jobId": job_for_task, "error": error.to_string() })); }
+        let result = download_hls_resumable(&url, &task_target, None, control_rx, progress_tx, rate_limiter()).await;
+        match result {
+            Ok(DownloadOutcome::Completed) => {
+                let _ = app.emit("download-complete", json!({ "jobId": job_for_task, "path": task_target.to_string_lossy() }));
+                if let Ok(mut controls) = job_controls().lock() { controls.remove(&job_for_task); }
+            }
+            Ok(DownloadOutcome::Paused) => {
+                let _ = app.emit("download-paused", json!({ "jobId": job_for_task, "targetPath": task_target.to_string_lossy() }));
+            }
+            Ok(DownloadOutcome::Cancelled) => {
+                let _ = app.emit("download-cancelled", json!({ "jobId": job_for_task }));
+                if let Ok(mut controls) = job_controls().lock() { controls.remove(&job_for_task); }
+            }
+            Err(error) => {
+                let _ = app.emit("download-error", json!({ "jobId": job_for_task, "error": error.to_string(), "targetPath": task_target.to_string_lossy() }));
+                if let Ok(mut controls) = job_controls().lock() { controls.remove(&job_for_task); }
+            }
         }
     });
-    Ok(job_id)
+    Ok(target.to_string_lossy().to_string())
 }
 
 #[tauri::command]
