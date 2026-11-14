@@ -1,7 +1,7 @@
-use std::{collections::HashMap, path::PathBuf, process::Command, sync::{Arc, Mutex, OnceLock}};
+use std::{collections::HashMap, path::PathBuf, process::Command, sync::{Arc, Mutex, OnceLock}, time::{Duration, Instant}};
 use serde_json::{json, Value};
 use tauri::{Emitter, Manager};
-use thunderload_engine::{default_download_dir, download_hls_resumable, download_url_resumable, hls_work_dir, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, DownloadControl, DownloadOutcome, GlobalRateLimiter};
+use thunderload_engine::{dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_resumable, download_url_resumable, hls_work_dir, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, DownloadControl, DownloadOutcome, GlobalRateLimiter};
 use tokio::{process::Command as TokioCommand, sync::{mpsc, watch}};
 
 #[tauri::command]
@@ -15,6 +15,90 @@ static RATE_LIMITER: OnceLock<Arc<GlobalRateLimiter>> = OnceLock::new();
 
 fn job_controls() -> &'static Mutex<HashMap<String, watch::Sender<DownloadControl>>> {
     JOB_CONTROLS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Jobs that already finished successfully, with the time they completed.
+/// `cancel_download` consults this before deleting anything: a cancel that
+/// arrives after the download completed (a UI row that has not refreshed
+/// yet) must not delete the finished file (D9). Entries are kept for the
+/// whole app session — a time-based expiry would re-open the hole for a
+/// late cancel — and the map is capped at 4096 entries (oldest evicted),
+/// so memory stays bounded no matter how many downloads complete.
+static COMPLETED_JOBS: OnceLock<Mutex<HashMap<String, (PathBuf, Instant)>>> = OnceLock::new();
+
+fn completed_jobs() -> &'static Mutex<HashMap<String, (PathBuf, Instant)>> {
+    COMPLETED_JOBS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn mark_job_completed(job_id: &str, target: &Path) {
+    if let Ok(mut jobs) = completed_jobs().lock() {
+        if jobs.len() >= 4096 {
+            if let Some(oldest) = jobs.iter().min_by_key(|(_, (_, at))| *at).map(|(id, _)| id.clone()) {
+                jobs.remove(&oldest);
+            }
+        }
+        jobs.insert(job_id.to_string(), (target.to_path_buf(), Instant::now()));
+    }
+}
+
+fn job_completed(job_id: &str) -> bool {
+    completed_jobs().lock().map(|jobs| jobs.contains_key(job_id)).unwrap_or(false)
+}
+
+/// Deletes every resume file a desktop download can leave behind: the
+/// partial file, the checkpoint sidecar, the HLS/DASH segment work
+/// directories, and the target itself. Paths that do not exist are
+/// no-ops, so this is safe to call without knowing the job kind.
+async fn delete_desktop_resume_files(target: &Path) {
+    let _ = tokio::fs::remove_file(partial_download_path(target)).await;
+    let _ = tokio::fs::remove_file(partial_download_metadata_path(target)).await;
+    let _ = tokio::fs::remove_dir_all(hls_work_dir(target)).await;
+    let _ = tokio::fs::remove_dir_all(dash_work_dir(target)).await;
+    let _ = tokio::fs::remove_file(target).await;
+}
+
+/// Reports the final outcome of a desktop download task.
+/// `cancelled_while_finishing` is the control channel's value read after
+/// the engine call returned: a cancel that arrived while the download was
+/// finishing must not delete a completed file (D9), but it does turn a
+/// Paused/Error finish into Cancelled so no checkpoint is left behind.
+/// Completed always wins — the file is whole, so a racing cancel is
+/// ignored and the completion event is what the UI sees.
+async fn finish_desktop_download(
+    app: &tauri::AppHandle,
+    job_id: &str,
+    target: &Path,
+    result: Result<DownloadOutcome, String>,
+    cancelled_while_finishing: bool,
+) {
+    match result {
+        Ok(DownloadOutcome::Completed) => {
+            mark_job_completed(job_id, target);
+            let _ = app.emit("download-complete", json!({ "jobId": job_id, "path": target.to_string_lossy() }));
+            if let Ok(mut controls) = job_controls().lock() { controls.remove(job_id); }
+        }
+        Ok(DownloadOutcome::Paused) if cancelled_while_finishing => {
+            delete_desktop_resume_files(target).await;
+            let _ = app.emit("download-cancelled", json!({ "jobId": job_id }));
+            if let Ok(mut controls) = job_controls().lock() { controls.remove(job_id); }
+        }
+        Ok(DownloadOutcome::Paused) => {
+            let _ = app.emit("download-paused", json!({ "jobId": job_id, "targetPath": target.to_string_lossy() }));
+        }
+        Ok(DownloadOutcome::Cancelled) => {
+            let _ = app.emit("download-cancelled", json!({ "jobId": job_id }));
+            if let Ok(mut controls) = job_controls().lock() { controls.remove(job_id); }
+        }
+        Err(error) if cancelled_while_finishing => {
+            delete_desktop_resume_files(target).await;
+            let _ = app.emit("download-cancelled", json!({ "jobId": job_id }));
+            if let Ok(mut controls) = job_controls().lock() { controls.remove(job_id); }
+        }
+        Err(error) => {
+            let _ = app.emit("download-error", json!({ "jobId": job_id, "error": error, "targetPath": target.to_string_lossy() }));
+            if let Ok(mut controls) = job_controls().lock() { controls.remove(job_id); }
+        }
+    }
 }
 
 fn rate_limiter() -> Arc<GlobalRateLimiter> {
@@ -144,11 +228,15 @@ async fn cancel_download(job_id: String, target_path: String, app: tauri::AppHan
     let sender = job_controls().lock().map_err(|_| "Download control lock is unavailable")?.remove(&job_id);
     let actively_running = sender.map(|sender| sender.send(DownloadControl::Cancelled).is_ok()).unwrap_or(false);
     if !actively_running {
+        // D9: the task already finished. If it completed, the target is a
+        // finished file and must not be deleted — the completion event
+        // already told (or will tell) the UI. Only a paused/failed job's
+        // checkpoint is deleted here.
+        if job_completed(&job_id) {
+            return Ok(());
+        }
         let target = PathBuf::from(target_path);
-        let _ = tokio::fs::remove_file(partial_download_path(&target)).await;
-        let _ = tokio::fs::remove_file(partial_download_metadata_path(&target)).await;
-        let _ = tokio::fs::remove_dir_all(hls_work_dir(&target)).await;
-        let _ = tokio::fs::remove_file(&target).await;
+        delete_desktop_resume_files(&target).await;
         // No task is alive to report the cancellation (e.g. the job was
         // already Paused, so its task ended), so emit it here — otherwise
         // the UI would stay on "Cancelling" forever. When the task is
@@ -181,6 +269,11 @@ async fn start_download(
         let mut controls = job_controls().lock().map_err(|_| "Download control lock is unavailable")?;
         controls.insert(job_id.clone(), control_tx);
     }
+    // Keep a second receiver alive in the task until the outcome is
+    // reported: a cancel that arrives while the download is finishing
+    // still reaches a live receiver, so `cancel_download` never falls into
+    // its cleanup branch for a job that just completed (D9).
+    let transition_rx = control_rx.clone();
 
     let job_for_task = job_id.clone();
     let app_for_task = app.clone();
@@ -196,23 +289,8 @@ async fn start_download(
             }
         });
         let result = download_url_resumable(&url, &task_target, None, control_rx, limit, progress_tx).await;
-        match result {
-            Ok(DownloadOutcome::Completed) => {
-                let _ = app_for_task.emit("download-complete", json!({ "jobId": job_for_task, "path": task_target.to_string_lossy() }));
-                if let Ok(mut controls) = job_controls().lock() { controls.remove(&job_for_task); }
-            }
-            Ok(DownloadOutcome::Paused) => {
-                let _ = app_for_task.emit("download-paused", json!({ "jobId": job_for_task, "targetPath": task_target.to_string_lossy() }));
-            }
-            Ok(DownloadOutcome::Cancelled) => {
-                let _ = app_for_task.emit("download-cancelled", json!({ "jobId": job_for_task }));
-                if let Ok(mut controls) = job_controls().lock() { controls.remove(&job_for_task); }
-            }
-            Err(error) => {
-                let _ = app_for_task.emit("download-error", json!({ "jobId": job_for_task, "error": error.to_string(), "targetPath": task_target.to_string_lossy() }));
-                if let Ok(mut controls) = job_controls().lock() { controls.remove(&job_for_task); }
-            }
-        }
+        let cancelled_while_finishing = *transition_rx.borrow() == DownloadControl::Cancelled;
+        finish_desktop_download(&app_for_task, &job_for_task, &task_target, result.map_err(|error| error.to_string()), cancelled_while_finishing).await;
     });
     Ok(target.to_string_lossy().to_string())
 }
@@ -243,11 +321,17 @@ async fn start_hls_download(
         let mut controls = job_controls().lock().map_err(|_| "Download control lock is unavailable")?;
         controls.insert(job_id.clone(), control_tx);
     }
+    // Keep a second receiver alive in the task until the outcome is
+    // reported: a cancel that arrives while the download is finishing
+    // still reaches a live receiver, so `cancel_download` never falls into
+    // its cleanup branch for a job that just completed (D9).
+    let transition_rx = control_rx.clone();
     let job_for_task = job_id.clone();
+    let app_for_task = app.clone();
     let task_target = target.clone();
     tauri::async_runtime::spawn(async move {
         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
-        let progress_app = app.clone();
+        let progress_app = app_for_task.clone();
         let progress_id = job_for_task.clone();
         tauri::async_runtime::spawn(async move {
             while let Some(progress) = progress_rx.recv().await {
@@ -255,23 +339,8 @@ async fn start_hls_download(
             }
         });
         let result = download_hls_resumable(&url, &task_target, None, control_rx, progress_tx, rate_limiter()).await;
-        match result {
-            Ok(DownloadOutcome::Completed) => {
-                let _ = app.emit("download-complete", json!({ "jobId": job_for_task, "path": task_target.to_string_lossy() }));
-                if let Ok(mut controls) = job_controls().lock() { controls.remove(&job_for_task); }
-            }
-            Ok(DownloadOutcome::Paused) => {
-                let _ = app.emit("download-paused", json!({ "jobId": job_for_task, "targetPath": task_target.to_string_lossy() }));
-            }
-            Ok(DownloadOutcome::Cancelled) => {
-                let _ = app.emit("download-cancelled", json!({ "jobId": job_for_task }));
-                if let Ok(mut controls) = job_controls().lock() { controls.remove(&job_for_task); }
-            }
-            Err(error) => {
-                let _ = app.emit("download-error", json!({ "jobId": job_for_task, "error": error.to_string(), "targetPath": task_target.to_string_lossy() }));
-                if let Ok(mut controls) = job_controls().lock() { controls.remove(&job_for_task); }
-            }
-        }
+        let cancelled_while_finishing = *transition_rx.borrow() == DownloadControl::Cancelled;
+        finish_desktop_download(&app_for_task, &job_for_task, &task_target, result.map_err(|error| error.to_string()), cancelled_while_finishing).await;
     });
     Ok(target.to_string_lossy().to_string())
 }
@@ -377,6 +446,7 @@ async fn start_dash_download(
     representation_id: String,
     audio_representation_id: Option<String>,
     filename: String,
+    target_path: Option<String>,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
@@ -386,28 +456,52 @@ async fn start_dash_download(
         return Err("A DASH representation must be selected before downloading".into());
     }
     let name = safe_filename(&filename, "video.mp4");
+    // Resume reuses the paused job's target so the on-disk DASH checkpoint
+    // is found; a fresh job resolves the manifest first so the reserved
+    // target gets the right extension (webm for a video-only WebM track),
+    // then reserves it. The target path is returned (like start_download)
+    // so the frontend learns it at start and can offer Pause/Cancel while
+    // the job is running.
+    let target = match target_path {
+        Some(path) => PathBuf::from(path),
+        None => {
+            let extension = dash_output_extension(&url, &representation_id, audio_representation_id.as_deref(), None).await
+                .map_err(|error| error.to_string())?;
+            let stem = Path::new(&name).file_stem().and_then(|value| value.to_str()).unwrap_or("video");
+            reserve_download_path(&default_download_dir().join(format!("{stem}.{extension}"))).await
+                .map_err(|error| error.to_string())?
+        }
+    };
+    let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
+    {
+        let mut controls = job_controls().lock().map_err(|_| "Download control lock is unavailable")?;
+        controls.insert(job_id.clone(), control_tx);
+    }
+    // Keep a second receiver alive in the task until the outcome is
+    // reported: a cancel that arrives while the download is finishing
+    // still reaches a live receiver, so `cancel_download` never falls into
+    // its cleanup branch for a job that just completed (D9).
+    let transition_rx = control_rx.clone();
     let job_for_task = job_id.clone();
+    let app_for_task = app.clone();
+    let task_target = target.clone();
     tauri::async_runtime::spawn(async move {
         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
-        let progress_app = app.clone();
+        let progress_app = app_for_task.clone();
         let progress_id = job_for_task.clone();
         tauri::async_runtime::spawn(async move {
             while let Some(progress) = progress_rx.recv().await {
                 let _ = progress_app.emit("download-progress", json!({ "jobId": progress_id, "progress": progress }));
             }
         });
-        match thunderload_engine::download_dash(
-            &url, &representation_id, audio_representation_id.as_deref(), &name, None, progress_tx, rate_limiter()
-        ).await {
-            Ok(path) => {
-                let _ = app.emit("download-complete", json!({ "jobId": job_for_task, "path": path.to_string_lossy() }));
-            }
-            Err(error) => {
-                let _ = app.emit("download-error", json!({ "jobId": job_for_task, "error": error.to_string() }));
-            }
-        }
+        let result = download_dash_resumable(
+            &url, &representation_id, audio_representation_id.as_deref(), &task_target, None,
+            control_rx, progress_tx, rate_limiter(),
+        ).await;
+        let cancelled_while_finishing = *transition_rx.borrow() == DownloadControl::Cancelled;
+        finish_desktop_download(&app_for_task, &job_for_task, &task_target, result.map_err(|error| error.to_string()), cancelled_while_finishing).await;
     });
-    Ok(job_id)
+    Ok(target.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -492,6 +586,22 @@ async fn get_native_downloads() -> Result<Vec<Value>, String> {
     Ok(jobs)
 }
 
+/// Writes one control word (`pause`, `resume` or `cancel`) for a
+/// browser-started job, atomically via tmp+rename, so the companion's
+/// watcher picks it up within ~250 ms. Shared by `control_native_download`
+/// and `dismiss_native_download`.
+async fn write_native_control_file(directory: &std::path::Path, job_id: &str, action: &str) -> Result<(), String> {
+    tokio::fs::create_dir_all(directory).await.map_err(|error| error.to_string())?;
+    let command_path = directory.join(format!("{job_id}.control"));
+    let temporary = directory.join(format!("{job_id}.control.tmp"));
+    tokio::fs::write(&temporary, action.as_bytes()).await.map_err(|error| error.to_string())?;
+    if tokio::fs::try_exists(&command_path).await.unwrap_or(false) {
+        tokio::fs::remove_file(&command_path).await.map_err(|error| error.to_string())?;
+    }
+    tokio::fs::rename(&temporary, &command_path).await.map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 #[tauri::command]
 async fn control_native_download(job_id: String, action: String) -> Result<(), String> {
     if job_id.is_empty() || job_id.len() > 64
@@ -517,14 +627,7 @@ async fn control_native_download(job_id: String, action: String) -> Result<(), S
         return Err(format!("Cannot {action} a browser download while it is {status}."));
     }
 
-    tokio::fs::create_dir_all(&directory).await.map_err(|error| error.to_string())?;
-    let command_path = directory.join(format!("{job_id}.control"));
-    let temporary = directory.join(format!("{job_id}.control.tmp"));
-    tokio::fs::write(&temporary, action.as_bytes()).await.map_err(|error| error.to_string())?;
-    if tokio::fs::try_exists(&command_path).await.unwrap_or(false) {
-        tokio::fs::remove_file(&command_path).await.map_err(|error| error.to_string())?;
-    }
-    tokio::fs::rename(&temporary, &command_path).await.map_err(|error| error.to_string())?;
+    write_native_control_file(&directory, &job_id, &action).await?;
     Ok(())
 }
 
@@ -535,6 +638,40 @@ async fn dismiss_native_download(job_id: String) -> Result<(), String> {
         return Err("Invalid browser download identifier.".into());
     }
     let directory = default_download_dir().join(".native-jobs");
+    let job_path = directory.join(format!("{job_id}.json"));
+    // D10: if the companion may still own this job (Downloading/Paused/
+    // Failed), its task is alive — possibly waiting in its pause/retry
+    // loop, heartbeating the state file every ten seconds. Ask it to
+    // cancel through the control file and wait until it records Cancelled
+    // before deleting the state file; deleting first would let the
+    // companion's next state save resurrect the job in the desktop queue.
+    // A heartbeat stale for more than 45 seconds means the companion is
+    // already gone (the same threshold `get_native_downloads` uses for
+    // Interrupted), so no wait is needed. Interrupted/Completed/Cancelled
+    // jobs have no live owner and their files are deleted immediately.
+    if let Ok(bytes) = tokio::fs::read(&job_path).await {
+        if let Ok(job) = serde_json::from_slice::<Value>(&bytes) {
+            let status = job.get("status").and_then(Value::as_str).unwrap_or("");
+            if ["Downloading", "Paused", "Failed"].contains(&status) {
+                let updated = job.get("updatedAt").and_then(Value::as_u64).unwrap_or(0);
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default().as_millis() as u64;
+                if updated == 0 || now.saturating_sub(updated) <= 45_000 {
+                    let _ = write_native_control_file(&directory, &job_id, "cancel").await;
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    loop {
+                        let cancelled = tokio::fs::read(&job_path).await.ok()
+                            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                            .and_then(|job| job.get("status").and_then(Value::as_str).map(str::to_string))
+                            .map(|status| status == "Cancelled")
+                            .unwrap_or(false);
+                        if cancelled || Instant::now() >= deadline { break; }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        }
+    }
     for path in [
         directory.join(format!("{job_id}.json")),
         directory.join(format!("{job_id}.control")),
