@@ -17,6 +17,12 @@
       <button class="secondary" id="rescanBtn">Rescan</button>
     </section>
     <section class="section-head"><div><h2>Detected media</h2><span class="muted" id="scanMeta">Scanning active tab…</span></div><span class="count" id="sourceCount">0</span></section>
+    <div class="grab-bar" id="grabBar" hidden>
+      <button class="secondary" id="selectAllBtn">Select all</button>
+      <button class="secondary" id="selectNoneBtn">Select none</button>
+      <button class="primary" id="downloadSelectedBtn">Download selected</button>
+    </div>
+    <div class="truncated-note" id="truncatedNote" hidden>Showing the first 100 items — download in batches, or narrow the page.</div>
     <div id="sourceList" class="source-list"><div class="empty">Looking for media sources…</div></div>
     <div class="footer-note">The small in-player Download control appears only on hover after you open this extension. Protected or hidden streams are not bypassed.</div>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>

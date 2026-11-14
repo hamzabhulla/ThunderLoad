@@ -3,8 +3,29 @@
   globalThis.__thunderLoadScannerInstalled = true;
 
   const found = new Map();
-  const MEDIA_EXT = /\.(?:m3u8|mpd|mp4|m4v|mov|webm|mkv|avi|mp3|m4a|aac|wav)(?:$|[?#])/i;
+  // Same media set as the engine grabber (engine/src/grabber.rs) so
+  // both surfaces agree on what counts. Playlists first, then files.
+  const MEDIA_EXT = /\.(?:m3u8|mpd|mp4|m4v|mov|webm|mkv|avi|mp3|m4a|aac|wav|ogg|opus|flac|pdf|zip)(?:$|[?#])/i;
   const SEGMENT_EXT = /\.(?:ts|m4s|cmfv|cmfa)(?:$|[?#])/i;
+  // The grabber caps at 100 items per page (same cap as the engine);
+  // `truncated` tells the popup the page held more.
+  const MAX_FOUND = 100;
+  let truncated = false;
+  // Distinct media URLs seen by the scan currently running, if any.
+  // scan() recomputes `truncated` from this set at its end, so the
+  // flag is exact for the current DOM even when `found` is already
+  // full from an earlier scan (duplicates would otherwise never hit
+  // the cap check in add() again — R1 follow-up).
+  let currentScanUrls = null;
+  // The cap flag must actually reach the background: add() returns
+  // early once the cap is hit, so no later item message can carry it.
+  // Notify once per scan with an item-less message instead.
+  let truncatedNotified = false;
+  function notifyTruncated() {
+    if (truncatedNotified) return;
+    truncatedNotified = true;
+    chrome.runtime.sendMessage({ type: "VIDEO_SOURCES_FOUND", sources: [], truncated: true }).catch(() => {});
+  }
   let scanScheduled = false;
   let activeVideo = null;
   let hideTimer = null;
@@ -51,10 +72,15 @@
 
   function add(url, label) {
     const kind = classify(url);
-    if (!kind || found.has(url) || found.size >= 80) return;
+    if (!kind) return;
+    // Count every classifiable URL this scan sees, duplicates included,
+    // so scan() can tell a still-overflowing page from a shrunk one.
+    if (currentScanUrls) currentScanUrls.add(url);
+    if (found.has(url)) return;
+    if (found.size >= MAX_FOUND) { truncated = true; notifyTruncated(); return; }
     const item = { url, kind, label: label || kind, discoveredAt: Date.now() };
     found.set(url, item);
-    chrome.runtime.sendMessage({ type: "VIDEO_SOURCES_FOUND", sources: [item] }).catch(() => {});
+    chrome.runtime.sendMessage({ type: "VIDEO_SOURCES_FOUND", sources: [item], truncated }).catch(() => {});
   }
 
   function ensureOverlay() {
@@ -267,13 +293,63 @@
   }
 
   function scan() {
+    // Recompute truncation from the current DOM on every scan (R1):
+    // a page that shrank below both caps must stop reporting truncated.
+    // The recompute at the end uses the distinct URLs this scan saw,
+    // not `found` (which is accumulative), so a repeat scan of an
+    // unchanged overflowing page still reports truncated.
+    truncated = false;
+    truncatedNotified = false;
+    currentScanUrls = new Set();
+    let anchorsOverCap = false;
     const videos = Array.from(document.querySelectorAll("video"));
     videos.forEach(attachVideo);
+    // Count video sources for this scan even when attachVideo
+    // early-returns for already-attached videos (R1 follow-up):
+    // add() dedups against `found`, so re-adding is free, and the
+    // per-scan set is what the truncation recompute reads.
+    videos.forEach((video, index) => {
+      const source = sourceFor(video);
+      if (source) add(source.url, "Video " + (index + 1));
+    });
+    // Audio elements expose their sources the same way videos do, but
+    // get no hover overlay — their entries go straight to the popup.
+    Array.from(document.querySelectorAll("audio")).forEach((audio, audioIndex) => {
+      const urls = [
+        audio.currentSrc,
+        audio.src,
+        ...Array.from(audio.querySelectorAll("source")).map((node) => node.src)
+      ];
+      urls.forEach((url) => {
+        if (classify(url)) add(url, "Audio " + (audioIndex + 1));
+      });
+    });
+    // Same-page media links: the grabber's main new source. Only the
+    // first 500 anchors are read so a link-heavy page stays cheap; the
+    // 100-item cap does the rest. A page with more than 500 anchors
+    // counts as truncated too, so the popup says the list is partial.
+    // data:/blob: links never classify.
+    const links = Array.from(document.querySelectorAll("a[href]"));
+    if (links.length > 500) anchorsOverCap = true;
+    for (const link of links.slice(0, 500)) {
+      const href = link.href;
+      if (classify(href)) {
+        let name = href;
+        try { name = decodeURIComponent(new URL(href).pathname.split("/").pop() || href); } catch (_) {}
+        add(href, "Link · " + name);
+      }
+    }
     // Include manifest and direct media resources for the extension popup.
     for (const entry of performance.getEntriesByType("resource").slice(-700)) {
       const kind = classify(entry.name);
       if (kind) add(entry.name, kind);
     }
+    // Final word on truncation for this scan: more distinct media than
+    // the cap, or more anchors than the anchor bound. A mid-scan notify
+    // from add() may already have fired; the guard dedups it.
+    truncated = currentScanUrls.size > MAX_FOUND || anchorsOverCap;
+    currentScanUrls = null;
+    if (truncated) notifyTruncated();
     if (activeVideo && !activeVideo.matches(":hover")) scheduleHide();
     return found.size;
   }
@@ -289,11 +365,11 @@
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type === "SCAN_NOW") {
-      sendResponse({ ok: true, count: scan() });
+      sendResponse({ ok: true, count: scan(), truncated });
       return false;
     }
     if (message?.type === "GET_SCANNED_MEDIA") {
-      sendResponse({ sources: Array.from(found.values()) });
+      sendResponse({ sources: Array.from(found.values()), truncated });
       return false;
     }
     return false;

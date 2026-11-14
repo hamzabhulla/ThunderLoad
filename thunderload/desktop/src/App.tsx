@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
@@ -7,8 +7,11 @@ type Page = "downloads" | "queue" | "video" | "settings";
 type Kind = "direct" | "hls" | "dash";
 type Status = "Queued" | "Downloading" | "Pausing" | "Paused" | "Cancelling" | "Completed" | "Failed" | "Interrupted" | "Cancelled";
 type Variant = { kind: string; quality: string; width?: number; height?: number; bandwidth?: number; url: string; downloadable: boolean; note?: string; representationId?: string; audioRepresentationId?: string; audioOnly?: boolean };
+type GrabItem = { url: string; kind: string; name: string };
+type GrabResult = { items: GrabItem[]; truncated: boolean };
 type Progress = { downloaded: number; total?: number; percent?: number; phase: string };
 type Item = { id: string; name: string; url: string; kind: Kind; status: Status; percent: number; downloaded: number; total?: number; detail: string; error?: string; createdAt: number; targetPath?: string; scheduledAt?: number; source?: "native"; representationId?: string; audioRepresentationId?: string };
+type StoredJob = { id: string; name: string; url: string; kind: string; origin: string; state: string; downloaded: number; total?: number; percent?: number; segmentsDone?: number; segmentsTotal?: number; targetPath?: string; checkpointPath?: string; representationId?: string; audioRepresentationId?: string; scheduledAtMs?: number; detail: string; error?: string; createdAtMs: number; updatedAtMs: number };
 
 const HISTORY_KEY = "thunderload.history.v2";
 const CONNECTIONS_KEY = "thunderload.connections.v1";
@@ -28,7 +31,7 @@ function readItems(): Item[] {
     return saved.map((item: Item) => item.source === "native"
       ? item
       : item.status === "Downloading" || item.status === "Pausing"
-        ? item.kind === "direct" && item.targetPath
+        ? item.targetPath
           ? { ...item, status: "Queued", detail: "Recovering saved partial download…" }
           : { ...item, status: "Interrupted", detail: "App closed before a resumable checkpoint was created" }
         : item);
@@ -46,11 +49,35 @@ function nameFromUrl(value: string): string {
     return raw ? decodeURIComponent(raw) : "download.bin";
   } catch { return "download.bin"; }
 }
+function storedJobToItem(row: StoredJob): Item {
+  const kind: Kind = row.kind === "hls" ? "hls" : row.kind === "dash" ? "dash" : "direct";
+  const status: Status = (["Queued", "Downloading", "Paused", "Completed", "Failed", "Interrupted", "Cancelled"].includes(row.state) ? row.state : "Failed") as Status;
+  const percent = row.percent !== undefined
+    ? Math.max(0, Math.min(100, row.percent))
+    : row.total ? Math.max(0, Math.min(100, Math.round(row.downloaded / row.total * 100))) : 0;
+  return {
+    id: row.id, name: row.name || nameFromUrl(row.url), url: row.url, kind, status, percent,
+    downloaded: row.downloaded, total: row.total, detail: row.detail || "",
+    error: row.error, createdAt: row.createdAtMs, targetPath: row.targetPath,
+    scheduledAt: row.scheduledAtMs, representationId: row.representationId,
+    audioRepresentationId: row.audioRepresentationId
+  };
+}
+function itemToSyncJob(item: Item) {
+  return {
+    id: item.id, name: item.name, url: item.url, kind: item.kind, status: item.status,
+    downloaded: item.downloaded, total: item.total ?? null, percent: item.percent,
+    targetPath: item.targetPath ?? null, createdAt: item.createdAt,
+    scheduledAt: item.scheduledAt ?? null, representationId: item.representationId ?? null,
+    audioRepresentationId: item.audioRepresentationId ?? null, detail: item.detail,
+    error: item.error ?? null
+  };
+}
 function pageInfo(page: Page) {
   const values = {
     downloads: ["Downloads", "A clear view of what is moving and what is finished."],
     queue: ["Queue", "Transfers waiting, running, or needing attention."],
-    video: ["Video grabber", "Find exposed media streams and choose an available quality."],
+    video: ["Video grabber", "Inspect one media URL, or grab every media file from one page."],
     settings: ["Settings", "A few useful controls. No decorative switches."]
   };
   return values[page];
@@ -70,6 +97,15 @@ export default function App() {
   const [inspecting, setInspecting] = useState(false);
   const [notice, setNotice] = useState("Ready.");
   const [videoNotice, setVideoNotice] = useState("");
+  // Site grabber (Slice 7): paste-a-page-URL path. The desktop reads
+  // the page's static HTML only, so `grabbed` may miss media that a
+  // login or JavaScript would reveal; the extension sees the live page.
+  const [grabUrl, setGrabUrl] = useState("");
+  const [grabbed, setGrabbed] = useState<GrabItem[]>([]);
+  const [grabChecked, setGrabChecked] = useState<Record<string, boolean>>({});
+  const [grabTruncated, setGrabTruncated] = useState(false);
+  const [grabbing, setGrabbing] = useState(false);
+  const [grabNotice, setGrabNotice] = useState("");
   const [connections, setConnections] = useState(() => readSetting(CONNECTIONS_KEY, 1, [1]));
   const [parallel, setParallel] = useState(() => readSetting(PARALLEL_KEY, 2, [1, 2, 3, 4]));
   const [speedLimit, setSpeedLimit] = useState(() => readSetting(SPEED_LIMIT_KEY, 0, [0, 262144, 524288, 1048576, 2097152, 5242880, 10485760]));
@@ -83,6 +119,10 @@ export default function App() {
   const [ffmpegPath, setFfmpegPath] = useState("ffmpeg");
   const [ffmpegStatus, setFfmpegStatus] = useState("");
   const [ffmpegSaving, setFfmpegSaving] = useState(false);
+  // Mirror of the job list for one-shot startup effects (the durable
+  // store seed below needs the current list without re-running).
+  const itemsRef = useRef(items);
+  useEffect(() => { itemsRef.current = items; }, [items]);
 
   const active = items.filter((item) => item.status === "Downloading" || item.status === "Pausing" || item.status === "Cancelling").length;
   const queued = items.filter((item) => item.status === "Queued").length;
@@ -101,6 +141,26 @@ export default function App() {
   useEffect(() => {
     const timer = window.setInterval(() => setClock(Date.now()), 1000);
     return () => window.clearInterval(timer);
+  }, []);
+
+  // Slice 5: seed the queue from the durable job database on startup,
+  // then send the merged desktop list back so jobs the store does not
+  // know yet (pre-Slice-5 history, queued jobs that never started)
+  // enter the database. Stored rows win by id; local history fills the
+  // rest. Browser-started rows keep coming through the native poll.
+  const seededRef = useRef(false);
+  useEffect(() => {
+    if (seededRef.current) return;
+    seededRef.current = true;
+    void invoke<Array<StoredJob>>("get_jobs").then((rows) => {
+      const stored = rows.filter((row) => row.origin !== "native").map(storedJobToItem);
+      const byId = new Map(itemsRef.current.map((item) => [item.id, item]));
+      for (const item of stored) byId.set(item.id, item);
+      const merged = Array.from(byId.values()).sort((a, b) => b.createdAt - a.createdAt);
+      setItems(merged);
+      const desktop = merged.filter((item) => item.source !== "native");
+      if (desktop.length) void invoke("sync_jobs", { jobs: desktop.map(itemToSyncJob) }).catch(() => {});
+    }).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -213,15 +273,26 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           void invoke("cancel_app_wake", { jobId: item.id }).catch(() => {});
         }
         if (item.kind === "hls") {
-          await invoke("start_hls_download", { jobId: item.id, url: item.url, filename: item.name });
+          // Pass the paused/failed job's target back so the backend
+          // reuses its on-disk checkpoint instead of reserving a fresh
+          // target and restarting from scratch. The returned path is
+          // stored so Cancel works while the job is running.
+          const targetPath = await invoke<string>("start_hls_download", { jobId: item.id, url: item.url, filename: item.name, targetPath: item.targetPath || null, scheduledAt: item.scheduledAt || null });
+          setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, targetPath } : entry));
         } else if (item.kind === "dash") {
-          await invoke("start_dash_download", {
+          // Pass the paused/failed job's target back so the backend
+          // reuses its on-disk checkpoint instead of reserving a fresh
+          // target and restarting from scratch. The returned path is
+          // stored so Pause/Cancel work while the job is running.
+          const targetPath = await invoke<string>("start_dash_download", {
             jobId: item.id, url: item.url, representationId: item.representationId,
-            audioRepresentationId: item.audioRepresentationId || null, filename: item.name
+            audioRepresentationId: item.audioRepresentationId || null, filename: item.name,
+            targetPath: item.targetPath || null, scheduledAt: item.scheduledAt || null
           });
+          setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, targetPath } : entry));
         } else {
           const targetPath = await invoke<string>("start_download", {
-            jobId: item.id, url: item.url, filename: item.name, targetPath: item.targetPath || null, connections
+            jobId: item.id, url: item.url, filename: item.name, targetPath: item.targetPath || null, connections, scheduledAt: item.scheduledAt || null
           });
           setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, targetPath } : entry));
         }
@@ -261,11 +332,15 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     const updated = [item, ...items];
     try { localStorage.setItem(HISTORY_KEY, JSON.stringify(updated)); } catch { /* Queue effect retries persistence. */ }
     setItems(updated);
-    setNotice(scheduledAt ? "Added to queue. Registering Windows wake task…" : "Added to queue.");
+    // Slice 5: record the queued job in the durable store immediately,
+    // so it survives a restart even if it never gets a download slot
+    // before the app closes.
+    void invoke("sync_jobs", { jobs: [itemToSyncJob(item)] }).catch(() => {});
+    setNotice(scheduledAt ? "Added to queue. Registering scheduled wake…" : "Added to queue.");
     if (scheduledAt) {
       void invoke<string>("schedule_app_wake", { jobId: item.id, localDateTime: scheduleAt })
         .then((status) => setNotice(status))
-        .catch((error) => setNotice("Queued locally, but Windows could not register a wake task: " + String(error)));
+        .catch((error) => setNotice("Queued locally, but a scheduled wake task could not be registered: " + String(error)));
     }
     setUrl(""); setFilename(""); setScheduleAt("");
   }
@@ -282,10 +357,11 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     } catch (error) { setNotice(String(error)); }
   }
   async function resume(item: Item) {
-    if (item.source === "native" && item.kind === "direct" && item.targetPath) {
-      if (item.status === "Interrupted") {
+    if (item.source === "native") {
+      if (item.status === "Interrupted" && item.targetPath) {
         // The browser companion has exited. Hand its persistent checkpoint
-        // to the desktop engine so the user can still continue the download.
+        // to the desktop engine so the user can still continue the download
+        // — direct, HLS and DASH checkpoints all live next to the target.
         await invoke("dismiss_native_download", { jobId: item.id.replace(/^native-/, "") }).catch(() => {});
         const recovered: Item = {
           ...item, id: crypto.randomUUID(), source: undefined, status: "Queued",
@@ -295,6 +371,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
         setNotice("Browser checkpoint moved to the desktop queue.");
         return;
       }
+      if (!item.targetPath) { retry(item); return; }
       try {
         await invoke("control_native_download", { jobId: item.id.replace(/^native-/, ""), action: "resume" });
         setItems((current) => current.map((entry) => entry.id === item.id
@@ -303,25 +380,38 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       } catch (error) { setNotice(String(error)); }
       return;
     }
-    if (item.kind !== "direct") { retry(item); return; }
-    setItems((current) => current.map((entry) => entry.id === item.id
-      ? { ...entry, status: "Queued", error: undefined, detail: "Resume queued from saved checkpoint" }
-      : entry));
+    // Desktop direct/HLS/DASH jobs resume the SAME item so the queue
+    // effect passes its targetPath back and the backend reuses the
+    // on-disk checkpoint instead of reserving a fresh target and
+    // restarting from scratch.
+    if (item.targetPath) {
+      setItems((current) => current.map((entry) => entry.id === item.id
+        ? { ...entry, status: "Queued", error: undefined, detail: "Resume queued from saved checkpoint" }
+        : entry));
+      return;
+    }
+    retry(item);
   }
   async function cancel(item: Item) {
     if (item.scheduledAt) {
       await invoke("cancel_app_wake", { jobId: item.id }).catch(() => {});
     }
-    if (item.source === "native" && item.kind === "direct") {
+    if (item.source === "native") {
       try {
-        if (item.status === "Interrupted" && item.targetPath) {
-          // No native process owns this checkpoint anymore; delete it locally.
-          await invoke("cancel_download", { jobId: item.id, targetPath: item.targetPath });
+        if (item.status === "Interrupted") {
+          // No native process owns this job anymore: delete its orphaned
+          // checkpoint locally (if any) and drop its record.
+          if (item.targetPath) {
+            await invoke("cancel_download", { jobId: item.id, targetPath: item.targetPath });
+          }
           await invoke("dismiss_native_download", { jobId: item.id.replace(/^native-/, "") }).catch(() => {});
           setItems((current) => current.map((entry) => entry.id === item.id
             ? { ...entry, status: "Cancelled", targetPath: undefined, downloaded: 0, percent: 0, detail: "Cancelled · checkpoint removed" }
             : entry));
         } else {
+          // Direct, HLS and DASH browser jobs alike: the companion owns
+          // the checkpoint, so cancel goes through its control channel
+          // and the companion deletes its own partial files.
           await invoke("control_native_download", { jobId: item.id.replace(/^native-/, ""), action: "cancel" });
           setItems((current) => current.map((entry) => entry.id === item.id
             ? { ...entry, status: "Cancelling", detail: "Cancelling browser download…" }
@@ -330,8 +420,12 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       } catch (error) { setNotice(String(error)); }
       return;
     }
-    if (item.kind !== "direct" || !item.targetPath) {
+    if (!item.targetPath) {
+      // Queued jobs never started and have nothing on disk: local flip only.
       setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, status: "Cancelled", detail: "Cancelled" } : entry));
+      // Slice 5: the durable row must flip too, or the job would come
+      // back as Queued on the next startup.
+      void invoke("cancel_queued_job", { jobId: item.id }).catch(() => {});
       return;
     }
     try {
@@ -346,28 +440,39 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     if (item?.scheduledAt) {
       await invoke("cancel_app_wake", { jobId: item.id }).catch(() => {});
     }
-    if (item?.source === "native" && item.kind === "direct"
+    // A live browser job is cancelled, not removed: the × button on an
+    // active native job acts as Cancel (all kinds alike).
+    if (item?.source === "native"
         && ["Downloading", "Pausing", "Paused", "Failed"].includes(item.status)) {
       await cancel(item);
       return;
     }
     if (item?.source === "native") {
-      if (item.targetPath && item.status !== "Completed") {
+      // D10: the desktop never deletes a companion-owned checkpoint with
+      // its own cancel_download — only an Interrupted job (no companion
+      // left) has its orphaned files removed locally. Dismissing asks a
+      // live companion to cancel first and waits for it, so the companion
+      // cannot resurrect the record afterwards.
+      if (item.status === "Interrupted" && item.targetPath) {
         await invoke("cancel_download", { jobId: item.id, targetPath: item.targetPath }).catch(() => {});
       }
       await invoke("dismiss_native_download", { jobId: item.id.replace(/^native-/, "") }).catch(() => {});
-    } else if (item?.targetPath && item.kind === "direct" && item.status !== "Completed") {
+    } else if (item?.targetPath && item.status !== "Completed") {
       await invoke("cancel_download", { jobId: item.id, targetPath: item.targetPath }).catch(() => {});
+    }
+    // Slice 5: drop the durable row too, or a removed job would be
+    // re-seeded from the database on the next startup.
+    if (item?.source !== "native") {
+      void invoke("remove_job", { jobId: id }).catch(() => {});
     }
     setItems((current) => current.filter((entry) => entry.id !== id || entry.status === "Downloading" || entry.status === "Pausing"));
   }
   function retry(item: Item) {
-    if (item.source === "native" && item.kind === "direct" && item.targetPath) {
-      void resume(item);
-      return;
-    }
-    if (item.source === "native") { add(item.url, item.name, item.kind, item.representationId, item.audioRepresentationId); return; }
-    if (item.kind === "direct" && item.targetPath) { void resume(item); return; }
+    // A job with a checkpoint on disk resumes from it — a browser job
+    // through its companion, a desktop job through the desktop engine.
+    // Without a checkpoint there is nothing to resume, so a fresh
+    // desktop job is queued instead.
+    if (item.targetPath) { void resume(item); return; }
     add(item.url, item.name, item.kind, item.representationId, item.audioRepresentationId);
   }
   async function clearFinished() {
@@ -376,6 +481,10 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       .map((item) => invoke("cancel_app_wake", { jobId: item.id }).catch(() => {})));
     await Promise.all(finished.filter((item) => item.source === "native")
       .map((item) => invoke("dismiss_native_download", { jobId: item.id.replace(/^native-/, "") }).catch(() => {})));
+    // Slice 5: drop the durable rows too, or cleared jobs would be
+    // re-seeded from the database on the next startup.
+    await Promise.all(finished.filter((item) => item.source !== "native")
+      .map((item) => invoke("remove_job", { jobId: item.id }).catch(() => {})));
     setItems((current) => current.filter((item) => item.status !== "Completed" && item.status !== "Cancelled"));
   }
   async function inspect() {
@@ -388,6 +497,62 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       setVideoNotice(result.length ? result.length + " stream option(s) found." : "No downloadable streams found.");
     } catch (error) { setVideoNotice(String(error)); }
     finally { setInspecting(false); }
+  }
+  function hostOf(value: string) {
+    try { return new URL(value).hostname; } catch { return value; }
+  }
+  async function grabPage() {
+    const clean = grabUrl.trim();
+    if (!/^https?:\/\//i.test(clean)) { setGrabNotice("Paste a valid HTTP or HTTPS page URL."); return; }
+    setGrabbing(true);
+    setGrabNotice("");
+    try {
+      const result = await invoke<GrabResult>("grab_page_media", { pageUrl: clean });
+      setGrabbed(result.items);
+      setGrabTruncated(result.truncated);
+      setGrabChecked(Object.fromEntries(result.items.map((item) => [item.url, true])));
+      setGrabNotice(result.items.length
+        ? ""
+        : "No media links were found in this page's HTML. Pages that need a login or load media with JavaScript need the browser extension instead.");
+    } catch (error) {
+      setGrabbed([]);
+      setGrabTruncated(false);
+      setGrabChecked({});
+      setGrabNotice(String(error));
+    } finally {
+      setGrabbing(false);
+    }
+  }
+  async function downloadGrabbed() {
+    const chosen = grabbed.filter((item) => grabChecked[item.url]);
+    if (!chosen.length) return;
+    setGrabNotice("Queueing " + chosen.length + " item(s)…");
+    let queued = 0;
+    let failed = 0;
+    // Sequential on purpose: each item goes through the same path a
+    // one-off add would take — DASH inspects first and takes the best
+    // quality, HLS and direct files queue directly — so every item
+    // lands in the job store as its own job with its own checkpoint.
+    for (const item of chosen) {
+      try {
+        if (item.kind === "dash") {
+          const result = await invoke<Variant[]>("inspect_video_url", { url: item.url, referer: null });
+          const variants = result.filter((variant) => variant.downloadable && variant.url);
+          variants.sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bandwidth || 0) - (a.bandwidth || 0));
+          const best = variants[0];
+          if (!best) { failed += 1; continue; }
+          add(item.url, item.name, "dash", best.representationId, best.audioRepresentationId);
+        } else if (item.kind === "hls") {
+          add(item.url, item.name, "hls");
+        } else {
+          add(item.url, item.name, "direct");
+        }
+        queued += 1;
+      } catch { failed += 1; }
+    }
+    setGrabNotice(failed
+      ? "Queued " + queued + " of " + chosen.length + " grabbed items (" + failed + " could not be started)."
+      : "Queued " + queued + " grabbed item" + (queued === 1 ? "" : "s") + ".");
   }
   async function saveFfmpegPath() {
     setFfmpegSaving(true);
@@ -450,11 +615,11 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
         {item.error && <div className="error-text">{item.error}</div>}
       </div>
       <div className="transfer-actions">
-        {item.status === "Downloading" && item.kind === "direct" && <button className="quiet-button transfer-control" onClick={() => void pause(item)}>Pause</button>}
+        {item.status === "Downloading" && <button className="quiet-button transfer-control" onClick={() => void pause(item)}>Pause</button>}
         {item.status === "Paused" && <button className="quiet-button transfer-control" onClick={() => resume(item)}>Resume</button>}
-        {(item.status === "Failed" || item.status === "Interrupted") && <button className="quiet-button transfer-control" onClick={() => retry(item)}>{item.kind === "direct" && item.targetPath ? "Resume" : "Retry"}</button>}
-        {(item.status === "Downloading" || item.status === "Pausing" || item.status === "Paused" || item.status === "Failed" || item.status === "Interrupted" || item.status === "Queued") && item.kind === "direct" && <button className="quiet-button transfer-control" onClick={() => void cancel(item)}>Cancel</button>}
-        {item.status !== "Downloading" && item.status !== "Pausing" && item.status !== "Cancelling" && (item.source !== "native" || item.status === "Completed" || item.status === "Cancelled" || item.status === "Failed" || item.status === "Interrupted") && <button className="remove-button" title="Remove" aria-label="Remove" onClick={() => void remove(item.id)}>×</button>}
+        {(item.status === "Failed" || item.status === "Interrupted") && <button className="quiet-button transfer-control" onClick={() => retry(item)}>{item.targetPath ? "Resume" : "Retry"}</button>}
+        {(item.status === "Downloading" || item.status === "Pausing" || item.status === "Paused" || item.status === "Failed" || item.status === "Interrupted" || item.status === "Queued") && <button className="quiet-button transfer-control" onClick={() => void cancel(item)}>Cancel</button>}
+        {item.status !== "Downloading" && item.status !== "Pausing" && item.status !== "Cancelling" && (item.source !== "native" || item.status === "Completed" || item.status === "Cancelled" || item.status === "Failed" || item.status === "Interrupted" || item.status === "Paused") && <button className="remove-button" title="Remove" aria-label="Remove" onClick={() => void remove(item.id)}>×</button>}
       </div>
     </article>)}</div>;
   }
@@ -506,7 +671,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           <div className="summary queue-summary"><div><strong>{active}</strong><span>Active</span></div><div><strong>{queued}</strong><span>Waiting</span></div><div><strong>{done}</strong><span>Completed</span></div><div><strong>{attention}</strong><span>Failed</span></div></div>
           <div className="panel-heading"><div><h2>All transfers</h2><p>Jobs start automatically, up to your active transfer limit.</p></div><button className="quiet-button" onClick={clearFinished}>Clear finished</button></div>
           {transferList(ordered)}
-          <p className="footnote">Direct HTTP downloads keep a partial file on disk. Pause saves a checkpoint, Resume continues with HTTP Range when the server permits it, and startup automatically recovers saved direct-download checkpoints. Scheduled jobs start at their selected local time.</p>
+          <p className="footnote">Direct HTTP, HLS and DASH downloads keep partial files on disk. Pause saves a checkpoint, Resume continues from it, and startup automatically recovers saved checkpoints. Jobs are also recorded in a durable job database, so the queue — including queued and scheduled entries — survives an app restart.</p>
         </section>}
 
         {page === "video" && <section className="panel video-panel">
@@ -523,7 +688,28 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
               <button className="secondary-button" disabled={!variant.downloadable} onClick={() => add(variant.kind === "dash" ? videoUrl : variant.url, "video.mp4", variant.kind === "hls" ? "hls" : variant.kind === "dash" ? "dash" : "direct", variant.representationId, variant.audioRepresentationId)}>{variant.downloadable ? "Download" : "Unavailable"}</button>
             </div>)}
           </div>}
-          <div className="support-note"><strong>Format support</strong><p>Direct HTTP/HTTPS files use resumable transfers. HLS supports completed unencrypted VOD. DASH supports static MPDs with SegmentTemplate/SegmentTimeline; separate audio/video requires FFmpeg. Live/dynamic MPDs, DRM, SegmentBase/SegmentList and multi-period DASH are not supported. A YouTube watch page is not a direct media URL; page extraction is not available in this build.</p></div>
+          <div className="rule" />
+          <div className="variants-heading"><h3>Grab a page</h3><span>SAME-PAGE ONLY · MAX 100</span></div>
+          <p className="footnote">Collect every media file linked from one page — video, audio, playlists, documents and archives. This reads the page's static HTML only, so pages that need a login or load media with JavaScript may show nothing; the browser extension scans the live page instead.</p>
+          <form onSubmit={(event) => { event.preventDefault(); void grabPage(); }}>
+            <label htmlFor="grab-url">Page URL</label>
+            <input id="grab-url" className="field" value={grabUrl} onChange={(event) => setGrabUrl(event.target.value)} placeholder="https://example.com/gallery" />
+            <div className="video-submit"><button className="primary-button" type="submit" disabled={grabbing}>{grabbing ? "Grabbing…" : "Grab page"}</button></div>
+          </form>
+          {grabNotice && <div className="notice">{grabNotice}</div>}
+          {grabbed.length > 0 && <div className="variants">
+            <div className="variants-heading"><h3>Found on this page</h3><span>{grabbed.length} ITEMS</span></div>
+            <div className="grab-actions">
+              <button className="quiet-button" onClick={() => setGrabChecked(Object.fromEntries(grabbed.map((item) => [item.url, true])))}>Select all</button>
+              <button className="quiet-button" onClick={() => setGrabChecked({})}>Select none</button>
+              <button className="primary-button" onClick={() => void downloadGrabbed()} disabled={!grabbed.some((item) => grabChecked[item.url])}>Download selected ({grabbed.filter((item) => grabChecked[item.url]).length})</button>
+            </div>
+            {grabTruncated && <div className="notice">Showing the first 100 items — download in batches, or narrow the page.</div>}
+            {grabbed.map((item) => <div className="variant" key={item.url}>
+              <label className="grab-item"><input type="checkbox" checked={!!grabChecked[item.url]} onChange={(event) => setGrabChecked((current) => ({ ...current, [item.url]: event.target.checked }))} /><span><strong>{item.name}</strong><small>{item.kind.toUpperCase()} · {hostOf(item.url)}</small></span></label>
+            </div>)}
+          </div>}
+          <div className="support-note"><strong>Format support</strong><p>Direct HTTP/HTTPS files use resumable transfers. HLS supports completed unencrypted VOD, with Pause/Resume/Cancel. DASH supports static MPDs with SegmentTemplate/SegmentTimeline, SegmentList, SegmentBase and multi-period, with Pause/Resume/Cancel; separate audio/video requires FFmpeg. Live/dynamic MPDs and DRM are not supported. A YouTube watch page is not a direct media URL; page extraction of its streams is not supported, but "Grab a page" above lists media files a page links to directly.</p></div>
         </section>}
 
         {page === "settings" && <section className="panel settings-panel">
@@ -541,7 +727,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
             <div><h2>DASH video support</h2><p>Static DASH VOD with separate audio/video tracks needs FFmpeg to combine the selected quality into one MP4 file.</p></div>
             <div className="ffmpeg-row">
               <label htmlFor="ffmpeg-path">FFmpeg executable path</label>
-              <input id="ffmpeg-path" className="field" value={ffmpegPath} onChange={(event) => setFfmpegPath(event.target.value)} placeholder="C:\Tools\ffmpeg\bin\ffmpeg.exe or ffmpeg" />
+              <input id="ffmpeg-path" className="field" value={ffmpegPath} onChange={(event) => setFfmpegPath(event.target.value)} placeholder="ffmpeg" />
               <button className="secondary-button" onClick={saveFfmpegPath} disabled={ffmpegSaving}>{ffmpegSaving ? "Checking…" : "Verify & save"}</button>
             </div>
             {ffmpegStatus && <div className="notice native-host-notice">{ffmpegStatus}</div>}
@@ -581,7 +767,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
             {extensionFileStatus && <div className="notice native-host-notice">{extensionFileStatus}</div>}
           </div>
           <div className="rule" />
-          <div className="settings-section"><div><h2>About</h2><p>Local desktop transfer engine · Version 0.2.0</p></div><div className="about-line"><span>Supported media</span><strong>Direct files · HLS VOD · Static DASH VOD</strong></div><div className="about-line"><span>Direct downloads</span><strong>Pause · Resume · Cancel · Speed limit · Schedule</strong></div><div className="about-line"><span>Still in development</span><strong>Multi-connection resume · HLS pause · Live/multi-period DASH</strong></div></div>
+          <div className="settings-section"><div><h2>About</h2><p>Local desktop transfer engine · Version 0.2.0</p></div><div className="about-line"><span>Supported media</span><strong>Direct files · HLS VOD · Static DASH VOD</strong></div><div className="about-line"><span>Direct downloads</span><strong>Pause · Resume · Cancel · Speed limit · Schedule</strong></div><div className="about-line"><span>Still in development</span><strong>Multi-connection resume · Live DASH</strong></div></div>
         </section>}
 
         <footer className="app-footer"><span>ThunderLoad</span><span>Downloads stay on this device.</span></footer>
