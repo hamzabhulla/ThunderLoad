@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf, process::Command, sync::{Arc, Mutex, OnceLock}, time::{Duration, Instant}};
+use std::{collections::HashMap, path::{Path, PathBuf}, process::Command, sync::{Arc, Mutex, OnceLock}, time::{Duration, Instant}};
 use serde_json::{json, Value};
 use tauri::{Emitter, Manager};
 use thunderload_engine::{dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_resumable, download_url_resumable, hls_work_dir, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, DownloadControl, DownloadOutcome, GlobalRateLimiter};
