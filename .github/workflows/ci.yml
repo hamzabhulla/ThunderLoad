@@ -74,3 +74,120 @@ jobs:
             thunderload/dist/extensions/*.xpi
           if-no-files-found: error
           retention-days: 14
+
+  linux-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: thunderload -> target
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install Tauri Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - name: Validate extension
+        run: |
+          node --check thunderload/extension/background.js
+          node --check thunderload/extension/content.js
+          node --check thunderload/extension/popup.js
+          node thunderload/scripts/validate-extension.mjs
+      - name: Package browser extensions
+        # Same packages as the Windows PowerShell step, via the
+        # cross-platform Node packager (same contents and layout).
+        run: node thunderload/scripts/package-extensions.mjs
+      - name: Build native host required by Tauri resources
+        working-directory: thunderload
+        run: |
+          cargo build --release -p thunderload-host
+          # The Tauri resource entry is named thunderload-host.exe (the
+          # Windows binary name); on Linux the built binary has no
+          # extension, so copy it to the expected resource name. The
+          # desktop copies it back out as `thunderload-host` at
+          # registration time.
+          cp target/release/thunderload-host target/release/thunderload-host.exe
+      - name: Check Rust workspace
+        working-directory: thunderload
+        run: cargo check --workspace
+      - name: Test Rust workspace
+        working-directory: thunderload
+        run: cargo test --workspace
+      - name: Install desktop dependencies
+        working-directory: thunderload/desktop
+        run: npm install
+      - name: Build desktop frontend
+        working-directory: thunderload/desktop
+        run: npm run build
+      - name: Build Linux packages
+        working-directory: thunderload/desktop
+        run: npm run tauri -- build
+      - name: Upload preview build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ThunderLoad-preview-linux-${{ github.sha }}
+          path: |
+            thunderload/target/release/bundle/deb/*.deb
+            thunderload/target/release/bundle/appimage/*.AppImage
+            thunderload/target/release/thunderload-host
+            thunderload/dist/extensions/*.zip
+            thunderload/dist/extensions/*.xpi
+          if-no-files-found: error
+          retention-days: 14
+
+  macos-checks:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: thunderload -> target
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Validate extension
+        run: |
+          node --check thunderload/extension/background.js
+          node --check thunderload/extension/content.js
+          node --check thunderload/extension/popup.js
+          node thunderload/scripts/validate-extension.mjs
+      - name: Package browser extensions
+        run: node thunderload/scripts/package-extensions.mjs
+      - name: Build native host required by Tauri resources
+        working-directory: thunderload
+        run: |
+          cargo build --release -p thunderload-host
+          # Same resource-name copy as the Linux job: the Tauri resource
+          # entry is named thunderload-host.exe, the macOS binary has no
+          # extension.
+          cp target/release/thunderload-host target/release/thunderload-host.exe
+      - name: Check Rust workspace
+        working-directory: thunderload
+        run: cargo check --workspace
+      - name: Test Rust workspace
+        working-directory: thunderload
+        run: cargo test --workspace
+      - name: Install desktop dependencies
+        working-directory: thunderload/desktop
+        run: npm install
+      - name: Build desktop frontend
+        working-directory: thunderload/desktop
+        run: npm run build
+      - name: Build macOS package
+        working-directory: thunderload/desktop
+        run: npm run tauri -- build
+      - name: Upload preview build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ThunderLoad-preview-macos-${{ github.sha }}
+          path: |
+            thunderload/target/release/bundle/dmg/*.dmg
+            thunderload/target/release/thunderload-host
+            thunderload/dist/extensions/*.zip
+            thunderload/dist/extensions/*.xpi
+          if-no-files-found: error
+          retention-days: 14
