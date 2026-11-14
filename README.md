@@ -1,10 +1,10 @@
 # ThunderLoad
 
-ThunderLoad is a Windows-first download manager project with a Rust transfer engine, a Tauri desktop client, and browser-specific extensions.
+ThunderLoad is a cross-platform download manager project with a Rust transfer engine, a Tauri desktop client, and browser-specific extensions.
 
 ## Project layout
 - thunderload/engine — Rust HTTP range downloader and HLS/DASH inspection.
-- thunderload/desktop — Tauri + React desktop client and Windows NSIS configuration.
+- thunderload/desktop — Tauri + React desktop client, with NSIS (Windows), deb/AppImage (Linux) and DMG (macOS) configuration.
 - thunderload/extension — Chromium and Firefox extension source.
 - thunderload/native-host — optional local Native Messaging bridge.
 - thunderload/docs — browser distribution, store submission and privacy notes.
