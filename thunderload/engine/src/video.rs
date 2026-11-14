@@ -5,9 +5,8 @@ use std::{path::{Path, PathBuf}, sync::{atomic::{AtomicU64, AtomicUsize, Orderin
 use tokio::{fs, io::AsyncWriteExt, process::Command as TokioCommand, sync::{mpsc, watch}};
 use quick_xml::{events::Event, Reader};
 use futures_util::StreamExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use url::Url;
-use uuid::Uuid;
 use crate::download::{default_download_dir, partial_download_metadata_path, safe_filename, DownloadControl, DownloadOutcome, DownloadProgress, GlobalRateLimiter};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2125,6 +2124,19 @@ pub async fn download_hls_resumable(
     Ok(DownloadOutcome::Completed)
 }
 
+/// The file extension an HLS download of this playlist produces ("mp4"
+/// when an EXT-X-MAP init segment is present, "ts" otherwise). Callers use
+/// it to reserve the target before starting the resumable download,
+/// mirroring `dash_output_extension` — reserving from the caller's filename
+/// alone would misname a TS stream as .mp4.
+pub async fn hls_output_extension(
+    playlist_url: &str,
+    referer: Option<&str>,
+) -> Result<String> {
+    let plan = resolve_hls_plan(playlist_url, referer).await?;
+    Ok(plan.extension)
+}
+
 pub async fn download_hls(
     playlist_url: &str,
     filename: &str,
@@ -2317,6 +2329,14 @@ async fn expand_dash_segment_base(
     Ok((plan.init_url.clone(), plan.init_range, segment_urls, segment_ranges))
 }
 
+/// What one DASH track download finished as: the assembled track file, or
+/// a stop (pause/cancel) observed mid-track — the finished segments stay on
+/// disk for the next call, which skips them via its done-set.
+enum DashTrackOutcome {
+    Assembled(PathBuf),
+    Stopped(DownloadControl),
+}
+
 async fn download_dash_track(
     client: &Client,
     track: &DashResolvedTrack,
@@ -2328,7 +2348,9 @@ async fn download_dash_track(
     downloaded_bytes: Arc<AtomicU64>,
     total_segments: usize,
     rate_limiter: Arc<GlobalRateLimiter>,
-) -> Result<PathBuf> {
+    done: &HashSet<usize>,
+    control: &watch::Receiver<DownloadControl>,
+) -> Result<DashTrackOutcome> {
     let mut refs = Vec::with_capacity(track.segment_urls.len() + usize::from(track.initialization_url.is_some()));
     if let Some(initialization) = &track.initialization_url {
         refs.push((initialization.clone(), track.initialization_range));
@@ -2344,10 +2366,26 @@ async fn download_dash_track(
     if refs.is_empty() { return Err(anyhow!("DASH representation contains no media URLs")); }
 
     let mut tasks = tokio::task::JoinSet::new();
+    let mut stopped: Option<DownloadControl> = None;
     for (index, (segment_url, range)) in refs.into_iter().enumerate() {
+        // Already on disk from an earlier call: the segment file is the
+        // progress record, so it is never re-requested.
+        if done.contains(&index) { continue; }
+        // Copy the value out first: the borrow guard must not be held
+        // across the awaits below (watch::Ref is not Send).
+        let current = *control.borrow();
+        if let control @ (DownloadControl::Paused | DownloadControl::Cancelled) = current {
+            stopped = Some(control);
+            break;
+        }
         let client = client.clone();
         let referrer = referer.map(str::to_string);
         let path = work_dir.join(format!("{prefix}-{index:06}.segment"));
+        // A segment is written to a temporary file and renamed into place
+        // only after its bytes are fully written and validated, so a
+        // partial file can never be mistaken for a finished segment on
+        // resume (the rename is the commit point).
+        let tmp_path = path.with_extension("segment.tmp");
         let tx = progress_tx.clone();
         let completed = completed.clone();
         let downloaded_bytes = downloaded_bytes.clone();
@@ -2384,7 +2422,7 @@ async fn download_dash_track(
                 response.error_for_status()?
             };
             let mut stream = response.bytes_stream();
-            let mut file = fs::File::create(&path).await?;
+            let mut file = fs::File::create(&tmp_path).await?;
             let mut bytes = 0_u64;
             let mut position = 0_u64;
             while let Some(chunk) = stream.next().await {
@@ -2419,6 +2457,10 @@ async fn download_dash_track(
                     return Err(anyhow!("DASH server returned {bytes} bytes for a {expected}-byte segment range"));
                 }
             }
+            // Commit the segment: drop the handle first (Windows cannot
+            // rename an open file), then rename into place.
+            drop(file);
+            fs::rename(&tmp_path, &path).await?;
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
             let transferred = downloaded_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
             let _ = tx.send(DownloadProgress {
@@ -2435,9 +2477,22 @@ async fn download_dash_track(
             }
         }
     }
+    if let Some(stopped) = stopped {
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        return Ok(DashTrackOutcome::Stopped(stopped));
+    }
 
     let mut failures = Vec::new();
     while let Some(result) = tasks.join_next().await {
+        // Copy the value out first: the borrow guard must not be held
+        // across the awaits below (watch::Ref is not Send).
+        let current = *control.borrow();
+        if let control @ (DownloadControl::Paused | DownloadControl::Cancelled) = current {
+            tasks.abort_all();
+            while tasks.join_next().await.is_some() {}
+            return Ok(DashTrackOutcome::Stopped(control));
+        }
         match result {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => failures.push(error),
@@ -2463,7 +2518,7 @@ async fn download_dash_track(
     }
     output.flush().await?;
     drop(output);
-    Ok(assembled)
+    Ok(DashTrackOutcome::Assembled(assembled))
 }
 
 async fn ffmpeg_mux_dash_tracks(
@@ -2518,39 +2573,27 @@ async fn ffmpeg_concat_dash_tracks(files: &[PathBuf], output: &Path) -> Result<(
     Ok(())
 }
 
-/// Downloads one static DASH representation. When the MPD defines separate
-/// audio/video AdaptationSets, both tracks are fetched and stream-copied into a
-/// playable container using FFmpeg. Multi-period MPDs are downloaded period
-/// by period and concatenated with FFmpeg; periods must agree on codec and
-/// dimensions. Dynamic MPDs and DRM are rejected instead of producing a
-/// broken file.
-pub async fn download_dash(
-    manifest_url: &str,
-    representation_id: &str,
-    audio_representation_id: Option<&str>,
-    filename: &str,
-    referer: Option<&str>,
-    progress_tx: mpsc::UnboundedSender<DownloadProgress>,
-    rate_limiter: Arc<GlobalRateLimiter>,
-) -> Result<PathBuf> {
-    let out_dir = default_download_dir();
-    fs::create_dir_all(&out_dir).await?;
-    download_dash_into(
-        manifest_url, representation_id, audio_representation_id, filename,
-        referer, progress_tx, rate_limiter, &out_dir,
-    ).await
+/// A fully resolved static DASH job: every period's video track (and audio
+/// track, when one was requested) with concrete segment URLs, plus whether
+/// more than one period must be concatenated. Self-contained — the parsed
+/// MPD is dropped after resolution — so a checkpoint can be built from it
+/// and a resume can compare a freshly resolved plan against the saved one.
+struct DashPlan {
+    video_tracks: Vec<DashResolvedTrack>,
+    audio_tracks: Vec<DashResolvedTrack>,
+    multi_period: bool,
 }
 
-async fn download_dash_into(
+/// Fetches the MPD, rejects dynamic/live and DRM manifests, resolves every
+/// period's requested representations (expanding SegmentBase sidx indexes),
+/// and checks that the periods agree on codec and dimensions. Shared by the
+/// one-shot download and the resumable download so both see the same plan.
+async fn resolve_dash_plan(
     manifest_url: &str,
     representation_id: &str,
     audio_representation_id: Option<&str>,
-    filename: &str,
     referer: Option<&str>,
-    progress_tx: mpsc::UnboundedSender<DownloadProgress>,
-    rate_limiter: Arc<GlobalRateLimiter>,
-    out_dir: &Path,
-) -> Result<PathBuf> {
+) -> Result<DashPlan> {
     let body = fetch_text(manifest_url, referer).await?;
     let document = parse_dash_document(&body)?;
     if !document.is_static { return Err(anyhow!("Dynamic/live DASH MPDs are not supported")); }
@@ -2590,98 +2633,439 @@ async fn download_dash_into(
         }
     }
     check_dash_period_compat(&video_tracks, &audio_tracks)?;
+    Ok(DashPlan { video_tracks, audio_tracks, multi_period })
+}
 
-    if (audio_representation_id.is_some() || multi_period) && !ffmpeg_available().await {
-        return Err(anyhow!("This DASH download needs FFmpeg (separate audio tracks or multiple periods to concatenate). Install FFmpeg or set THUNDERLOAD_FFMPEG to its executable path, then retry."));
-    }
+/// The file extension a DASH download of these representations produces
+/// ("webm" for a video-only WebM track, "mp4" otherwise — separate audio is
+/// always muxed into MP4). Callers use it to reserve the target before
+/// starting the resumable download, mirroring how `download_hls` resolves
+/// the playlist first so the reserved target gets the right extension.
+pub async fn dash_output_extension(
+    manifest_url: &str,
+    representation_id: &str,
+    audio_representation_id: Option<&str>,
+    referer: Option<&str>,
+) -> Result<String> {
+    let plan = resolve_dash_plan(manifest_url, representation_id, audio_representation_id, referer).await?;
+    let extension = if audio_representation_id.is_some() {
+        "mp4"
+    } else if plan.video_tracks.first().map(|track| track.mime_type.to_ascii_lowercase().contains("webm")).unwrap_or(false) {
+        "webm"
+    } else {
+        "mp4"
+    };
+    Ok(extension.to_string())
+}
 
-    let total_segments = video_tracks.iter()
-        .map(|track| track.segment_urls.len() + usize::from(track.initialization_url.is_some())).sum::<usize>()
-        + audio_tracks.iter()
-        .map(|track| track.segment_urls.len() + usize::from(track.initialization_url.is_some())).sum::<usize>();
-    if total_segments == 0 { return Err(anyhow!("DASH MPD did not produce media segments")); }
+/// Downloads one static DASH representation. When the MPD defines separate
+/// audio/video AdaptationSets, both tracks are fetched and stream-copied into a
+/// playable container using FFmpeg. Multi-period MPDs are downloaded period
+/// by period and concatenated with FFmpeg; periods must agree on codec and
+/// dimensions. Dynamic MPDs and DRM are rejected instead of producing a
+/// broken file.
+pub async fn download_dash(
+    manifest_url: &str,
+    representation_id: &str,
+    audio_representation_id: Option<&str>,
+    filename: &str,
+    referer: Option<&str>,
+    progress_tx: mpsc::UnboundedSender<DownloadProgress>,
+    rate_limiter: Arc<GlobalRateLimiter>,
+) -> Result<PathBuf> {
+    let out_dir = default_download_dir();
+    fs::create_dir_all(&out_dir).await?;
+    download_dash_into(
+        manifest_url, representation_id, audio_representation_id, filename,
+        referer, progress_tx, rate_limiter, &out_dir,
+    ).await
+}
 
+async fn download_dash_into(
+    manifest_url: &str,
+    representation_id: &str,
+    audio_representation_id: Option<&str>,
+    filename: &str,
+    referer: Option<&str>,
+    progress_tx: mpsc::UnboundedSender<DownloadProgress>,
+    rate_limiter: Arc<GlobalRateLimiter>,
+    out_dir: &Path,
+) -> Result<PathBuf> {
+    // One-shot download: a fresh target, a fresh control channel that is
+    // never paused or cancelled, and the old contract — on any failure the
+    // work directory and the reserved target are removed, so a failed call
+    // leaves nothing behind. The resumable engine does the work; a caller
+    // that wants pause/resume uses `download_dash_resumable` directly.
+    let plan = resolve_dash_plan(manifest_url, representation_id, audio_representation_id, referer).await?;
     let track_extension = |mime_type: &str| if mime_type.to_ascii_lowercase().contains("webm") { "webm" } else { "mp4" };
-    let extension = if audio_representation_id.is_some() { "mp4" } else { track_extension(&video_tracks[0].mime_type) };
+    let extension = if audio_representation_id.is_some() { "mp4" } else { track_extension(&plan.video_tracks[0].mime_type) };
     let safe = safe_filename(filename, "video");
     let stem = Path::new(&safe).file_stem().and_then(|value| value.to_str()).unwrap_or("video");
     let target = unique_video_path(out_dir, stem, extension).await?;
-    let work_dir = out_dir.join(format!(".dash-{}", Uuid::new_v4()));
-    let download_result = async {
-        fs::create_dir_all(&work_dir).await?;
-        let completed = Arc::new(AtomicUsize::new(0));
-        let downloaded_bytes = Arc::new(AtomicU64::new(0));
-        let mut video_files = Vec::new();
-        for (index, track) in video_tracks.iter().enumerate() {
-            video_files.push(download_dash_track(
-                &client, track, &work_dir, &format!("video-p{index}"), referer, &progress_tx,
-                completed.clone(), downloaded_bytes.clone(), total_segments, rate_limiter.clone()
-            ).await?);
+    let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
+    let outcome = download_dash_resumable_with_plan(
+        manifest_url, representation_id, audio_representation_id, &target, referer,
+        control_rx, progress_tx, rate_limiter, plan,
+    ).await;
+    drop(control_tx);
+    match outcome {
+        Ok(DownloadOutcome::Completed) => Ok(target),
+        Ok(outcome) => {
+            remove_dash_resume_files(&target).await;
+            Err(anyhow!("DASH download stopped with {outcome:?} before completion"))
         }
-        let mut audio_files = Vec::new();
-        for (index, track) in audio_tracks.iter().enumerate() {
-            audio_files.push(download_dash_track(
-                &client, track, &work_dir, &format!("audio-p{index}"), referer, &progress_tx,
-                completed.clone(), downloaded_bytes.clone(), total_segments, rate_limiter.clone()
-            ).await?);
+        Err(error) => {
+            remove_dash_resume_files(&target).await;
+            Err(error)
         }
+    }
+}
 
-        let video_file = if multi_period {
-            let concatenated = work_dir.join(format!("video-concat.{}", track_extension(&video_tracks[0].mime_type)));
-            ffmpeg_concat_dash_tracks(&video_files, &concatenated).await?;
+/// Stable work directory for one DASH target, mirroring `hls_work_dir`:
+/// segment files live here, so a fresh call — including from a fresh
+/// process — resumes purely from disk.
+pub fn dash_work_dir(target: &Path) -> PathBuf {
+    let extension = target.extension().and_then(|value| value.to_str()).unwrap_or("file");
+    target.with_extension(format!("{extension}.thunderload.dash"))
+}
+
+async fn remove_dash_resume_files(target: &Path) {
+    let _ = fs::remove_dir_all(dash_work_dir(target)).await;
+    let _ = fs::remove_file(partial_download_metadata_path(target)).await;
+    let _ = fs::remove_file(target).await;
+}
+
+/// One resolved DASH track as persisted in the checkpoint: the concrete
+/// segment plan (initialization + media URLs with their byte ranges).
+/// The done-set is NOT stored — a segment counts as done only when its
+/// file is on disk, and segment files are renamed into place only after
+/// their bytes are fully written and validated, so a partial file can
+/// never be mistaken for a finished segment.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct DashCheckpointTrack {
+    mime_type: String,
+    initialization_url: Option<String>,
+    initialization_range: Option<(u64, u64)>,
+    segment_urls: Vec<String>,
+    segment_ranges: Vec<Option<(u64, u64)>>,
+}
+
+impl From<&DashResolvedTrack> for DashCheckpointTrack {
+    fn from(track: &DashResolvedTrack) -> Self {
+        Self {
+            mime_type: track.mime_type.clone(),
+            initialization_url: track.initialization_url.clone(),
+            initialization_range: track.initialization_range,
+            segment_urls: track.segment_urls.clone(),
+            segment_ranges: track.segment_ranges.clone(),
+        }
+    }
+}
+
+/// Everything needed to (re)download one DASH job, persisted as the
+/// checkpoint sidecar next to the target — the same sidecar path HLS uses
+/// (`<target>.thunderload.part.meta.json`); the two never share a target.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DashJobState {
+    version: u32,
+    manifest_url: String,
+    representation_id: String,
+    audio_representation_id: Option<String>,
+    referer: Option<String>,
+    video_tracks: Vec<DashCheckpointTrack>,
+    audio_tracks: Vec<DashCheckpointTrack>,
+    multi_period: bool,
+}
+
+impl DashJobState {
+    fn from_plan(
+        manifest_url: &str,
+        representation_id: &str,
+        audio_representation_id: Option<&str>,
+        referer: Option<&str>,
+        plan: &DashPlan,
+    ) -> Self {
+        Self {
+            version: 1,
+            manifest_url: manifest_url.to_string(),
+            representation_id: representation_id.to_string(),
+            audio_representation_id: audio_representation_id.map(str::to_string),
+            referer: referer.map(str::to_string),
+            video_tracks: plan.video_tracks.iter().map(DashCheckpointTrack::from).collect(),
+            audio_tracks: plan.audio_tracks.iter().map(DashCheckpointTrack::from).collect(),
+            multi_period: plan.multi_period,
+        }
+    }
+
+    fn total_segments(&self) -> usize {
+        self.video_tracks.iter()
+            .map(|track| track.segment_urls.len() + usize::from(track.initialization_url.is_some()))
+            .sum::<usize>()
+            + self.audio_tracks.iter()
+            .map(|track| track.segment_urls.len() + usize::from(track.initialization_url.is_some()))
+            .sum::<usize>()
+    }
+
+    /// A checkpoint is reusable only when it describes exactly the same
+    /// job: same manifest, same representations, same segment plan in the
+    /// same order. Anything else is discarded and the job restarts from
+    /// scratch instead of joining two different files.
+    fn matches_plan(&self, plan: &DashJobState) -> bool {
+        self.version == plan.version
+            && self.manifest_url == plan.manifest_url
+            && self.representation_id == plan.representation_id
+            && self.audio_representation_id == plan.audio_representation_id
+            && self.referer == plan.referer
+            && self.video_tracks == plan.video_tracks
+            && self.audio_tracks == plan.audio_tracks
+            && self.multi_period == plan.multi_period
+    }
+}
+
+async fn write_dash_checkpoint(path: &Path, state: &DashJobState) -> Result<()> {
+    let temporary = path.with_extension("meta.tmp");
+    let bytes = serde_json::to_vec(state)?;
+    fs::write(&temporary, bytes).await?;
+    if fs::try_exists(path).await.unwrap_or(false) {
+        fs::remove_file(path).await?;
+    }
+    fs::rename(&temporary, path).await
+        .with_context(|| format!("Could not save DASH checkpoint at {}", path.display()))?;
+    Ok(())
+}
+
+async fn read_dash_checkpoint(path: &Path) -> Option<DashJobState> {
+    let bytes = fs::read(path).await.ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Segment file for one reference of a track: index 0 is the initialization
+/// segment when the track has one, then the media segments in order.
+fn dash_segment_path(work_dir: &Path, prefix: &str, index: usize) -> PathBuf {
+    work_dir.join(format!("{prefix}-{index:06}.segment"))
+}
+
+/// The references of one track that are already complete on disk: a segment
+/// counts only when its final file exists (in-progress downloads live in a
+/// `.tmp` file until they are renamed into place).
+async fn dash_done_refs(work_dir: &Path, prefix: &str, track: &DashResolvedTrack) -> HashSet<usize> {
+    let count = track.segment_urls.len() + usize::from(track.initialization_url.is_some());
+    let mut done = HashSet::new();
+    for index in 0..count {
+        if fs::try_exists(dash_segment_path(work_dir, prefix, index)).await.unwrap_or(false) {
+            done.insert(index);
+        }
+    }
+    done
+}
+
+/// DASH download with pause/resume/cancel and an on-disk checkpoint,
+/// mirroring `download_hls_resumable`: the manifest URL, chosen
+/// representations and segment plan are persisted next to the target, so a
+/// fresh call — including from a fresh process — resumes from the next
+/// unfinished segment. Cancel removes the partial files. A network error
+/// keeps the checkpoint and the finished segments, so a retry resumes
+/// instead of restarting.
+pub async fn download_dash_resumable(
+    manifest_url: &str,
+    representation_id: &str,
+    audio_representation_id: Option<&str>,
+    target: &Path,
+    referer: Option<&str>,
+    control: watch::Receiver<DownloadControl>,
+    progress_tx: mpsc::UnboundedSender<DownloadProgress>,
+    rate_limiter: Arc<GlobalRateLimiter>,
+) -> Result<DownloadOutcome> {
+    let plan = resolve_dash_plan(manifest_url, representation_id, audio_representation_id, referer).await?;
+    download_dash_resumable_with_plan(
+        manifest_url, representation_id, audio_representation_id, target, referer,
+        control, progress_tx, rate_limiter, plan,
+    ).await
+}
+
+async fn download_dash_resumable_with_plan(
+    manifest_url: &str,
+    representation_id: &str,
+    audio_representation_id: Option<&str>,
+    target: &Path,
+    referer: Option<&str>,
+    control: watch::Receiver<DownloadControl>,
+    progress_tx: mpsc::UnboundedSender<DownloadProgress>,
+    rate_limiter: Arc<GlobalRateLimiter>,
+    plan: DashPlan,
+) -> Result<DownloadOutcome> {
+    if *control.borrow() == DownloadControl::Cancelled {
+        remove_dash_resume_files(target).await;
+        return Ok(DownloadOutcome::Cancelled);
+    }
+    if *control.borrow() == DownloadControl::Paused {
+        return Ok(DownloadOutcome::Paused);
+    }
+    if let Some(parent) = target.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).await?;
+        }
+    }
+    let work_dir = dash_work_dir(target);
+    let meta_path = partial_download_metadata_path(target);
+    let state = DashJobState::from_plan(manifest_url, representation_id, audio_representation_id, referer, &plan);
+    // Reuse a checkpoint only when it describes exactly this job; a
+    // manifest whose segment plan changed restarts from scratch.
+    let reused = matches!(read_dash_checkpoint(&meta_path).await, Some(saved) if saved.matches_plan(&state));
+    if !reused {
+        // No usable checkpoint — fresh job, changed plan, or corrupt
+        // metadata: drop any stale segment files so they can never be
+        // mistaken for this job's output.
+        let _ = fs::remove_dir_all(&work_dir).await;
+        let _ = fs::remove_file(&meta_path).await;
+    }
+    fs::create_dir_all(&work_dir).await?;
+    write_dash_checkpoint(&meta_path, &state).await?;
+
+    if (audio_representation_id.is_some() || plan.multi_period) && !ffmpeg_available().await {
+        return Err(anyhow!("This DASH download needs FFmpeg (separate audio tracks or multiple periods to concatenate). Install FFmpeg or set THUNDERLOAD_FFMPEG to its executable path, then retry."));
+    }
+
+    let client = client()?;
+    let total_segments = state.total_segments();
+    if total_segments == 0 { return Err(anyhow!("DASH MPD did not produce media segments")); }
+    let track_extension = |mime_type: &str| if mime_type.to_ascii_lowercase().contains("webm") { "webm" } else { "mp4" };
+
+    // Progress restarts from the segment files already on disk, not from
+    // zero: count them and their bytes before any track runs.
+    let mut already_completed = 0_usize;
+    let mut already_downloaded = 0_u64;
+    for (kind, tracks) in [("video", &plan.video_tracks), ("audio", &plan.audio_tracks)] {
+        for (period_index, track) in tracks.iter().enumerate() {
+            let prefix = format!("{kind}-p{period_index}");
+            for index in dash_done_refs(&work_dir, &prefix, track).await {
+                already_completed += 1;
+                if let Ok(metadata) = fs::metadata(dash_segment_path(&work_dir, &prefix, index)).await {
+                    already_downloaded = already_downloaded.saturating_add(metadata.len());
+                }
+            }
+        }
+    }
+    let completed = Arc::new(AtomicUsize::new(already_completed));
+    let downloaded_bytes = Arc::new(AtomicU64::new(already_downloaded));
+
+    let mut video_files = Vec::new();
+    for (period_index, track) in plan.video_tracks.iter().enumerate() {
+        let prefix = format!("video-p{period_index}");
+        let done = dash_done_refs(&work_dir, &prefix, track).await;
+        match download_dash_track(
+            &client, track, &work_dir, &prefix, referer, &progress_tx,
+            completed.clone(), downloaded_bytes.clone(), total_segments, rate_limiter.clone(),
+            &done, &control,
+        ).await? {
+            DashTrackOutcome::Assembled(path) => video_files.push(path),
+            DashTrackOutcome::Stopped(stopped) => return Ok(dash_stopped_outcome(stopped, target).await),
+        }
+    }
+    let mut audio_files = Vec::new();
+    for (period_index, track) in plan.audio_tracks.iter().enumerate() {
+        let prefix = format!("audio-p{period_index}");
+        let done = dash_done_refs(&work_dir, &prefix, track).await;
+        match download_dash_track(
+            &client, track, &work_dir, &prefix, referer, &progress_tx,
+            completed.clone(), downloaded_bytes.clone(), total_segments, rate_limiter.clone(),
+            &done, &control,
+        ).await? {
+            DashTrackOutcome::Assembled(path) => audio_files.push(path),
+            DashTrackOutcome::Stopped(stopped) => return Ok(dash_stopped_outcome(stopped, target).await),
+        }
+    }
+
+    // The segment loops are the only place the control is polled while
+    // downloading; check it again around the FFmpeg steps, which can take
+    // seconds. A pause here keeps every segment and the checkpoint, so a
+    // resume redoes only the cheap assembly and mux.
+    if *control.borrow() == DownloadControl::Cancelled {
+        remove_dash_resume_files(target).await;
+        return Ok(DownloadOutcome::Cancelled);
+    }
+    if *control.borrow() == DownloadControl::Paused {
+        return Ok(DownloadOutcome::Paused);
+    }
+    let video_file = if plan.multi_period {
+        let concatenated = work_dir.join(format!("video-concat.{}", track_extension(&plan.video_tracks[0].mime_type)));
+        ffmpeg_concat_dash_tracks(&video_files, &concatenated).await?;
+        concatenated
+    } else {
+        video_files.into_iter().next().unwrap()
+    };
+    if *control.borrow() == DownloadControl::Cancelled {
+        remove_dash_resume_files(target).await;
+        return Ok(DownloadOutcome::Cancelled);
+    }
+    if *control.borrow() == DownloadControl::Paused {
+        return Ok(DownloadOutcome::Paused);
+    }
+    let output_file = if !audio_files.is_empty() {
+        let audio_file = if plan.multi_period {
+            let concatenated = work_dir.join(format!("audio-concat.{}", track_extension(&plan.audio_tracks[0].mime_type)));
+            ffmpeg_concat_dash_tracks(&audio_files, &concatenated).await?;
             concatenated
         } else {
-            video_files.into_iter().next().unwrap()
+            audio_files.into_iter().next().unwrap()
         };
-        let output_file = if !audio_files.is_empty() {
-            let audio_file = if multi_period {
-                let concatenated = work_dir.join(format!("audio-concat.{}", track_extension(&audio_tracks[0].mime_type)));
-                ffmpeg_concat_dash_tracks(&audio_files, &concatenated).await?;
-                concatenated
-            } else {
-                audio_files.into_iter().next().unwrap()
-            };
-            let muxed = work_dir.join("muxed.mp4");
-            ffmpeg_mux_dash_tracks(&video_file, &audio_file, &muxed).await?;
-            muxed
-        } else {
-            video_file
-        };
-
-        let metadata = fs::metadata(&output_file).await?;
-        if metadata.len() == 0 { return Err(anyhow!("DASH assembly produced an empty output file")); }
-        fs::remove_file(&target).await?;
-        fs::rename(&output_file, &target).await
-            .with_context(|| format!("Could not move the assembled DASH file to {}", target.display()))?;
-        let _ = progress_tx.send(DownloadProgress {
-            downloaded: downloaded_bytes.load(Ordering::Relaxed),
-            total: None,
-            percent: Some(100.0),
-            phase: "complete".into(),
-        });
-        Ok::<PathBuf, anyhow::Error>(target.clone())
-    }.await;
-
-    if download_result.is_err() {
-        let _ = fs::remove_dir_all(&work_dir).await;
-        let _ = fs::remove_file(&target).await;
+        let muxed = work_dir.join("muxed.mp4");
+        ffmpeg_mux_dash_tracks(&video_file, &audio_file, &muxed).await?;
+        muxed
     } else {
-        let _ = fs::remove_dir_all(&work_dir).await;
+        video_file
+    };
+    if *control.borrow() == DownloadControl::Cancelled {
+        remove_dash_resume_files(target).await;
+        return Ok(DownloadOutcome::Cancelled);
     }
-    download_result
+    if *control.borrow() == DownloadControl::Paused {
+        return Ok(DownloadOutcome::Paused);
+    }
+
+    let metadata = fs::metadata(&output_file).await?;
+    if metadata.len() == 0 { return Err(anyhow!("DASH assembly produced an empty output file")); }
+    // The target was reserved atomically before downloading. Replace only
+    // our empty reservation after the file is fully assembled.
+    let _ = fs::remove_file(target).await;
+    fs::rename(&output_file, target).await
+        .with_context(|| format!("Could not move the assembled DASH file to {}", target.display()))?;
+    let _ = fs::remove_dir_all(&work_dir).await;
+    let _ = fs::remove_file(&meta_path).await;
+    let _ = progress_tx.send(DownloadProgress {
+        downloaded: downloaded_bytes.load(Ordering::Relaxed),
+        total: None,
+        percent: Some(100.0),
+        phase: "complete".into(),
+    });
+    Ok(DownloadOutcome::Completed)
+}
+
+async fn dash_stopped_outcome(stopped: DownloadControl, target: &Path) -> DownloadOutcome {
+    match stopped {
+        DownloadControl::Paused => DownloadOutcome::Paused,
+        DownloadControl::Cancelled => {
+            remove_dash_resume_files(target).await;
+            DownloadOutcome::Cancelled
+        }
+        DownloadControl::Running => unreachable!("a DASH track only stops on pause or cancel"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        download_dash_into, expand_dash_template, is_complete_vod_playlist, parse_dash_document,
+        dash_output_extension, dash_work_dir, download_dash_into, download_dash_resumable,
+        expand_dash_template, is_complete_vod_playlist, parse_dash_document,
         parse_dash_representations, parse_dash_sidx, parse_hls_master, resolve_dash_track,
-        unsupported_hls_master_reason, unsupported_hls_reason,
+        unsupported_hls_master_reason, unsupported_hls_reason, DashCheckpointTrack, DashJobState,
+        DownloadControl, DownloadOutcome, partial_download_metadata_path,
     };
-    use crate::download::GlobalRateLimiter;
+    use crate::download::{reserve_download_path, GlobalRateLimiter};
     use std::collections::{HashMap, HashSet};
     use std::sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex, RwLock};
-    use tokio::sync::mpsc;
+    use std::time::Duration;
+    use tokio::sync::{mpsc, watch};
     use url::Url;
 
     #[test]
@@ -3153,6 +3537,17 @@ mod tests {
         routes: Arc<RwLock<HashMap<String, Vec<u8>>>>,
         no_range: Arc<HashSet<String>>,
     ) -> (String, Arc<Mutex<HashMap<String, usize>>>, Arc<Mutex<HashMap<String, usize>>>, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+        spawn_dash_server_with_delay(routes, no_range, Duration::ZERO)
+    }
+
+    /// Same fixture with a fixed delay before every GET response, so a
+    /// test can observe progress and pause mid-download instead of racing
+    /// a download that finishes in milliseconds on loopback.
+    fn spawn_dash_server_with_delay(
+        routes: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+        no_range: Arc<HashSet<String>>,
+        response_delay: Duration,
+    ) -> (String, Arc<Mutex<HashMap<String, usize>>>, Arc<Mutex<HashMap<String, usize>>>, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::time::Duration;
@@ -3243,6 +3638,9 @@ mod tests {
                             format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\n\r\n", body.len()).as_bytes(),
                         );
                         response.extend_from_slice(&body);
+                    }
+                    if !response_delay.is_zero() {
+                        std::thread::sleep(response_delay);
                     }
                     if stream.write_all(&response).is_err() { return; }
                 });
@@ -3786,13 +4184,392 @@ mod tests {
         stop_dash_server(shutdown, server);
         tokio::fs::remove_dir_all(out_dir).await.unwrap();
     }
+
+    /// SegmentTemplate MPD for `segment_count` segments: init
+    /// `$RepresentationID$/init.mp4`, media
+    /// `$RepresentationID$/seg-$Number%03d$.m4s`, timeline `r = count - 1`.
+    /// No BaseURL: segment URLs resolve against the manifest URL, so the
+    /// test server serves them.
+    fn dash_segment_template_mpd(segment_count: usize) -> String {
+        format!(r#"<MPD type="static" mediaPresentationDuration="PT{segment_count}S">
+          <Period duration="PT{segment_count}S">
+            <AdaptationSet contentType="video" mimeType="video/mp4">
+              <SegmentTemplate timescale="1" startNumber="1" initialization="$RepresentationID$/init.mp4" media="$RepresentationID$/seg-$Number%03d$.m4s">
+                <SegmentTimeline><S t="0" d="1" r="{}"/></SegmentTimeline>
+              </SegmentTemplate>
+              <Representation id="v1" bandwidth="900000" width="640" height="360"/>
+            </AdaptationSet>
+          </Period>
+        </MPD>"#, segment_count - 1)
+    }
+
+    async fn run_dash_resumable(
+        url: &str,
+        target: &std::path::Path,
+        control_rx: watch::Receiver<DownloadControl>,
+    ) -> anyhow::Result<DownloadOutcome> {
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        download_dash_resumable(url, "v1", None, target, None, control_rx, progress_tx, Arc::new(GlobalRateLimiter::new())).await
+    }
+
+    fn fresh_dash_control() -> (watch::Sender<DownloadControl>, watch::Receiver<DownloadControl>) {
+        watch::channel(DownloadControl::Running)
+    }
+
+    /// Segment file names currently on disk in the DASH work dir (final
+    /// names only — in-progress `.tmp` files do not count). Waits until at
+    /// least `minimum` exist but fewer than `total`, i.e. mid-download.
+    async fn wait_for_dash_segment_files(target: &std::path::Path, minimum: usize, total: usize) -> Vec<String> {
+        let work_dir = dash_work_dir(target);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let mut files = Vec::new();
+            if let Ok(mut entries) = tokio::fs::read_dir(&work_dir).await {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.ends_with(".segment") { files.push(name); }
+                }
+            }
+            files.sort();
+            if files.len() >= minimum && files.len() < total { return files; }
+            assert!(tokio::time::Instant::now() < deadline, "DASH segment files never reached {minimum} of {total} for {}", target.display());
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Maps a DASH work-dir segment file back to the request path it was
+    /// fetched from, for the SegmentTemplate fixture above (ref 0 is the
+    /// init, ref N is seg-N).
+    fn dash_segment_file_to_request_path(name: &str) -> String {
+        let index: usize = name.trim_start_matches("video-p0-").trim_end_matches(".segment").parse().unwrap();
+        if index == 0 { "/v1/init.mp4".to_string() } else { format!("/v1/seg-{index:03}.m4s") }
+    }
+
+    #[tokio::test]
+    async fn dash_pause_mid_download_then_resume_completes_without_re_requesting_finished_segments() {
+        let segment_count = 48;
+        let routes: Arc<RwLock<HashMap<String, Vec<u8>>>> = Arc::new(RwLock::new(HashMap::new()));
+        let (base, counts, _range_counts, shutdown, server) =
+            spawn_dash_server_with_delay(routes.clone(), Arc::new(HashSet::new()), Duration::from_millis(10));
+        let init = b"FAKEINIT".to_vec();
+        let mut expected = init.clone();
+        {
+            let mut map = routes.write().unwrap();
+            map.insert("/v1/init.mp4".into(), init.clone());
+            for index in 1..=segment_count {
+                let body = format!("SEGMENT-{index:03}-DATA").into_bytes();
+                expected.extend_from_slice(&body);
+                map.insert(format!("/v1/seg-{index:03}.m4s"), body);
+            }
+            map.insert("/video.mpd".into(), dash_segment_template_mpd(segment_count).into_bytes());
+        }
+        let directory = std::env::temp_dir().join(format!("thunderload-dash-pause-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("movie.mp4")).await.unwrap();
+        let url = format!("{base}/video.mpd");
+
+        let (control_tx, control_rx) = fresh_dash_control();
+        let task_target = target.clone();
+        let task_url = url.clone();
+        let task = tokio::spawn(async move { run_dash_resumable(&task_url, &task_target, control_rx).await });
+        let done_before_pause = wait_for_dash_segment_files(&target, 1, segment_count + 1).await;
+        assert!(!done_before_pause.is_empty() && done_before_pause.len() < segment_count + 1);
+        control_tx.send(DownloadControl::Paused).unwrap();
+        let outcome = task.await.unwrap().unwrap();
+        assert_eq!(outcome, DownloadOutcome::Paused);
+        assert!(tokio::fs::try_exists(partial_download_metadata_path(&target)).await.unwrap());
+        let counts_after_pause = counts.lock().unwrap().clone();
+        drop(control_tx);
+
+        let (_control_tx, control_rx) = fresh_dash_control();
+        let outcome = run_dash_resumable(&url, &target, control_rx).await.unwrap();
+        assert_eq!(outcome, DownloadOutcome::Completed);
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(bytes, expected);
+        // Segments finished before the pause were not requested again.
+        let counts_after_resume = counts.lock().unwrap().clone();
+        for name in done_before_pause {
+            let key = dash_segment_file_to_request_path(&name);
+            assert_eq!(counts_after_resume.get(&key), counts_after_pause.get(&key),
+                "segment {key} was re-requested after resume");
+        }
+        stop_dash_server(shutdown, server);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dash_error_interrupted_download_resumes_from_disk_checkpoint() {
+        // The last six segments are absent (404) on the first call, so the
+        // download errors after the first batch — keeping its checkpoint
+        // and the finished segments. Which segments finished is read from
+        // disk afterwards, never assumed.
+        let segment_count = 12;
+        let routes: Arc<RwLock<HashMap<String, Vec<u8>>>> = Arc::new(RwLock::new(HashMap::new()));
+        let (base, counts, _range_counts, shutdown, server) =
+            spawn_dash_server(routes.clone(), Arc::new(HashSet::new()));
+        let init = b"FAKEINIT".to_vec();
+        let mut expected = init.clone();
+        let mut missing = Vec::new();
+        {
+            let mut map = routes.write().unwrap();
+            map.insert("/v1/init.mp4".into(), init.clone());
+            for index in 1..=segment_count {
+                let body = format!("SEGMENT-{index:03}-DATA").into_bytes();
+                expected.extend_from_slice(&body);
+                if index <= 6 {
+                    map.insert(format!("/v1/seg-{index:03}.m4s"), body);
+                } else {
+                    missing.push((format!("/v1/seg-{index:03}.m4s"), body));
+                }
+            }
+            map.insert("/video.mpd".into(), dash_segment_template_mpd(segment_count).into_bytes());
+        }
+        let directory = std::env::temp_dir().join(format!("thunderload-dash-error-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("movie.mp4")).await.unwrap();
+        let url = format!("{base}/video.mpd");
+
+        let (control_tx, control_rx) = fresh_dash_control();
+        let task_target = target.clone();
+        let task_url = url.clone();
+        let task = tokio::spawn(async move { run_dash_resumable(&task_url, &task_target, control_rx).await });
+        let result = task.await.unwrap();
+        assert!(result.is_err(), "expected the missing segments to abort the download");
+        assert!(tokio::fs::try_exists(partial_download_metadata_path(&target)).await.unwrap());
+        let done_before_error = wait_for_dash_segment_files(&target, 1, segment_count + 1).await;
+        assert!(!done_before_error.is_empty(), "at least the first batch must have finished before the error");
+        let counts_after_error = counts.lock().unwrap().clone();
+        drop(control_tx);
+
+        // Server recovers; a fresh call (fresh process equivalent) resumes.
+        {
+            let mut map = routes.write().unwrap();
+            for (path, body) in missing { map.insert(path, body); }
+        }
+        let (_control_tx, control_rx) = fresh_dash_control();
+        let outcome = run_dash_resumable(&url, &target, control_rx).await.unwrap();
+        assert_eq!(outcome, DownloadOutcome::Completed);
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(bytes, expected);
+        let counts_after_resume = counts.lock().unwrap().clone();
+        for name in done_before_error {
+            let key = dash_segment_file_to_request_path(&name);
+            assert_eq!(counts_after_resume.get(&key), counts_after_error.get(&key),
+                "segment {key} was re-requested after the error-interrupted resume");
+        }
+        stop_dash_server(shutdown, server);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dash_cancel_removes_partial_files() {
+        let segment_count = 48;
+        let routes: Arc<RwLock<HashMap<String, Vec<u8>>>> = Arc::new(RwLock::new(HashMap::new()));
+        let (base, _counts, _range_counts, shutdown, server) =
+            spawn_dash_server_with_delay(routes.clone(), Arc::new(HashSet::new()), Duration::from_millis(10));
+        let init = b"FAKEINIT".to_vec();
+        {
+            let mut map = routes.write().unwrap();
+            map.insert("/v1/init.mp4".into(), init.clone());
+            for index in 1..=segment_count {
+                map.insert(format!("/v1/seg-{index:03}.m4s"), format!("SEGMENT-{index:03}-DATA").into_bytes());
+            }
+            map.insert("/video.mpd".into(), dash_segment_template_mpd(segment_count).into_bytes());
+        }
+        let directory = std::env::temp_dir().join(format!("thunderload-dash-cancel-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("movie.mp4")).await.unwrap();
+        let url = format!("{base}/video.mpd");
+        let (control_tx, control_rx) = fresh_dash_control();
+        let task_target = target.clone();
+        let task_url = url.clone();
+        let task = tokio::spawn(async move { run_dash_resumable(&task_url, &task_target, control_rx).await });
+        let done = wait_for_dash_segment_files(&target, 1, segment_count + 1).await;
+        assert!(!done.is_empty());
+        control_tx.send(DownloadControl::Cancelled).unwrap();
+        let outcome = task.await.unwrap().unwrap();
+        assert_eq!(outcome, DownloadOutcome::Cancelled);
+        assert!(!tokio::fs::try_exists(&target).await.unwrap());
+        assert!(!tokio::fs::try_exists(dash_work_dir(&target)).await.unwrap());
+        assert!(!tokio::fs::try_exists(partial_download_metadata_path(&target)).await.unwrap());
+        stop_dash_server(shutdown, server);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dash_changed_plan_restarts_from_scratch() {
+        // Pause mid-download, then change the MPD to a different segment
+        // plan (different URLs and bytes). The resume must discard the
+        // stale checkpoint and its segment files and download the new plan
+        // from scratch — never join two different files.
+        let segment_count = 12;
+        let routes: Arc<RwLock<HashMap<String, Vec<u8>>>> = Arc::new(RwLock::new(HashMap::new()));
+        let (base, counts, _range_counts, shutdown, server) =
+            spawn_dash_server_with_delay(routes.clone(), Arc::new(HashSet::new()), Duration::from_millis(10));
+        let init = b"FAKEINIT".to_vec();
+        {
+            let mut map = routes.write().unwrap();
+            map.insert("/v1/init.mp4".into(), init.clone());
+            for index in 1..=segment_count {
+                map.insert(format!("/v1/seg-{index:03}.m4s"), format!("SEGMENT-{index:03}-DATA").into_bytes());
+            }
+            map.insert("/video.mpd".into(), dash_segment_template_mpd(segment_count).into_bytes());
+        }
+        let directory = std::env::temp_dir().join(format!("thunderload-dash-plan-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("movie.mp4")).await.unwrap();
+        let url = format!("{base}/video.mpd");
+        let (control_tx, control_rx) = fresh_dash_control();
+        let task_target = target.clone();
+        let task_url = url.clone();
+        let task = tokio::spawn(async move { run_dash_resumable(&task_url, &task_target, control_rx).await });
+        let done_before_pause = wait_for_dash_segment_files(&target, 1, segment_count + 1).await;
+        assert!(!done_before_pause.is_empty());
+        control_tx.send(DownloadControl::Paused).unwrap();
+        assert_eq!(task.await.unwrap().unwrap(), DownloadOutcome::Paused);
+        let counts_after_pause = counts.lock().unwrap().clone();
+        drop(control_tx);
+
+        let new_init = b"NEW-INIT!".to_vec();
+        let mut new_expected = new_init.clone();
+        {
+            let mut map = routes.write().unwrap();
+            map.insert("/v1/n-init.mp4".into(), new_init.clone());
+            for index in 1..=segment_count {
+                let body = format!("NEW-SEGMENT-{index:03}").into_bytes();
+                new_expected.extend_from_slice(&body);
+                map.insert(format!("/v1/n-{index:03}.m4s"), body);
+            }
+            let mpd = dash_segment_template_mpd(segment_count)
+                .replace("$RepresentationID$/init.mp4", "$RepresentationID$/n-init.mp4")
+                .replace("$RepresentationID$/seg-$Number%03d$.m4s", "$RepresentationID$/n-$Number%03d$.m4s");
+            map.insert("/video.mpd".into(), mpd.into_bytes());
+        }
+        let (_control_tx, control_rx) = fresh_dash_control();
+        let outcome = run_dash_resumable(&url, &target, control_rx).await.unwrap();
+        assert_eq!(outcome, DownloadOutcome::Completed);
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(bytes, new_expected);
+        // The new plan was fetched from scratch: every new segment was
+        // requested exactly once, and no stale segment was reused.
+        let counts_after_resume = counts.lock().unwrap().clone();
+        for index in 1..=segment_count {
+            assert_eq!(counts_after_resume.get(&format!("/v1/n-{index:03}.m4s")), Some(&1));
+        }
+        assert_eq!(counts_after_resume.get("/v1/n-init.mp4"), Some(&1));
+        for name in done_before_pause {
+            let key = dash_segment_file_to_request_path(&name);
+            assert_eq!(counts_after_resume.get(&key), counts_after_pause.get(&key),
+                "stale segment {key} was re-requested after the plan change");
+        }
+        stop_dash_server(shutdown, server);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[test]
+    fn dash_checkpoint_matches_only_the_same_plan() {
+        let track = DashCheckpointTrack {
+            mime_type: "video/mp4".into(),
+            initialization_url: Some("https://cdn.example.test/init.mp4".into()),
+            initialization_range: None,
+            segment_urls: vec!["https://cdn.example.test/seg-1.m4s".into()],
+            segment_ranges: vec![None],
+        };
+        let state = DashJobState {
+            version: 1,
+            manifest_url: "https://cdn.example.test/video.mpd".into(),
+            representation_id: "v1".into(),
+            audio_representation_id: None,
+            referer: None,
+            video_tracks: vec![track.clone()],
+            audio_tracks: vec![],
+            multi_period: false,
+        };
+        assert!(state.matches_plan(&state));
+        let mut changed = state.clone();
+        changed.video_tracks[0].segment_urls = vec!["https://cdn.example.test/seg-9.m4s".into()];
+        assert!(!state.matches_plan(&changed));
+        let mut changed = state.clone();
+        changed.representation_id = "v2".into();
+        assert!(!state.matches_plan(&changed));
+        let mut changed = state.clone();
+        changed.manifest_url = "https://cdn.example.test/other.mpd".into();
+        assert!(!state.matches_plan(&changed));
+    }
+
+    #[tokio::test]
+    async fn dash_output_extension_matches_track_container() {
+        let routes: Arc<RwLock<HashMap<String, Vec<u8>>>> = Arc::new(RwLock::new(HashMap::new()));
+        let (base, _counts, _range_counts, shutdown, server) =
+            spawn_dash_server(routes.clone(), Arc::new(HashSet::new()));
+        let webm_mpd = dash_segment_template_mpd(1).replace("video/mp4", "video/webm");
+        let mp4_mpd = dash_segment_template_mpd(1);
+        let av_mpd = r#"<MPD type="static" mediaPresentationDuration="PT1S">
+          <Period duration="PT1S">
+            <AdaptationSet contentType="video" mimeType="video/webm">
+              <SegmentTemplate timescale="1" startNumber="1" initialization="v1/init.mp4" media="v1/seg-$Number%03d$.m4s">
+                <SegmentTimeline><S t="0" d="1" r="0"/></SegmentTimeline>
+              </SegmentTemplate>
+              <Representation id="v1" bandwidth="900000" width="640" height="360"/>
+            </AdaptationSet>
+            <AdaptationSet contentType="audio" mimeType="audio/mp4">
+              <SegmentTemplate timescale="1" startNumber="1" initialization="a1/init.mp4" media="a1/seg-$Number%03d$.m4s">
+                <SegmentTimeline><S t="0" d="1" r="0"/></SegmentTimeline>
+              </SegmentTemplate>
+              <Representation id="a1" bandwidth="128000"/>
+            </AdaptationSet>
+          </Period>
+        </MPD>"#;
+        {
+            let mut map = routes.write().unwrap();
+            map.insert("/video.mpd".into(), webm_mpd.into_bytes());
+        }
+        assert_eq!(dash_output_extension(&format!("{base}/video.mpd"), "v1", None, None).await.unwrap(), "webm");
+        {
+            let mut map = routes.write().unwrap();
+            map.insert("/video.mpd".into(), mp4_mpd.into_bytes());
+        }
+        assert_eq!(dash_output_extension(&format!("{base}/video.mpd"), "v1", None, None).await.unwrap(), "mp4");
+        {
+            let mut map = routes.write().unwrap();
+            map.insert("/video.mpd".into(), av_mpd.as_bytes().to_vec());
+        }
+        assert_eq!(dash_output_extension(&format!("{base}/video.mpd"), "v1", Some("a1"), None).await.unwrap(), "mp4");
+        stop_dash_server(shutdown, server);
+    }
+
+    #[tokio::test]
+    async fn dash_one_shot_download_removes_partial_files_on_error() {
+        // The one-shot wrapper keeps the old contract: a failed call
+        // leaves no target, work directory, or checkpoint behind.
+        let routes: Arc<RwLock<HashMap<String, Vec<u8>>>> = Arc::new(RwLock::new(HashMap::new()));
+        let (base, _counts, _range_counts, shutdown, server) =
+            spawn_dash_server(routes.clone(), Arc::new(HashSet::new()));
+        {
+            let mut map = routes.write().unwrap();
+            map.insert("/v1/init.mp4".into(), b"FAKEINIT".to_vec());
+            map.insert("/v1/seg-001.m4s".into(), b"SEGMENT-001-DATA".to_vec());
+            map.insert("/video.mpd".into(), dash_segment_template_mpd(2).into_bytes());
+        }
+        let out_dir = dash_test_dir("one-shot-error");
+        tokio::fs::create_dir_all(&out_dir).await.unwrap();
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        let result = download_dash_into(
+            &format!("{base}/video.mpd"), "v1", None, "cleanup-video", None,
+            progress_tx, Arc::new(GlobalRateLimiter::new()), &out_dir,
+        ).await;
+        assert!(result.is_err(), "expected the missing second segment to fail the download");
+        assert!(dash_out_dir_is_empty(&out_dir).await, "a failed one-shot download must not leave files behind");
+        stop_dash_server(shutdown, server);
+        tokio::fs::remove_dir_all(out_dir).await.unwrap();
+    }
 }
 
 
 #[cfg(test)]
 mod hls_download_tests {
     use super::{
-        download_hls_resumable, ffmpeg_available, hls_work_dir,
+        download_hls_resumable, ffmpeg_available, hls_output_extension, hls_work_dir,
         partial_download_metadata_path, validate_hls_content_range,
         DownloadControl, DownloadOutcome, GlobalRateLimiter,
     };
@@ -4089,6 +4866,24 @@ mod hls_download_tests {
         assert!(!tokio::fs::try_exists(partial_download_metadata_path(&target)).await.unwrap());
         stop_server(shutdown, server);
         tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hls_output_extension_matches_playlist_container() {
+        // Plain TS playlist (no EXT-X-MAP) -> "ts"; fMP4 playlist
+        // (EXT-X-MAP init) -> "mp4". The native host reserves the target
+        // from this, so a TS stream is not misnamed .mp4.
+        let (mut routes, _bodies) = segment_routes(2, 64);
+        routes.insert("/ts.m3u8".into(), media_playlist(2).into_bytes());
+        routes.insert("/init.mp4".into(), b"fake-init".to_vec());
+        routes.insert("/seg0.m4s".into(), b"fake-fragment-0".to_vec());
+        routes.insert("/seg1.m4s".into(), b"fake-fragment-1".to_vec());
+        routes.insert("/fmp4.m3u8".into(), fmp4_media_playlist("init.mp4", &["seg0.m4s".to_string(), "seg1.m4s".to_string()]).into_bytes());
+        let (base, _counts, _range_206, shutdown, server) =
+            spawn_hls_server(routes, Duration::ZERO, HlsServerOptions::default());
+        assert_eq!(hls_output_extension(&format!("{base}/ts.m3u8"), None).await.unwrap(), "ts");
+        assert_eq!(hls_output_extension(&format!("{base}/fmp4.m3u8"), None).await.unwrap(), "mp4");
+        stop_server(shutdown, server);
     }
 
     #[tokio::test]
