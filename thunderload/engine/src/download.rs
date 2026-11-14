@@ -3946,9 +3946,28 @@ mod dynamic_segmentation_tests {
                 assert!(worker.ewma_bytes_per_sec > 0.0, "throughput must be measured per worker");
             }
         }
+        // The speed claim is relative, not an absolute wall-clock bound:
+        // a fixed 1 MiB segment on the slow connection needs
+        // 1 MiB / (that connection's measured rate), and the dynamic run
+        // must beat it. The old absolute 900 ms bound was calibrated on
+        // a fast VM and fails on slow CI runners — the macOS runner took
+        // ~2 s for the same run while the whole suite ran ~5x slower —
+        // even though work-sharing itself was correct (skew assertions
+        // above all passed there).
+        let slow_rate = stats
+            .workers
+            .iter()
+            .filter(|worker| worker.chunks_completed > 0)
+            .map(|worker| worker.ewma_bytes_per_sec)
+            .fold(f64::INFINITY, f64::min);
         assert!(
-            elapsed < Duration::from_millis(900),
-            "dynamic run took {elapsed:?}; fixed segmentation needs ~1.6 s on the slow segment"
+            slow_rate.is_finite() && slow_rate > 0.0,
+            "slow connection's measured rate must be positive"
+        );
+        let fixed_floor = Duration::from_secs_f64(1_048_576.0 / slow_rate);
+        assert!(
+            elapsed < fixed_floor,
+            "dynamic run took {elapsed:?}; a fixed 1 MiB segment on the slow connection at {slow_rate:.0} B/s needs {fixed_floor:?}"
         );
         fixture.stop();
         tokio::fs::remove_dir_all(directory).await.unwrap();
