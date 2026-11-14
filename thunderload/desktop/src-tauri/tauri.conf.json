@@ -26,10 +26,11 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": ["nsis", "deb", "appimage", "dmg"],
     "icon": [
       "icons/icon.png",
-      "icons/icon.ico"
+      "icons/icon.ico",
+      "icons/icon.icns"
     ],
     "resources": {
       "../../target/release/thunderload-host.exe": "native-host/thunderload-host.exe",
