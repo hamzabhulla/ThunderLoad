@@ -3,13 +3,13 @@
 **Status: release candidate / not production-ready yet.** This repository contains packaging pipelines, but the tagged Windows build must pass CI and be tested on real machines/browsers before general release. Store approval is decided by each browser vendor.
 
 ## Current source features
-- Desktop direct HTTP/HTTPS transfers use a persistent sidecar checkpoint (`.thunderload.part`). Pause flushes the checkpoint, Resume requests the remaining byte range when the server supports it, and startup recovers direct jobs that were in progress when the app closed.
+- Desktop direct HTTP/HTTPS transfers use a persistent sidecar checkpoint (`.thunderload.part`). Pause flushes the checkpoint, Resume re-requests only the unfinished segments when the server supports byte ranges (falling back to the remaining byte range on the sequential path), and startup recovers direct jobs that were in progress when the app closed.
 - Direct desktop transfers support Pause, Resume, Cancel and an aggregate speed cap shared across active direct, HLS and DASH transfers within each ThunderLoad process.
 - The same saved speed cap is applied to direct segmented/streaming, HLS and DASH segment transfers in the desktop and browser-native processes independently.
 - Queue entries and scheduled start times are stored in desktop local storage. On Windows, each scheduled job registers a one-time Task Scheduler wake task (`WakeToRun` / `StartWhenAvailable`) that launches ThunderLoad when due; it is cancelled when the job starts or is removed. The user must be logged in, and actual wake behavior depends on Windows power settings. Other platforms start scheduled entries while the app is running only.
 - Desktop HLS downloads support completed, unencrypted VOD playlists. HLS does not yet support Pause/Resume/Cancel, separate audio/video muxing, byte-range playlists or live playlists.
 - Browser-started direct and HLS transfers write local status files into `Downloads/ThunderLoad/.native-jobs`. The desktop queue polls these files to show browser job progress and completion. Desktop Pause/Cancel commands do not yet control native-host jobs.
-- The Rust engine retains a parallel byte-range downloader (up to 16 connections), but the checkpointed desktop transfer path currently uses one connection. Multi-connection checkpointing is not implemented.
+- The checkpointed desktop transfer path downloads in parallel segments (up to 8 connections by default) against one preallocated partial file, with per-segment completion persisted in the metadata sidecar — so pause, resume and restart recovery all work for multi-connection downloads. Servers without byte-range support fall back to the single-connection checkpointed path.
 - Automatic scan of media URLs visible on every visited page. The extension watches for video elements and media traffic, and shows a hover-only in-player Download control over each video; the popup lists everything found on the active tab, and Alt+Shift+D still forces a re-scan.
 - A compact, hover-only in-player Download control for supported video elements; no banners. Automatic detection needs broad host access (`<all_urls>` + `webRequest`): the content script must run on every page and the background must observe media traffic to catch streams the DOM scan cannot see. The earlier minimal-permission stance is intentionally given up for this feature.
 - HLS master-playlist quality discovery through the optional desktop native host.
@@ -72,7 +72,7 @@ The extension ID is required because the browser native-messaging allowlist must
 HLS qualities are listed only when exposed by the site. Completed unencrypted HLS VOD playlists can be downloaded; encrypted/DRM streams, byte-range playlists, live playlists and separate audio groups are not supported. Static DASH VOD with SegmentTemplate/SegmentTimeline can be downloaded. Separate audio/video tracks need an external FFmpeg executable for stream-copy muxing. Dynamic/live MPDs, ContentProtection/DRM, SegmentBase/SegmentList and multi-period MPDs are not supported. Blob/MSE-only, cookie-bound and signed URLs may not be exposed or may fail. Parallel connections cannot guarantee a fixed speed multiplier; results depend on server support and bandwidth.
 
 ## Production work still required
-- Durable transactional job database and multi-connection checkpoint resume.
+- Durable transactional job database.
 - HLS pause/resume/cancel, byte-range playlists, fMP4 and separate audio groups.
 - Broader DASH coverage for SegmentList, SegmentBase and multi-period MPDs; DRM remains unsupported by design.
 - Explicit, secure cookie/header handoff for user-authorized sessions.
