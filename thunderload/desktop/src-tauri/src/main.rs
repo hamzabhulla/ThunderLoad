@@ -1,4 +1,6 @@
 use std::{collections::HashMap, path::{Path, PathBuf}, process::Command, sync::{Arc, Mutex, OnceLock}, time::{Duration, Instant}};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use serde_json::{json, Value};
 use tauri::{Emitter, Manager};
 use thunderload_engine::{dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_resumable, download_url_resumable, grab_page_media as engine_grab_page_media, hls_work_dir, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, store_file_name, DownloadControl, DownloadOutcome, GlobalRateLimiter, JobKind, JobOrigin, JobRecord, JobState, JobStore, PageMediaList, SessionHeaders};
@@ -209,6 +211,120 @@ fn powershell_literal(value: &str) -> String {
     value.replace('\'', "''")
 }
 
+/// Scheduled-wake helpers shared by the platform implementations below.
+/// `local_date_time` is always validated with `valid_local_datetime_shape`
+/// ("YYYY-MM-DDTHH:mm") before these run.
+#[cfg(target_os = "macos")]
+fn wake_datetime_parts(local_date_time: &str) -> Option<(u32, u32, u32, u32, u32)> {
+    let year = local_date_time.get(0..4)?.parse().ok()?;
+    let month = local_date_time.get(5..7)?.parse().ok()?;
+    let day = local_date_time.get(8..10)?.parse().ok()?;
+    let hour = local_date_time.get(11..13)?.parse().ok()?;
+    let minute = local_date_time.get(14..16)?.parse().ok()?;
+    Some((year, month, day, hour, minute))
+}
+
+/// Executable to launch at the scheduled time. An AppImage sets $APPIMAGE
+/// to its own image file; `current_exe()` inside an AppImage points at a
+/// path under the (ephemeral) FUSE mount, which is gone after a reboot,
+/// so the image file wins when it is set.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn wake_executable() -> Result<PathBuf, String> {
+    if let Some(image) = std::env::var_os("APPIMAGE") {
+        let image = PathBuf::from(image);
+        if !image.as_os_str().is_empty() {
+            return Ok(image);
+        }
+    }
+    std::env::current_exe().map_err(|error| error.to_string())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn home_dir() -> Result<PathBuf, String> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| "HOME is not available.".to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_exec_arg(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if text
+        .chars()
+        .any(|c| c.is_whitespace() || c == '"' || c == '\\')
+    {
+        format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        text.into_owned()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// systemd user timer + service units for a one-shot wake (Linux).
+/// The timer wakes the machine from suspend when the platform allows it
+/// (`WakeSystem=true`); `Persistent=true` runs a missed launch at the next
+/// login/boot instead of dropping it.
+#[cfg(target_os = "linux")]
+fn systemd_wake_units(executable: &Path, local_date_time: &str) -> (String, String) {
+    let on_calendar = format!("{} {}:00", &local_date_time[..10], &local_date_time[11..16]);
+    let timer = format!(
+        "[Unit]\nDescription=ThunderLoad scheduled launch\n\n[Timer]\nOnCalendar={on_calendar}\nWakeSystem=true\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n"
+    );
+    let service = format!(
+        "[Unit]\nDescription=ThunderLoad scheduled launch\n\n[Service]\nType=oneshot\nExecStart={}\n",
+        systemd_exec_arg(executable)
+    );
+    (timer, service)
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_wake_unit_names(job_id: &str) -> (String, String) {
+    (
+        format!("thunderload-wake-{job_id}.timer"),
+        format!("thunderload-wake-{job_id}.service"),
+    )
+}
+
+/// launchd agent plist for a one-shot scheduled launch (macOS).
+/// launchd has no wake-from-sleep: if the Mac is asleep at the scheduled
+/// time the launch is skipped, which the success message says plainly.
+#[cfg(target_os = "macos")]
+fn launchd_wake_plist(executable: &Path, job_id: &str, local_date_time: &str) -> Option<String> {
+    let (year, month, day, hour, minute) = wake_datetime_parts(local_date_time)?;
+    Some(format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>Label</key>\n  <string>com.thunderload.wake-{job_id}</string>\n  <key>ProgramArguments</key>\n  <array>\n    <string>{}</string>\n  </array>\n  <key>StartCalendarInterval</key>\n  <dict>\n    <key>Year</key>\n    <integer>{year}</integer>\n    <key>Month</key>\n    <integer>{month}</integer>\n    <key>Day</key>\n    <integer>{day}</integer>\n    <key>Hour</key>\n    <integer>{hour}</integer>\n    <key>Minute</key>\n    <integer>{minute}</integer>\n  </dict>\n</dict>\n</plist>\n",
+        xml_escape(&executable.to_string_lossy())
+    ))
+}
+
+/// Current local time in the validated "YYYY-MM-DDTHH:mm" shape, via the
+/// `date` command (present on every Linux desktop and macOS). Used for
+/// the future-time check in `schedule_app_wake`; None when the command is
+/// unavailable, in which case the backends still decide (systemd fires a
+/// past-due timer at once, launchd waits for the next match — both
+/// visible, neither silent).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn local_now_shaped() -> Option<String> {
+    let output = Command::new("date").arg("+%Y-%m-%dT%H:%M").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let now = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if valid_local_datetime_shape(&now) {
+        Some(now)
+    } else {
+        None
+    }
+}
+
 #[tauri::command]
 async fn schedule_app_wake(
     job_id: String,
@@ -220,6 +336,18 @@ async fn schedule_app_wake(
     }
     if !valid_local_datetime_shape(&local_date_time) {
         return Err("Scheduled time must use YYYY-MM-DDTHH:mm local time.".into());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        // The validated shape makes lexicographic comparison chronological.
+        // Windows rejects past times in its PowerShell script; this is the
+        // same check for the systemd/launchd backends.
+        if let Some(now) = local_now_shaped() {
+            if local_date_time <= now {
+                return Err("The scheduled time must be in the future.".into());
+            }
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -256,10 +384,91 @@ async fn schedule_app_wake(
         }
         Ok(format!("Windows wake task registered for {local_date_time}. Wake from sleep depends on your Windows power settings."))
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    {
+        let _ = app;
+        let executable = wake_executable()?;
+        let (timer_name, service_name) = systemd_wake_unit_names(&job_id);
+        let unit_dir = home_dir()?.join(".config").join("systemd").join("user");
+        tokio::fs::create_dir_all(&unit_dir)
+            .await
+            .map_err(|error| error.to_string())?;
+        let (timer, service) = systemd_wake_units(&executable, &local_date_time);
+        let timer_path = unit_dir.join(&timer_name);
+        let service_path = unit_dir.join(&service_name);
+        tokio::fs::write(&timer_path, timer)
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Err(error) = tokio::fs::write(&service_path, service).await {
+            let _ = tokio::fs::remove_file(&timer_path).await;
+            return Err(error.to_string());
+        }
+        let enabled = Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .output()
+            .and_then(|output| {
+                if output.status.success() {
+                    Command::new("systemctl")
+                        .args(["--user", "enable", "--now", &timer_name])
+                        .output()
+                } else {
+                    Ok(output)
+                }
+            });
+        match enabled {
+            Ok(output) if output.status.success() => Ok(format!("Linux wake timer registered for {local_date_time}. Wake from sleep depends on systemd and your power settings.")),
+            Ok(output) => {
+                let _ = tokio::fs::remove_file(&timer_path).await;
+                let _ = tokio::fs::remove_file(&service_path).await;
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                Err(if stderr.is_empty() { "systemd refused the wake timer.".into() } else { format!("systemctl: {stderr}") })
+            }
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&timer_path).await;
+                let _ = tokio::fs::remove_file(&service_path).await;
+                Err(format!("Could not run systemctl: {error}"))
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app;
+        let executable = wake_executable()?;
+        let plist = launchd_wake_plist(&executable, &job_id, &local_date_time)
+            .ok_or_else(|| "Scheduled time must use YYYY-MM-DDTHH:mm local time.".to_string())?;
+        let agent_dir = home_dir()?.join("Library").join("LaunchAgents");
+        tokio::fs::create_dir_all(&agent_dir)
+            .await
+            .map_err(|error| error.to_string())?;
+        let plist_path = agent_dir.join(format!("com.thunderload.wake-{job_id}.plist"));
+        tokio::fs::write(&plist_path, plist)
+            .await
+            .map_err(|error| error.to_string())?;
+        // Unload a previous agent of the same name first: `load` refuses
+        // an already-loaded label.
+        let _ = Command::new("launchctl")
+            .args(["unload", &plist_path.to_string_lossy()])
+            .output();
+        let loaded = Command::new("launchctl")
+            .args(["load", &plist_path.to_string_lossy()])
+            .output();
+        match loaded {
+            Ok(output) if output.status.success() => Ok(format!("macOS scheduled launch registered for {local_date_time}. Note: launchd does not wake a sleeping Mac — the app launches only if the Mac is awake at that time (use `pmset schedule wake` with admin rights to wake it).")),
+            Ok(output) => {
+                let _ = tokio::fs::remove_file(&plist_path).await;
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                Err(if stderr.is_empty() { "launchd refused the scheduled launch.".into() } else { format!("launchctl: {stderr}") })
+            }
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&plist_path).await;
+                Err(format!("Could not run launchctl: {error}"))
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
     {
         let _ = (local_date_time, app);
-        Err("OS-level scheduled launch is currently supported on Windows only.".into())
+        Err("OS-level scheduled launch is not supported on this platform.".into())
     }
 }
 
@@ -284,10 +493,45 @@ async fn cancel_app_wake(job_id: String, app: tauri::AppHandle) -> Result<(), St
         }
         Ok(())
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
     {
         let _ = app;
-        Err("OS-level scheduled launch is currently supported on Windows only.".into())
+        let (timer_name, service_name) = systemd_wake_unit_names(&job_id);
+        // Idempotent by design: disabling a timer that was never
+        // registered exits non-zero, which is not an error here.
+        let _ = Command::new("systemctl")
+            .args(["--user", "disable", "--now", &timer_name])
+            .output();
+        if let Ok(unit_dir) =
+            home_dir().map(|home| home.join(".config").join("systemd").join("user"))
+        {
+            let _ = tokio::fs::remove_file(unit_dir.join(&timer_name)).await;
+            let _ = tokio::fs::remove_file(unit_dir.join(&service_name)).await;
+        }
+        let _ = Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .output();
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app;
+        if let Ok(plist_path) = home_dir().map(|home| {
+            home.join("Library")
+                .join("LaunchAgents")
+                .join(format!("com.thunderload.wake-{job_id}.plist"))
+        }) {
+            let _ = Command::new("launchctl")
+                .args(["unload", &plist_path.to_string_lossy()])
+                .output();
+            let _ = tokio::fs::remove_file(&plist_path).await;
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        let _ = app;
+        Err("OS-level scheduled launch is not supported on this platform.".into())
     }
 }
 
@@ -458,36 +702,130 @@ async fn start_hls_download(
     Ok(target.to_string_lossy().to_string())
 }
 
+/// Chromium-family browsers vs Firefox: the native-messaging manifest
+/// differs (allowed_origins vs allowed_extensions) and so does the
+/// extension-ID format.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeBrowserFamily {
+    Chromium,
+    Firefox,
+}
+
+fn native_browser_family(browser: &str) -> Option<NativeBrowserFamily> {
+    match browser {
+        // No "opera" arm: Opera has no manifest directory in either
+        // native_manifest_dir below, so it is rejected here instead of
+        // failing later with a confusing message.
+        "chrome" | "chromium" | "edge" | "brave" => Some(NativeBrowserFamily::Chromium),
+        "firefox" => Some(NativeBrowserFamily::Firefox),
+        _ => None,
+    }
+}
+
+fn validate_native_extension_id(
+    family: NativeBrowserFamily,
+    extension_id: &str,
+) -> Result<(), String> {
+    match family {
+        NativeBrowserFamily::Firefox => {
+            if extension_id.is_empty()
+                || extension_id.len() > 128
+                || !extension_id
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || "@._+-".contains(ch))
+            {
+                Err("Enter the exact Firefox add-on ID.".into())
+            } else {
+                Ok(())
+            }
+        }
+        NativeBrowserFamily::Chromium => {
+            if extension_id.len() != 32 || !extension_id.chars().all(|ch| ('a'..='p').contains(&ch))
+            {
+                Err("Chromium extension IDs must be exactly 32 characters (a–p).".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+/// The native-messaging manifest, identical on every platform; only the
+/// install location differs (Windows registry, browser config dirs
+/// elsewhere). Chrome docs:
+/// https://developer.chrome.com/docs/extensions/develop/concepts/native-messaging
+/// Firefox docs:
+/// https://developer.mozilla.org/en-US/docs/Mozilla/Add-ons/WebExtensions/Native_messaging
+fn native_host_manifest(
+    family: NativeBrowserFamily,
+    extension_id: &str,
+    host_path: &Path,
+) -> Value {
+    let mut manifest = match family {
+        NativeBrowserFamily::Chromium => {
+            json!({"name":"com.thunderload.host","description":"ThunderLoad local download engine","type":"stdio","allowed_origins":[format!("chrome-extension://{extension_id}/")]})
+        }
+        NativeBrowserFamily::Firefox => {
+            json!({"name":"com.thunderload.host","description":"ThunderLoad local download engine","type":"stdio","allowed_extensions":[extension_id]})
+        }
+    };
+    // Native messaging manifests must contain the absolute executable path.
+    manifest["path"] = json!(host_path.to_string_lossy().to_string());
+    manifest
+}
+
+/// Where a browser looks for native-messaging manifests (Linux).
+#[cfg(target_os = "linux")]
+fn native_manifest_dir(browser: &str, home: &Path) -> Option<PathBuf> {
+    let dir = match browser {
+        "chrome" => home.join(".config/google-chrome/NativeMessagingHosts"),
+        "chromium" => home.join(".config/chromium/NativeMessagingHosts"),
+        "edge" => home.join(".config/microsoft-edge/NativeMessagingHosts"),
+        "brave" => home.join(".config/BraveSoftware/Brave-Browser/NativeMessagingHosts"),
+        "firefox" => home.join(".mozilla/native-messaging-hosts"),
+        _ => return None,
+    };
+    Some(dir)
+}
+
+/// Where a browser looks for native-messaging manifests (macOS).
+#[cfg(target_os = "macos")]
+fn native_manifest_dir(browser: &str, home: &Path) -> Option<PathBuf> {
+    let support = home.join("Library/Application Support");
+    let dir = match browser {
+        "chrome" => support.join("Google/Chrome/NativeMessagingHosts"),
+        "chromium" => support.join("Chromium/NativeMessagingHosts"),
+        "edge" => support.join("Microsoft Edge/NativeMessagingHosts"),
+        "brave" => support.join("BraveSoftware/Brave-Browser/NativeMessagingHosts"),
+        "firefox" => support.join("Mozilla/NativeMessagingHosts"),
+        _ => return None,
+    };
+    Some(dir)
+}
+
 #[tauri::command]
 async fn register_native_host(
     browser: String,
     extension_id: String,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
+    let browser = browser.trim().to_ascii_lowercase();
+    let extension_id = extension_id.trim();
     #[cfg(target_os = "windows")]
     {
-        let browser = browser.trim().to_ascii_lowercase();
-        let extension_id = extension_id.trim();
-        let (registry_path, mut manifest) = match browser.as_str() {
-            "chrome" => (r"HKCU\Software\Google\Chrome\NativeMessagingHosts\com.thunderload.host",
-                json!({"name":"com.thunderload.host","description":"ThunderLoad local download engine","type":"stdio","allowed_origins":[format!("chrome-extension://{extension_id}/")]})),
-            "edge" => (r"HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.thunderload.host",
-                json!({"name":"com.thunderload.host","description":"ThunderLoad local download engine","type":"stdio","allowed_origins":[format!("chrome-extension://{extension_id}/")]})),
-            "brave" => (r"HKCU\Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.thunderload.host",
-                json!({"name":"com.thunderload.host","description":"ThunderLoad local download engine","type":"stdio","allowed_origins":[format!("chrome-extension://{extension_id}/")]})),
-            "firefox" => (r"HKCU\Software\Mozilla\NativeMessagingHosts\com.thunderload.host",
-                json!({"name":"com.thunderload.host","description":"ThunderLoad local download engine","type":"stdio","allowed_extensions":[extension_id]})),
+        let family = native_browser_family(&browser)
+            .ok_or_else(|| "Choose Chrome, Edge, Brave or Firefox.".to_string())?;
+        validate_native_extension_id(family, extension_id)?;
+        let registry_path = match browser.as_str() {
+            "chrome" => r"HKCU\Software\Google\Chrome\NativeMessagingHosts\com.thunderload.host",
+            "edge" => r"HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.thunderload.host",
+            "brave" => {
+                r"HKCU\Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.thunderload.host"
+            }
+            "firefox" => r"HKCU\Software\Mozilla\NativeMessagingHosts\com.thunderload.host",
+            // "chromium" maps to a family above but has no Windows registry path.
             _ => return Err("Choose Chrome, Edge, Brave or Firefox.".into()),
         };
-        if browser == "firefox" {
-            if extension_id.is_empty() || extension_id.len() > 128
-                || !extension_id.chars().all(|ch| ch.is_ascii_alphanumeric() || "@._+-".contains(ch)) {
-                return Err("Enter the exact Firefox add-on ID.".into());
-            }
-        } else if extension_id.len() != 32 || !extension_id.chars().all(|ch| ('a'..='p').contains(&ch)) {
-            return Err("Chromium extension IDs must be exactly 32 characters (a–p).".into());
-        }
-
         let resource_dir = app.path().resource_dir().map_err(|error| error.to_string())?;
         let source = resource_dir.join("native-host").join("thunderload-host.exe");
         if !source.is_file() {
@@ -499,9 +837,8 @@ async fn register_native_host(
         std::fs::create_dir_all(&install_dir).map_err(|error| error.to_string())?;
         let host_path = install_dir.join("thunderload-host.exe");
         std::fs::copy(&source, &host_path).map_err(|error| format!("Could not install native host: {error}"))?;
+        let manifest = native_host_manifest(family, extension_id, &host_path);
         let manifest_path = install_dir.join(format!("{browser}-native-host.json"));
-        // Native messaging manifests must contain the absolute executable path.
-        manifest["path"] = json!(host_path.to_string_lossy().to_string());
         let bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?;
         std::fs::write(&manifest_path, bytes).map_err(|error| format!("Could not write native host manifest: {error}"))?;
         let status = Command::new("reg").args([
@@ -511,10 +848,54 @@ async fn register_native_host(
         if !status.success() { return Err("Windows refused to register the ThunderLoad native host.".into()); }
         Ok(format!("{browser} native host registered. Restart the browser and grant Native messaging permission in the extension popup."))
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let family = native_browser_family(&browser)
+            .ok_or_else(|| "Choose Chrome, Chromium, Edge, Brave or Firefox.".to_string())?;
+        validate_native_extension_id(family, extension_id)?;
+        let home = home_dir()?;
+        let manifest_dir = native_manifest_dir(&browser, &home)
+            .ok_or_else(|| "Choose Chrome, Chromium, Edge, Brave or Firefox.".to_string())?;
+        // The bundled resource keeps the Windows file name
+        // (thunderload-host.exe): on Linux/macOS the build copies the
+        // platform binary to that resource name, and registration installs
+        // it under its native name.
+        let resource_dir = app
+            .path()
+            .resource_dir()
+            .map_err(|error| error.to_string())?;
+        let source = resource_dir
+            .join("native-host")
+            .join("thunderload-host.exe");
+        if !source.is_file() {
+            return Err(format!(
+                "Native host binary was not found: {}",
+                source.display()
+            ));
+        }
+        let install_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|error| error.to_string())?
+            .join("native-host");
+        std::fs::create_dir_all(&install_dir).map_err(|error| error.to_string())?;
+        let host_path = install_dir.join("thunderload-host");
+        std::fs::copy(&source, &host_path)
+            .map_err(|error| format!("Could not install native host: {error}"))?;
+        std::fs::set_permissions(&host_path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|error| error.to_string())?;
+        let manifest = native_host_manifest(family, extension_id, &host_path);
+        let manifest_path = manifest_dir.join("com.thunderload.host.json");
+        std::fs::create_dir_all(&manifest_dir).map_err(|error| error.to_string())?;
+        let bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?;
+        std::fs::write(&manifest_path, bytes)
+            .map_err(|error| format!("Could not write native host manifest: {error}"))?;
+        Ok(format!("{browser} native host registered. Restart the browser and grant Native messaging permission in the extension popup."))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
     {
         let _ = (browser, extension_id, app);
-        Err("Browser native-host setup is currently supported by the Windows installer only.".into())
+        Err("Browser native-host setup is not supported on this platform.".into())
     }
 }
 
@@ -1133,14 +1514,23 @@ fn main() {
         .expect("error while running ThunderLoad desktop app");
 }
 
-
 #[cfg(test)]
 mod scheduler_tests {
+    #[cfg(target_os = "macos")]
+    use super::{launchd_wake_plist, wake_datetime_parts, xml_escape};
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use super::{local_now_shaped, wake_executable};
     use super::{powershell_literal, valid_local_datetime_shape, valid_scheduler_job_id};
+    #[cfg(target_os = "linux")]
+    use super::{systemd_exec_arg, systemd_wake_unit_names, systemd_wake_units};
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn scheduler_job_ids_allow_only_short_safe_identifiers() {
-        assert!(valid_scheduler_job_id("9fa8dd1a-69a1-43d2-9fa4-10b4c2b0ad32"));
+        assert!(valid_scheduler_job_id(
+            "9fa8dd1a-69a1-43d2-9fa4-10b4c2b0ad32"
+        ));
         assert!(valid_scheduler_job_id("download-42"));
         assert!(!valid_scheduler_job_id(""));
         assert!(!valid_scheduler_job_id("name'; Start-Process calc; '"));
@@ -1158,6 +1548,243 @@ mod scheduler_tests {
 
     #[test]
     fn powershell_literals_escape_single_quotes() {
-        assert_eq!(powershell_literal("C:\\Tools\\User's App\\ThunderLoad.exe"), "C:\\Tools\\User''s App\\ThunderLoad.exe");
+        assert_eq!(
+            powershell_literal("C:\\Tools\\User's App\\ThunderLoad.exe"),
+            "C:\\Tools\\User''s App\\ThunderLoad.exe"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn wake_datetime_parts_split_the_local_format() {
+        assert_eq!(
+            wake_datetime_parts("2026-11-15T10:30"),
+            Some((2026, 11, 15, 10, 30))
+        );
+        assert_eq!(
+            wake_datetime_parts("2026-01-02T03:04"),
+            Some((2026, 1, 2, 3, 4))
+        );
+        assert_eq!(wake_datetime_parts("2026/11/15 10:30"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn systemd_units_carry_wake_and_persistent() {
+        let (timer, service) =
+            systemd_wake_units(Path::new("/usr/bin/thunderload"), "2026-11-15T10:30");
+        assert!(timer.contains("OnCalendar=2026-11-15 10:30:00"));
+        assert!(timer.contains("WakeSystem=true"));
+        assert!(timer.contains("Persistent=true"));
+        assert!(timer.contains("WantedBy=timers.target"));
+        assert!(service.contains("ExecStart=/usr/bin/thunderload"));
+        assert!(service.contains("Type=oneshot"));
+        let (timer_name, service_name) = systemd_wake_unit_names("job-1");
+        assert_eq!(timer_name, "thunderload-wake-job-1.timer");
+        assert_eq!(service_name, "thunderload-wake-job-1.service");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn systemd_exec_arg_quotes_paths_with_spaces() {
+        assert_eq!(
+            systemd_exec_arg(Path::new("/opt/Thunder Load/thunderload")),
+            "\"/opt/Thunder Load/thunderload\""
+        );
+        assert_eq!(
+            systemd_exec_arg(Path::new("/usr/bin/thunderload")),
+            "/usr/bin/thunderload"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launchd_plist_carries_the_calendar_interval() {
+        let plist = launchd_wake_plist(
+            Path::new("/Applications/ThunderLoad.app/Contents/MacOS/thunderload"),
+            "job-1",
+            "2026-11-15T10:30",
+        )
+        .expect("valid datetime");
+        assert!(plist.contains("<string>com.thunderload.wake-job-1</string>"));
+        assert!(plist
+            .contains("<string>/Applications/ThunderLoad.app/Contents/MacOS/thunderload</string>"));
+        assert!(plist.contains("<key>Year</key>\n    <integer>2026</integer>"));
+        assert!(plist.contains("<key>Month</key>\n    <integer>11</integer>"));
+        assert!(plist.contains("<key>Day</key>\n    <integer>15</integer>"));
+        assert!(plist.contains("<key>Hour</key>\n    <integer>10</integer>"));
+        assert!(plist.contains("<key>Minute</key>\n    <integer>30</integer>"));
+        assert!(launchd_wake_plist(Path::new("/bin/true"), "job-1", "2026/11/15 10:30").is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn xml_escape_covers_ampersand_and_brackets() {
+        assert_eq!(xml_escape("a & b <c> d"), "a &amp; b &lt;c&gt; d");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn local_now_shaped_matches_the_schedule_format() {
+        let now = local_now_shaped().expect("date command available");
+        assert!(valid_local_datetime_shape(&now));
+        // The validated shape is chronological under lexicographic order,
+        // which is what the future-time check relies on.
+        assert!("2000-01-01T00:00" < now.as_str());
+        assert!("2999-01-01T00:00" > now.as_str());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn wake_executable_prefers_appimage_env() {
+        // No other test reads APPIMAGE, so save/restore here is safe.
+        let previous = std::env::var_os("APPIMAGE");
+        std::env::set_var("APPIMAGE", "/opt/ThunderLoad.AppImage");
+        let resolved = wake_executable().expect("APPIMAGE set");
+        assert_eq!(resolved, PathBuf::from("/opt/ThunderLoad.AppImage"));
+        match previous {
+            Some(value) => std::env::set_var("APPIMAGE", value),
+            None => std::env::remove_var("APPIMAGE"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_host_tests {
+    use super::{
+        native_browser_family, native_host_manifest, validate_native_extension_id,
+        NativeBrowserFamily,
+    };
+    use std::path::Path;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use std::path::PathBuf;
+
+    #[test]
+    fn browser_family_maps_chromium_and_firefox() {
+        assert_eq!(
+            native_browser_family("chrome"),
+            Some(NativeBrowserFamily::Chromium)
+        );
+        assert_eq!(
+            native_browser_family("chromium"),
+            Some(NativeBrowserFamily::Chromium)
+        );
+        assert_eq!(
+            native_browser_family("edge"),
+            Some(NativeBrowserFamily::Chromium)
+        );
+        assert_eq!(
+            native_browser_family("brave"),
+            Some(NativeBrowserFamily::Chromium)
+        );
+        assert_eq!(
+            native_browser_family("firefox"),
+            Some(NativeBrowserFamily::Firefox)
+        );
+        assert_eq!(native_browser_family("safari"), None);
+        // Opera maps to no family: no manifest directory is known for it.
+        assert_eq!(native_browser_family("opera"), None);
+        assert_eq!(native_browser_family(""), None);
+    }
+
+    #[test]
+    fn extension_id_rules_match_the_windows_command() {
+        // Chromium IDs: exactly 32 chars a–p.
+        assert!(validate_native_extension_id(
+            NativeBrowserFamily::Chromium,
+            "abcdefghijklmnopabcdefghijklmnop"
+        )
+        .is_ok());
+        assert!(validate_native_extension_id(
+            NativeBrowserFamily::Chromium,
+            "abcdefghijklmnopabcdefghijklmnopq"
+        )
+        .is_err());
+        assert!(validate_native_extension_id(
+            NativeBrowserFamily::Chromium,
+            "abcdefghijklmnopabcdefghijklmnoq"
+        )
+        .is_err());
+        // Firefox IDs: 1–128 chars, alphanumerics plus @._+-
+        assert!(validate_native_extension_id(
+            NativeBrowserFamily::Firefox,
+            "thunderload@example.com"
+        )
+        .is_ok());
+        assert!(validate_native_extension_id(NativeBrowserFamily::Firefox, "").is_err());
+        assert!(validate_native_extension_id(NativeBrowserFamily::Firefox, "bad id!").is_err());
+    }
+
+    #[test]
+    fn manifest_shape_is_chromium_or_firefox() {
+        let chromium = native_host_manifest(
+            NativeBrowserFamily::Chromium,
+            "abcdefghijklmnopabcdefghijklmnop",
+            Path::new("/home/u/.local/share/com.thunderload.desktop/native-host/thunderload-host"),
+        );
+        assert_eq!(chromium["name"], "com.thunderload.host");
+        assert_eq!(chromium["type"], "stdio");
+        assert_eq!(
+            chromium["allowed_origins"][0],
+            "chrome-extension://abcdefghijklmnopabcdefghijklmnop/"
+        );
+        assert_eq!(
+            chromium["path"],
+            "/home/u/.local/share/com.thunderload.desktop/native-host/thunderload-host"
+        );
+        let firefox = native_host_manifest(
+            NativeBrowserFamily::Firefox,
+            "thunderload@example.com",
+            Path::new("/opt/thunderload-host"),
+        );
+        assert_eq!(firefox["allowed_extensions"][0], "thunderload@example.com");
+        assert_eq!(firefox["path"], "/opt/thunderload-host");
+        assert!(firefox.get("allowed_origins").is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_manifest_dirs_match_the_browser_docs() {
+        use super::native_manifest_dir;
+        let home = Path::new("/home/u");
+        assert_eq!(
+            native_manifest_dir("chrome", home).unwrap(),
+            PathBuf::from("/home/u/.config/google-chrome/NativeMessagingHosts")
+        );
+        assert_eq!(
+            native_manifest_dir("chromium", home).unwrap(),
+            PathBuf::from("/home/u/.config/chromium/NativeMessagingHosts")
+        );
+        assert_eq!(
+            native_manifest_dir("edge", home).unwrap(),
+            PathBuf::from("/home/u/.config/microsoft-edge/NativeMessagingHosts")
+        );
+        assert_eq!(
+            native_manifest_dir("brave", home).unwrap(),
+            PathBuf::from("/home/u/.config/BraveSoftware/Brave-Browser/NativeMessagingHosts")
+        );
+        assert_eq!(
+            native_manifest_dir("firefox", home).unwrap(),
+            PathBuf::from("/home/u/.mozilla/native-messaging-hosts")
+        );
+        assert_eq!(native_manifest_dir("safari", home), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_manifest_dirs_match_the_browser_docs() {
+        use super::native_manifest_dir;
+        let home = Path::new("/Users/u");
+        assert_eq!(
+            native_manifest_dir("chrome", home).unwrap(),
+            PathBuf::from(
+                "/Users/u/Library/Application Support/Google/Chrome/NativeMessagingHosts"
+            )
+        );
+        assert_eq!(
+            native_manifest_dir("firefox", home).unwrap(),
+            PathBuf::from("/Users/u/Library/Application Support/Mozilla/NativeMessagingHosts")
+        );
+        assert_eq!(native_manifest_dir("safari", home), None);
     }
 }
