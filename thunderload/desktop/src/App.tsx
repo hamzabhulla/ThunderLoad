@@ -28,7 +28,7 @@ function readItems(): Item[] {
     return saved.map((item: Item) => item.source === "native"
       ? item
       : item.status === "Downloading" || item.status === "Pausing"
-        ? (item.kind === "direct" || item.kind === "hls") && item.targetPath
+        ? item.targetPath
           ? { ...item, status: "Queued", detail: "Recovering saved partial download…" }
           : { ...item, status: "Interrupted", detail: "App closed before a resumable checkpoint was created" }
         : item);
@@ -220,10 +220,16 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           const targetPath = await invoke<string>("start_hls_download", { jobId: item.id, url: item.url, filename: item.name, targetPath: item.targetPath || null });
           setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, targetPath } : entry));
         } else if (item.kind === "dash") {
-          await invoke("start_dash_download", {
+          // Pass the paused/failed job's target back so the backend
+          // reuses its on-disk checkpoint instead of reserving a fresh
+          // target and restarting from scratch. The returned path is
+          // stored so Pause/Cancel work while the job is running.
+          const targetPath = await invoke<string>("start_dash_download", {
             jobId: item.id, url: item.url, representationId: item.representationId,
-            audioRepresentationId: item.audioRepresentationId || null, filename: item.name
+            audioRepresentationId: item.audioRepresentationId || null, filename: item.name,
+            targetPath: item.targetPath || null
           });
+          setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, targetPath } : entry));
         } else {
           const targetPath = await invoke<string>("start_download", {
             jobId: item.id, url: item.url, filename: item.name, targetPath: item.targetPath || null, connections
@@ -287,10 +293,11 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     } catch (error) { setNotice(String(error)); }
   }
   async function resume(item: Item) {
-    if (item.source === "native" && item.kind === "direct" && item.targetPath) {
-      if (item.status === "Interrupted") {
+    if (item.source === "native") {
+      if (item.status === "Interrupted" && item.targetPath) {
         // The browser companion has exited. Hand its persistent checkpoint
-        // to the desktop engine so the user can still continue the download.
+        // to the desktop engine so the user can still continue the download
+        // — direct, HLS and DASH checkpoints all live next to the target.
         await invoke("dismiss_native_download", { jobId: item.id.replace(/^native-/, "") }).catch(() => {});
         const recovered: Item = {
           ...item, id: crypto.randomUUID(), source: undefined, status: "Queued",
@@ -300,6 +307,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
         setNotice("Browser checkpoint moved to the desktop queue.");
         return;
       }
+      if (!item.targetPath) { retry(item); return; }
       try {
         await invoke("control_native_download", { jobId: item.id.replace(/^native-/, ""), action: "resume" });
         setItems((current) => current.map((entry) => entry.id === item.id
@@ -308,36 +316,38 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       } catch (error) { setNotice(String(error)); }
       return;
     }
-    // Desktop HLS jobs resume the SAME item so the queue effect passes
-    // its targetPath back and the backend reuses the on-disk checkpoint
-    // instead of reserving a fresh target and restarting from scratch.
-    // Browser-started HLS jobs have no desktop control channel yet, so
-    // they keep the retry path (unified browser-job controls are Slice 4).
-    if (item.kind === "hls" && item.targetPath && item.source !== "native") {
+    // Desktop direct/HLS/DASH jobs resume the SAME item so the queue
+    // effect passes its targetPath back and the backend reuses the
+    // on-disk checkpoint instead of reserving a fresh target and
+    // restarting from scratch.
+    if (item.targetPath) {
       setItems((current) => current.map((entry) => entry.id === item.id
         ? { ...entry, status: "Queued", error: undefined, detail: "Resume queued from saved checkpoint" }
         : entry));
       return;
     }
-    if (item.kind !== "direct") { retry(item); return; }
-    setItems((current) => current.map((entry) => entry.id === item.id
-      ? { ...entry, status: "Queued", error: undefined, detail: "Resume queued from saved checkpoint" }
-      : entry));
+    retry(item);
   }
   async function cancel(item: Item) {
     if (item.scheduledAt) {
       await invoke("cancel_app_wake", { jobId: item.id }).catch(() => {});
     }
-    if (item.source === "native" && item.kind === "direct") {
+    if (item.source === "native") {
       try {
-        if (item.status === "Interrupted" && item.targetPath) {
-          // No native process owns this checkpoint anymore; delete it locally.
-          await invoke("cancel_download", { jobId: item.id, targetPath: item.targetPath });
+        if (item.status === "Interrupted") {
+          // No native process owns this job anymore: delete its orphaned
+          // checkpoint locally (if any) and drop its record.
+          if (item.targetPath) {
+            await invoke("cancel_download", { jobId: item.id, targetPath: item.targetPath });
+          }
           await invoke("dismiss_native_download", { jobId: item.id.replace(/^native-/, "") }).catch(() => {});
           setItems((current) => current.map((entry) => entry.id === item.id
             ? { ...entry, status: "Cancelled", targetPath: undefined, downloaded: 0, percent: 0, detail: "Cancelled · checkpoint removed" }
             : entry));
         } else {
+          // Direct, HLS and DASH browser jobs alike: the companion owns
+          // the checkpoint, so cancel goes through its control channel
+          // and the companion deletes its own partial files.
           await invoke("control_native_download", { jobId: item.id.replace(/^native-/, ""), action: "cancel" });
           setItems((current) => current.map((entry) => entry.id === item.id
             ? { ...entry, status: "Cancelling", detail: "Cancelling browser download…" }
@@ -346,10 +356,8 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       } catch (error) { setNotice(String(error)); }
       return;
     }
-    if (item.source === "native" || (item.kind !== "direct" && item.kind !== "hls") || !item.targetPath) {
-      // Browser-started jobs have no desktop control channel yet
-      // (Slice 4), queued jobs never started, and other kinds have
-      // nothing on disk for the backend to cancel: local flip only.
+    if (!item.targetPath) {
+      // Queued jobs never started and have nothing on disk: local flip only.
       setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, status: "Cancelled", detail: "Cancelled" } : entry));
       return;
     }
@@ -365,28 +373,34 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     if (item?.scheduledAt) {
       await invoke("cancel_app_wake", { jobId: item.id }).catch(() => {});
     }
-    if (item?.source === "native" && item.kind === "direct"
+    // A live browser job is cancelled, not removed: the × button on an
+    // active native job acts as Cancel (all kinds alike).
+    if (item?.source === "native"
         && ["Downloading", "Pausing", "Paused", "Failed"].includes(item.status)) {
       await cancel(item);
       return;
     }
     if (item?.source === "native") {
-      if (item.targetPath && item.status !== "Completed") {
+      // D10: the desktop never deletes a companion-owned checkpoint with
+      // its own cancel_download — only an Interrupted job (no companion
+      // left) has its orphaned files removed locally. Dismissing asks a
+      // live companion to cancel first and waits for it, so the companion
+      // cannot resurrect the record afterwards.
+      if (item.status === "Interrupted" && item.targetPath) {
         await invoke("cancel_download", { jobId: item.id, targetPath: item.targetPath }).catch(() => {});
       }
       await invoke("dismiss_native_download", { jobId: item.id.replace(/^native-/, "") }).catch(() => {});
-    } else if (item?.targetPath && (item.kind === "direct" || item.kind === "hls") && item.status !== "Completed") {
+    } else if (item?.targetPath && item.status !== "Completed") {
       await invoke("cancel_download", { jobId: item.id, targetPath: item.targetPath }).catch(() => {});
     }
     setItems((current) => current.filter((entry) => entry.id !== id || entry.status === "Downloading" || entry.status === "Pausing"));
   }
   function retry(item: Item) {
-    if (item.source === "native" && item.kind === "direct" && item.targetPath) {
-      void resume(item);
-      return;
-    }
-    if (item.source === "native") { add(item.url, item.name, item.kind, item.representationId, item.audioRepresentationId); return; }
-    if ((item.kind === "direct" || item.kind === "hls") && item.targetPath) { void resume(item); return; }
+    // A job with a checkpoint on disk resumes from it — a browser job
+    // through its companion, a desktop job through the desktop engine.
+    // Without a checkpoint there is nothing to resume, so a fresh
+    // desktop job is queued instead.
+    if (item.targetPath) { void resume(item); return; }
     add(item.url, item.name, item.kind, item.representationId, item.audioRepresentationId);
   }
   async function clearFinished() {
@@ -469,11 +483,11 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
         {item.error && <div className="error-text">{item.error}</div>}
       </div>
       <div className="transfer-actions">
-        {item.status === "Downloading" && (item.kind === "direct" || (item.kind === "hls" && item.source !== "native")) && <button className="quiet-button transfer-control" onClick={() => void pause(item)}>Pause</button>}
+        {item.status === "Downloading" && <button className="quiet-button transfer-control" onClick={() => void pause(item)}>Pause</button>}
         {item.status === "Paused" && <button className="quiet-button transfer-control" onClick={() => resume(item)}>Resume</button>}
-        {(item.status === "Failed" || item.status === "Interrupted") && <button className="quiet-button transfer-control" onClick={() => retry(item)}>{(item.kind === "direct" || item.kind === "hls") && item.targetPath ? "Resume" : "Retry"}</button>}
-        {(item.status === "Downloading" || item.status === "Pausing" || item.status === "Paused" || item.status === "Failed" || item.status === "Interrupted" || item.status === "Queued") && (item.kind === "direct" || (item.kind === "hls" && item.source !== "native")) && <button className="quiet-button transfer-control" onClick={() => void cancel(item)}>Cancel</button>}
-        {item.status !== "Downloading" && item.status !== "Pausing" && item.status !== "Cancelling" && (item.source !== "native" || item.status === "Completed" || item.status === "Cancelled" || item.status === "Failed" || item.status === "Interrupted") && <button className="remove-button" title="Remove" aria-label="Remove" onClick={() => void remove(item.id)}>×</button>}
+        {(item.status === "Failed" || item.status === "Interrupted") && <button className="quiet-button transfer-control" onClick={() => retry(item)}>{item.targetPath ? "Resume" : "Retry"}</button>}
+        {(item.status === "Downloading" || item.status === "Pausing" || item.status === "Paused" || item.status === "Failed" || item.status === "Interrupted" || item.status === "Queued") && <button className="quiet-button transfer-control" onClick={() => void cancel(item)}>Cancel</button>}
+        {item.status !== "Downloading" && item.status !== "Pausing" && item.status !== "Cancelling" && (item.source !== "native" || item.status === "Completed" || item.status === "Cancelled" || item.status === "Failed" || item.status === "Interrupted" || item.status === "Paused") && <button className="remove-button" title="Remove" aria-label="Remove" onClick={() => void remove(item.id)}>×</button>}
       </div>
     </article>)}</div>;
   }
@@ -525,7 +539,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           <div className="summary queue-summary"><div><strong>{active}</strong><span>Active</span></div><div><strong>{queued}</strong><span>Waiting</span></div><div><strong>{done}</strong><span>Completed</span></div><div><strong>{attention}</strong><span>Failed</span></div></div>
           <div className="panel-heading"><div><h2>All transfers</h2><p>Jobs start automatically, up to your active transfer limit.</p></div><button className="quiet-button" onClick={clearFinished}>Clear finished</button></div>
           {transferList(ordered)}
-          <p className="footnote">Direct HTTP and HLS downloads keep partial files on disk. Pause saves a checkpoint, Resume continues from it, and startup automatically recovers saved checkpoints. Scheduled jobs start at their selected local time.</p>
+          <p className="footnote">Direct HTTP, HLS and DASH downloads keep partial files on disk. Pause saves a checkpoint, Resume continues from it, and startup automatically recovers saved checkpoints. Scheduled jobs start at their selected local time.</p>
         </section>}
 
         {page === "video" && <section className="panel video-panel">
@@ -542,7 +556,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
               <button className="secondary-button" disabled={!variant.downloadable} onClick={() => add(variant.kind === "dash" ? videoUrl : variant.url, "video.mp4", variant.kind === "hls" ? "hls" : variant.kind === "dash" ? "dash" : "direct", variant.representationId, variant.audioRepresentationId)}>{variant.downloadable ? "Download" : "Unavailable"}</button>
             </div>)}
           </div>}
-          <div className="support-note"><strong>Format support</strong><p>Direct HTTP/HTTPS files use resumable transfers. HLS supports completed unencrypted VOD. DASH supports static MPDs with SegmentTemplate/SegmentTimeline; separate audio/video requires FFmpeg. Live/dynamic MPDs, DRM, SegmentBase/SegmentList and multi-period DASH are not supported. A YouTube watch page is not a direct media URL; page extraction is not available in this build.</p></div>
+          <div className="support-note"><strong>Format support</strong><p>Direct HTTP/HTTPS files use resumable transfers. HLS supports completed unencrypted VOD, with Pause/Resume/Cancel. DASH supports static MPDs with SegmentTemplate/SegmentTimeline, SegmentList, SegmentBase and multi-period, with Pause/Resume/Cancel; separate audio/video requires FFmpeg. Live/dynamic MPDs and DRM are not supported. A YouTube watch page is not a direct media URL; page extraction is not available in this build.</p></div>
         </section>}
 
         {page === "settings" && <section className="panel settings-panel">
@@ -600,7 +614,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
             {extensionFileStatus && <div className="notice native-host-notice">{extensionFileStatus}</div>}
           </div>
           <div className="rule" />
-          <div className="settings-section"><div><h2>About</h2><p>Local desktop transfer engine · Version 0.2.0</p></div><div className="about-line"><span>Supported media</span><strong>Direct files · HLS VOD · Static DASH VOD</strong></div><div className="about-line"><span>Direct downloads</span><strong>Pause · Resume · Cancel · Speed limit · Schedule</strong></div><div className="about-line"><span>Still in development</span><strong>Multi-connection resume · Live/multi-period DASH</strong></div></div>
+          <div className="settings-section"><div><h2>About</h2><p>Local desktop transfer engine · Version 0.2.0</p></div><div className="about-line"><span>Supported media</span><strong>Direct files · HLS VOD · Static DASH VOD</strong></div><div className="about-line"><span>Direct downloads</span><strong>Pause · Resume · Cancel · Speed limit · Schedule</strong></div><div className="about-line"><span>Still in development</span><strong>Multi-connection resume · Live DASH</strong></div></div>
         </section>}
 
         <footer className="app-footer"><span>ThunderLoad</span><span>Downloads stay on this device.</span></footer>
