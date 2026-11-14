@@ -1700,6 +1700,10 @@ async fn write_hls_checkpoint(path: &Path, state: &HlsJobState) -> Result<()> {
     let temporary = path.with_extension("meta.tmp");
     let bytes = serde_json::to_vec(state)?;
     fs::write(&temporary, bytes).await?;
+    // Unix rename(2) replaces atomically, so the checkpoint file is
+    // never absent; Windows rename fails when the destination exists.
+    // (Same gap as the direct-download writer, fixed the same way.)
+    #[cfg(not(unix))]
     if fs::try_exists(path).await.unwrap_or(false) {
         fs::remove_file(path).await?;
     }
@@ -2926,6 +2930,10 @@ async fn write_dash_checkpoint(path: &Path, state: &DashJobState) -> Result<()> 
     let temporary = path.with_extension("meta.tmp");
     let bytes = serde_json::to_vec(state)?;
     fs::write(&temporary, bytes).await?;
+    // Unix rename(2) replaces atomically, so the checkpoint file is
+    // never absent; Windows rename fails when the destination exists.
+    // (Same gap as the direct-download writer, fixed the same way.)
+    #[cfg(not(unix))]
     if fs::try_exists(path).await.unwrap_or(false) {
         fs::remove_file(path).await?;
     }

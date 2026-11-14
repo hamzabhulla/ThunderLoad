@@ -3,8 +3,8 @@ use crate::session::{apply_session, SessionHeaders};
 use futures_util::StreamExt;
 use reqwest::{header, Client, StatusCode};
 use serde::{Deserialize, Serialize};
-use std::{path::{Path, PathBuf}, sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex}, time::Instant};
-use tokio::{fs, io::{AsyncSeekExt, AsyncWriteExt, SeekFrom}, sync::{mpsc, Mutex as AsyncMutex}};
+use std::{collections::VecDeque, path::{Path, PathBuf}, sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex}, time::{Duration, Instant}};
+use tokio::{fs, io::{AsyncSeekExt, AsyncWriteExt, SeekFrom}, sync::{mpsc, Mutex as AsyncMutex}, task::{AbortHandle, JoinHandle}};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize)]
@@ -581,6 +581,14 @@ struct ResumeMetadata {
     connections: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     segments: Option<Vec<SegmentState>>,
+    /// Dynamic-segmentation marker (Slice 8). `Some(true)` means
+    /// `segments` is a chunk plan (see `chunk_ranges`), validated by
+    /// coverage, not by exact equality with `segment_ranges`. Absent
+    /// (None) means the checkpoint was written by Slice 1-7 code — or
+    /// by an older build — so the fixed equal-segment layout rule
+    /// applies and the old checkpoint still parses and resumes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dynamic: Option<bool>,
     /// Browser session handed off with this job, if any — stored here
     /// so a resume reuses it even when the caller has none. A desktop
     /// resume of a browser-started job mints a fresh job id, so the
@@ -616,6 +624,90 @@ fn segment_ranges(total: u64, connections: usize) -> Vec<(u64, u64)> {
             Some((start, start.saturating_add(chunk_size - 1).min(total - 1)))
         })
         .collect()
+}
+
+/// Dynamic segmentation (Slice 8): the chunk plan for a fresh segmented
+/// download. The file is split into near-equal chunks — each between
+/// `MIN_CHUNK_SIZE` and `2 * MIN_CHUNK_SIZE` bytes (no silly 1 KB
+/// chunks) and never more than `MAX_CHUNKS` chunks in total (so
+/// per-chunk checkpoint rewrites stay cheap even on a 100 GiB file).
+/// The count is `floor(total / MIN_CHUNK_SIZE)` — not the ceiling — and
+/// the bytes are split evenly (the first `total % count` chunks get one
+/// byte more), so every chunk is `floor(total / count)` or
+/// `ceil(total / count)`, both ≥ the minimum because
+/// `count ≤ total / MIN`. (A ceiling count would shrink every chunk
+/// toward half the minimum whenever the total is just over a multiple
+/// of MIN — F3.)
+/// Chunks are the checkpoint unit, exactly like segments were:
+/// `ResumeMetadata.segments` holds the chunk list and a chunk is marked
+/// done only after its full range is written and flushed, so a pause
+/// mid-chunk re-downloads at most one chunk.
+///
+/// Why chunks instead of re-splitting segment boundaries mid-flight:
+/// the remaining work is re-split *at plan time* into chunks, and the
+/// *assignment* adapts continuously — workers pull the next unfinished
+/// chunk when free, so each connection's share of the remaining work
+/// ends up proportional to its measured throughput, and a stalled
+/// connection holds at most one chunk while the others drain the rest.
+/// No byte range that is downloaded or in flight is ever moved, so a
+/// pause/resume mid-adaptation cannot lose or re-download committed
+/// bytes (only a partially written chunk is re-fetched whole, exactly
+/// like a partially written segment was before).
+const MIN_CHUNK_SIZE: u64 = 256 * 1024;
+const MAX_CHUNKS: usize = 1024;
+
+/// How long a worker may go without receiving a byte before the
+/// coordinator treats its current chunk as stalled and re-assigns it
+/// (see `run_segmented_download_with_stats`).
+const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// A chunk that stalls this many times in one run is a real failure, not
+/// a race to chase: the run errors out (checkpoint preserved for Resume)
+/// instead of aborting and re-queueing forever.
+const MAX_STALL_REQUEUES: u32 = 3;
+
+fn chunk_ranges(total: u64) -> Vec<(u64, u64)> {
+    if total == 0 {
+        return Vec::new();
+    }
+    // Floor, not ceiling: with count = total / MIN (rounded down),
+    // total / count >= MIN, so an even split keeps every chunk at or
+    // above the minimum. (A ceiling count would shrink every chunk
+    // toward MIN/2 whenever the total is just over a multiple of MIN.)
+    let count = ((total / MIN_CHUNK_SIZE) as usize).min(MAX_CHUNKS).max(1) as u64;
+    let base = total / count;
+    let extra = total % count;
+    let mut start = 0_u64;
+    (0..count)
+        .map(|index| {
+            let size = base + u64::from(index < extra);
+            let end = start + size - 1;
+            let range = (start, end);
+            start = end + 1;
+            range
+        })
+        .collect()
+}
+
+/// Whether a dynamic (chunked) checkpoint layout is safe to trust: the
+/// ranges must be sorted, contiguous, and cover exactly `[0, total)`,
+/// with a bounded chunk count. Corrupt-but-covering layouts are
+/// harmless — they just partition the file — so the rule checks shape,
+/// not exact equality with today's chunk plan (a chunk plan written by
+/// a future chunk size still validates).
+fn dynamic_layout_matches(saved: &ResumeMetadata) -> bool {
+    let Some(total) = saved.total else { return false };
+    let Some(segments) = saved.segments.as_ref() else { return false };
+    if segments.is_empty() || segments.len() > MAX_CHUNKS {
+        return false;
+    }
+    let mut expected_start = 0_u64;
+    for state in segments {
+        if state.start != expected_start || state.end < state.start || state.end >= total {
+            return false;
+        }
+        expected_start = state.end + 1;
+    }
+    expected_start == total
 }
 
 /// What a HEAD (plus a one-byte probe when HEAD is silent) tells us about
@@ -736,6 +828,15 @@ async fn write_resume_metadata(path: &Path, metadata: &ResumeMetadata) -> Result
     let temporary = path.with_extension("meta.tmp");
     let bytes = serde_json::to_vec(metadata)?;
     fs::write(&temporary, bytes).await?;
+    // Unix rename(2) replaces the destination atomically, so the
+    // metadata file is never absent: a crash mid-write leaves either
+    // the old or the new checkpoint, never none. Windows rename fails
+    // when the destination exists, so there the old file is removed
+    // first (a crash in that gap loses the checkpoint — the part file
+    // survives and a fresh download can restart — but Slice 8's
+    // per-chunk marks make the gap far more likely to be hit, so the
+    // Unix path must not pay it). F5.
+    #[cfg(not(unix))]
     if fs::try_exists(path).await.unwrap_or(false) {
         fs::remove_file(path).await?;
     }
@@ -771,7 +872,13 @@ fn parse_resume_content_range(value: &str, expected_start: u64) -> Result<Option
 /// Whether the stored segment layout is exactly the layout for the stored
 /// (total, connections). A mismatch means the checkpoint is corrupt or was
 /// written by a different layout, so it must be discarded, never trusted.
+/// Dynamic checkpoints (Slice 8, `dynamic: true`) are validated by
+/// coverage instead — see `dynamic_layout_matches` — so a chunk plan
+/// written by any chunk size still resumes.
 fn segmented_layout_matches(saved: &ResumeMetadata) -> bool {
+    if saved.dynamic == Some(true) {
+        return dynamic_layout_matches(saved);
+    }
     let Some(total) = saved.total else { return false };
     let Some(connections) = saved.connections else { return false };
     let Some(segments) = saved.segments.as_ref() else { return false };
@@ -790,7 +897,33 @@ fn segmented_layout_matches(saved: &ResumeMetadata) -> bool {
 struct SegmentCheckpoint {
     metadata_path: PathBuf,
     metadata: ResumeMetadata,
+    /// Instant of the last on-disk checkpoint write (F6).
+    last_write: Instant,
 }
+
+/// Defense-in-depth helper (F1): every chunk must be marked done before
+/// the part file is committed. The preallocated file's size can never
+/// prove coverage, so the checkpoint is the authority. An empty segment
+/// list is not coverage — a checkpoint with no segments must never
+/// commit.
+fn all_segments_done(metadata: &ResumeMetadata) -> bool {
+    metadata
+        .segments
+        .as_ref()
+        .is_some_and(|segments| !segments.is_empty() && segments.iter().all(|state| state.done))
+}
+
+/// How often a chunk completion may rewrite the checkpoint file at
+/// most (F6): a full JSON rewrite per chunk is up to ~47 MB of metadata
+/// writes for a 1024-chunk file. Marks update the in-memory state
+/// immediately and flush to disk at most this often — or immediately
+/// when the last unfinished chunk completes, so the on-disk state is
+/// complete before the run can report success. A crash between flushes
+/// only loses completion markers (safe: those chunks are re-downloaded
+/// on resume, never joined wrongly); the Paused tail writes the
+/// metadata explicitly before returning, and the Completed tail deletes
+/// the file, so no final state ever depends on the throttle.
+const MARK_COALESCE: Duration = Duration::from_millis(500);
 
 async fn mark_segment_done(checkpoint: &Arc<AsyncMutex<SegmentCheckpoint>>, index: usize) -> Result<()> {
     let mut guard = checkpoint.lock().await;
@@ -799,7 +932,12 @@ async fn mark_segment_done(checkpoint: &Arc<AsyncMutex<SegmentCheckpoint>>, inde
             state.done = true;
         }
     }
-    write_resume_metadata(&guard.metadata_path, &guard.metadata).await
+    let all_done = all_segments_done(&guard.metadata);
+    if all_done || guard.last_write.elapsed() >= MARK_COALESCE {
+        write_resume_metadata(&guard.metadata_path, &guard.metadata).await?;
+        guard.last_write = Instant::now();
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -810,6 +948,7 @@ enum SegmentOutcome {
     ValidatorChanged,
 }
 
+#[derive(Debug)]
 enum SegmentedRun {
     Finished(DownloadOutcome),
     ValidatorChanged,
@@ -819,6 +958,14 @@ enum SegmentedRun {
 /// range into the shared preallocated partial file at its own offset.
 /// Each task owns its own file handle and seeks to its own range, so
 /// concurrent tasks never share a cursor and ranges never overlap.
+///
+/// Slice 8 additions: `chunk_received` counts this range's bytes alone
+/// (the coordinator subtracts them if the chunk is re-queued after a
+/// stall, so the shared `received` counter stays the true unique-byte
+/// count); `activity` is the owning worker's last-received-byte instant
+/// (the stall watchdog reads it); `reported` is the running maximum of
+/// bytes ever reported, so progress never goes backwards even across a
+/// re-queue subtraction.
 #[allow(clippy::too_many_arguments)]
 async fn download_segment_range(
     client: &Client,
@@ -834,6 +981,9 @@ async fn download_segment_range(
     received: Arc<AtomicU64>,
     last_report: Arc<Mutex<Instant>>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
+    chunk_received: Arc<AtomicU64>,
+    activity: Arc<Mutex<Instant>>,
+    reported: Arc<AtomicU64>,
 ) -> Result<SegmentOutcome> {
     let mut request = apply_session(
         session,
@@ -893,6 +1043,17 @@ async fn download_segment_range(
         };
         file.write_all(&chunk).await?;
         local_bytes += chunk.len() as u64;
+        // R1: both counters are incremented together, before any await.
+        // The rate-limiter wait below can suspend the task, and the
+        // watchdog can abort it there; if `received` were incremented
+        // after the wait, the reap could subtract bytes that were never
+        // added to it (fetch_sub underflow — the progress counter would
+        // wrap to a huge value in both debug and release builds).
+        chunk_received.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+        let sum = received.fetch_add(chunk.len() as u64, Ordering::Relaxed) + chunk.len() as u64;
+        if let Ok(mut last) = activity.lock() {
+            *last = Instant::now();
+        }
         let wait = rate_limiter.reserve(chunk.len() as u64).await;
         if !wait.is_zero() {
             tokio::select! {
@@ -900,13 +1061,16 @@ async fn download_segment_range(
                 changed = control.changed() => { if changed.is_err() { /* host is shutting down */ } }
             }
         }
-        let sum = received.fetch_add(chunk.len() as u64, Ordering::Relaxed) + chunk.len() as u64;
         if let Ok(mut last) = last_report.lock() {
             if last.elapsed() >= std::time::Duration::from_millis(180) || sum == total {
+                // Clamp the reported value to the running maximum: a
+                // stall re-queue subtracts this chunk's partial bytes
+                // from `received`, and progress must never go backwards.
+                let shown = reported.fetch_max(sum, Ordering::Relaxed).max(sum);
                 let _ = progress_tx.send(DownloadProgress {
-                    downloaded: sum,
+                    downloaded: shown,
                     total: Some(total),
-                    percent: Some(sum as f64 * 100.0 / total as f64),
+                    percent: Some(shown as f64 * 100.0 / total as f64),
                     phase: "downloading".into(),
                 });
                 *last = Instant::now();
@@ -920,11 +1084,178 @@ async fn download_segment_range(
     Ok(SegmentOutcome::Completed)
 }
 
+/// Per-connection throughput measurement (Slice 8). One `WorkerStats`
+/// is produced per worker slot. Throughput is an exponentially weighted
+/// moving average over completed chunks (weight 1/2 per sample), so a
+/// measurement older than a couple of chunks contributes under a quarter
+/// of the estimate — stale measurements age out instead of steering the
+/// run forever. The average is recorded for diagnostics and tests; the
+/// adaptation itself is the pull-based queue (a fast connection simply
+/// claims more chunks), so no decision ever depends on a stale estimate.
+#[derive(Debug, Clone, Default)]
+struct WorkerStats {
+    chunks_completed: usize,
+    bytes_downloaded: u64,
+    ewma_bytes_per_sec: f64,
+}
+
+/// What one segmented run did: per-slot stats plus how often the
+/// watchdog had to re-assign a stalled chunk.
+#[derive(Debug, Clone, Default)]
+struct SegmentRunStats {
+    workers: Vec<WorkerStats>,
+    stall_requeues: u32,
+}
+
+/// Shared work-stealing state for one segmented run. `pending` holds the
+/// indices of unfinished chunks in file order; a worker claims the front
+/// entry when free, so the remaining work is always handed to whoever is
+/// ready — faster connections end up with the larger share. `current` is
+/// the chunk each slot is working on right now (if any); `stalls` counts,
+/// per chunk, how many times the watchdog re-queued it. The mutex is
+/// only ever held for a pop/push or a flag read — never across an await
+/// — so claiming never blocks downloading.
+struct DynamicQueue {
+    pending: VecDeque<usize>,
+    stalls: Vec<u32>,
+    current: Vec<Option<usize>>,
+}
+
+/// Everything a chunk worker needs that is shared across slots.
+struct SegmentWorkers {
+    client: Client,
+    url: String,
+    part: PathBuf,
+    total: u64,
+    ranges: Vec<(u64, u64)>,
+    validator: Option<String>,
+    session: Option<SessionHeaders>,
+    rate_limiter: Arc<GlobalRateLimiter>,
+    received: Arc<AtomicU64>,
+    reported: Arc<AtomicU64>,
+    last_report: Arc<Mutex<Instant>>,
+    progress_tx: mpsc::UnboundedSender<DownloadProgress>,
+    checkpoint: Arc<AsyncMutex<SegmentCheckpoint>>,
+    queue: Arc<Mutex<DynamicQueue>>,
+    chunk_received: Vec<Arc<AtomicU64>>,
+    activities: Vec<Arc<Mutex<Instant>>>,
+}
+
+struct WorkerResult {
+    terminal: Option<SegmentOutcome>,
+    error: Option<anyhow::Error>,
+    stats: WorkerStats,
+}
+
+/// One worker slot: claim unfinished chunks from the shared queue until
+/// it is empty. A chunk is claimed only when the worker is free, so a
+/// slow connection never holds more than one chunk at a time while the
+/// others drain the rest — that is the work stealing. A claimed chunk is
+/// downloaded by `download_segment_range` and marked done in the
+/// checkpoint on completion; a partially written chunk is simply
+/// re-downloaded whole on the next run, exactly like a partially
+/// written segment was before.
+async fn download_chunk_worker(
+    shared: Arc<SegmentWorkers>,
+    slot: usize,
+    control: tokio::sync::watch::Receiver<DownloadControl>,
+) -> WorkerResult {
+    let mut stats = WorkerStats::default();
+    loop {
+        let claimed = {
+            let mut guard = shared.queue.lock().unwrap();
+            let next = guard.pending.pop_front();
+            if next.is_some() {
+                guard.current[slot] = next;
+            }
+            next
+        };
+        let Some(index) = claimed else {
+            return WorkerResult { terminal: None, error: None, stats };
+        };
+        if let Ok(mut last) = shared.activities[slot].lock() {
+            *last = Instant::now();
+        }
+        let (start, end) = shared.ranges[index];
+        let started = Instant::now();
+        let outcome = download_segment_range(
+            &shared.client,
+            &shared.url,
+            &shared.part,
+            start,
+            end,
+            shared.total,
+            shared.validator.as_deref(),
+            shared.session.as_ref(),
+            control.clone(),
+            shared.rate_limiter.clone(),
+            shared.received.clone(),
+            shared.last_report.clone(),
+            shared.progress_tx.clone(),
+            shared.chunk_received[index].clone(),
+            shared.activities[slot].clone(),
+            shared.reported.clone(),
+        )
+        .await;
+        {
+            let mut guard = shared.queue.lock().unwrap();
+            guard.current[slot] = None;
+        }
+        match outcome {
+            Ok(SegmentOutcome::Completed) => {
+                if let Err(error) = mark_segment_done(&shared.checkpoint, index).await {
+                    return WorkerResult { terminal: None, error: Some(error), stats };
+                }
+                let chunk_len = end - start + 1;
+                let rate = chunk_len as f64 / started.elapsed().as_secs_f64().max(1e-6);
+                stats.chunks_completed += 1;
+                stats.bytes_downloaded += chunk_len;
+                stats.ewma_bytes_per_sec = if stats.chunks_completed == 1 {
+                    rate
+                } else {
+                    0.5 * stats.ewma_bytes_per_sec + 0.5 * rate
+                };
+            }
+            Ok(other) => return WorkerResult { terminal: Some(other), error: None, stats },
+            Err(error) => return WorkerResult { terminal: None, error: Some(error), stats },
+        }
+    }
+}
+
+/// One slot of the coordinator: its task handle, the handle used to
+/// abort it, and the chunk it was aborted on (if the watchdog fired and
+/// the task has not finished dying yet).
+struct Slot {
+    handle: Option<JoinHandle<WorkerResult>>,
+    abort: Option<AbortHandle>,
+    aborting_chunk: Option<usize>,
+}
+
+fn spawn_chunk_worker(
+    shared: &Arc<SegmentWorkers>,
+    control: &tokio::sync::watch::Receiver<DownloadControl>,
+    slot: usize,
+    state: &mut Slot,
+) {
+    let shared = shared.clone();
+    let task_control = control.clone();
+    let handle = tokio::spawn(async move { download_chunk_worker(shared, slot, task_control).await });
+    state.abort = Some(handle.abort_handle());
+    state.handle = Some(handle);
+}
+
 /// Runs the unfinished segments of a checkpointed segmented download.
 /// Completed segments are skipped; a partially written segment is
 /// re-downloaded whole. Network and server errors leave the checkpoint on
 /// disk so the next call resumes from the completed segments.
-#[allow(clippy::too_many_arguments)]
+///
+/// Slice 8: the segments are the chunk plan (fresh downloads) or the
+/// stored fixed layout (old checkpoints). `connections` worker slots pull
+/// unfinished chunks from a shared queue, so the remaining work is
+/// continuously re-split by availability instead of being fixed up
+/// front; a worker that receives nothing for `stall_timeout` has its
+/// chunk re-assigned to a fresh worker. Progress never goes backwards:
+/// the reported byte count is a running maximum across re-queues.
 async fn run_segmented_download(
     client: &Client,
     url: &str,
@@ -938,16 +1269,45 @@ async fn run_segmented_download(
     rate_limiter: Arc<GlobalRateLimiter>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
 ) -> Result<SegmentedRun> {
-    let ranges: Vec<(u64, u64, bool)> = {
+    let (run, _stats) = run_segmented_download_with_stats(
+        client, url, target, part, checkpoint, total, validator, session,
+        control, rate_limiter, progress_tx, DEFAULT_STALL_TIMEOUT,
+    )
+    .await?;
+    Ok(run)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_segmented_download_with_stats(
+    client: &Client,
+    url: &str,
+    target: &Path,
+    part: &Path,
+    checkpoint: &Arc<AsyncMutex<SegmentCheckpoint>>,
+    total: u64,
+    validator: Option<String>,
+    session: Option<&SessionHeaders>,
+    control: tokio::sync::watch::Receiver<DownloadControl>,
+    rate_limiter: Arc<GlobalRateLimiter>,
+    progress_tx: mpsc::UnboundedSender<DownloadProgress>,
+    stall_timeout: Duration,
+) -> Result<(SegmentedRun, SegmentRunStats)> {
+    let (ranges, worker_count) = {
         let guard = checkpoint.lock().await;
-        guard
+        let ranges: Vec<(u64, u64, bool)> = guard
             .metadata
             .segments
             .clone()
             .unwrap_or_default()
             .into_iter()
             .map(|state| (state.start, state.end, state.done))
-            .collect()
+            .collect();
+        let worker_count = guard
+            .metadata
+            .connections
+            .unwrap_or(DEFAULT_RESUMABLE_CONNECTIONS)
+            .clamp(1, 16);
+        (ranges, worker_count)
     };
     let downloaded: u64 = ranges
         .iter()
@@ -955,81 +1315,246 @@ async fn run_segmented_download(
         .map(|(start, end, _)| end - start + 1)
         .sum();
     let received = Arc::new(AtomicU64::new(downloaded));
+    let reported = Arc::new(AtomicU64::new(downloaded));
     let last_report = Arc::new(Mutex::new(Instant::now()));
-    let mut tasks = tokio::task::JoinSet::new();
-    for (index, (start, end, done)) in ranges.into_iter().enumerate() {
-        if done {
-            continue;
-        }
-        let client = client.clone();
-        let url = url.to_owned();
-        let part = part.to_path_buf();
-        let session = session.cloned();
-        let validator = validator.clone();
-        let task_control = control.clone();
-        let rate_limiter = rate_limiter.clone();
-        let received = received.clone();
-        let last_report = last_report.clone();
-        let progress_tx = progress_tx.clone();
-        let checkpoint = checkpoint.clone();
-        tasks.spawn(async move {
-            let outcome = download_segment_range(
-                &client,
-                &url,
-                &part,
-                start,
-                end,
-                total,
-                validator.as_deref(),
-                session.as_ref(),
-                task_control,
-                rate_limiter,
-                received,
-                last_report,
-                progress_tx,
-            )
-            .await?;
-            if outcome == SegmentOutcome::Completed {
-                mark_segment_done(&checkpoint, index).await?;
-            }
-            Ok::<SegmentOutcome, anyhow::Error>(outcome)
-        });
+    let queue = Arc::new(Mutex::new(DynamicQueue {
+        pending: ranges
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, _, done))| !*done)
+            .map(|(index, _)| index)
+            .collect(),
+        stalls: vec![0; ranges.len()],
+        current: vec![None; worker_count],
+    }));
+    let shared = Arc::new(SegmentWorkers {
+        client: client.clone(),
+        url: url.to_owned(),
+        part: part.to_path_buf(),
+        total,
+        ranges: ranges.iter().map(|(start, end, _)| (*start, *end)).collect(),
+        validator,
+        session: session.cloned(),
+        rate_limiter: rate_limiter.clone(),
+        received: received.clone(),
+        reported: reported.clone(),
+        last_report,
+        progress_tx: progress_tx.clone(),
+        checkpoint: checkpoint.clone(),
+        queue,
+        chunk_received: ranges.iter().map(|_| Arc::new(AtomicU64::new(0))).collect(),
+        activities: (0..worker_count).map(|_| Arc::new(Mutex::new(Instant::now()))).collect(),
+    });
+    // Explicit JoinHandles instead of a JoinSet: the stall watchdog must
+    // abort ONE worker without touching the others, and JoinSet can only
+    // abort all. The coordinator polls every 100 ms — one sleeping task,
+    // negligible cost for a download.
+    let mut slots: Vec<Slot> = (0..worker_count)
+        .map(|_| Slot { handle: None, abort: None, aborting_chunk: None })
+        .collect();
+    for slot in 0..worker_count {
+        spawn_chunk_worker(&shared, &control, slot, &mut slots[slot]);
     }
 
+    let mut run_stats = SegmentRunStats::default();
     let mut saw_paused = false;
     let mut saw_cancelled = false;
     let mut saw_validator_changed = false;
     let mut first_error: Option<anyhow::Error> = None;
-    while let Some(joined) = tasks.join_next().await {
-        match joined {
-            Ok(Ok(SegmentOutcome::Completed)) => {}
-            Ok(Ok(SegmentOutcome::Paused)) => saw_paused = true,
-            Ok(Ok(SegmentOutcome::Cancelled)) => saw_cancelled = true,
-            Ok(Ok(SegmentOutcome::ValidatorChanged)) => saw_validator_changed = true,
-            Ok(Err(error)) => {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
+    loop {
+        // Reap finished slots.
+        for slot_index in 0..slots.len() {
+            let finished = slots[slot_index]
+                .handle
+                .as_ref()
+                .is_some_and(|handle| handle.is_finished());
+            if !finished {
+                continue;
             }
-            Err(error) => {
-                if first_error.is_none() {
-                    first_error = Some(error.into());
+            let handle = slots[slot_index].handle.take().unwrap();
+            slots[slot_index].abort = None;
+            let was_aborting = slots[slot_index].aborting_chunk.take();
+            match handle.await {
+                Ok(result) => {
+                    run_stats.workers.push(result.stats);
+                    if let Some(error) = result.error {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                    match result.terminal {
+                        Some(SegmentOutcome::Paused) => saw_paused = true,
+                        Some(SegmentOutcome::Cancelled) => saw_cancelled = true,
+                        Some(SegmentOutcome::ValidatorChanged) => saw_validator_changed = true,
+                        Some(SegmentOutcome::Completed) | None => {}
+                    }
+                }
+                Err(join_error) => {
+                    if join_error.is_cancelled() {
+                        // A watchdog-aborted worker: its task is dead
+                        // (the handle finished), so whatever it was
+                        // doing can be safely re-queued — no writer owns
+                        // it anymore. An abort from the terminal path
+                        // below carries no chunk and needs no re-queue.
+                        // F1: re-queue the slot's LIVE current chunk,
+                        // taken at reap time — never the id captured at
+                        // detection time. The worker may have completed
+                        // that chunk and claimed the next one since the
+                        // watchdog noticed the stall; re-queueing the
+                        // stale id would drop the live chunk from both
+                        // pending and current, losing it silently (the
+                        // preallocated file's size check cannot detect
+                        // a hole). If the worker died between chunks,
+                        // current is None and nothing is re-queued.
+                        if was_aborting.is_some() {
+                            let live = {
+                                let mut guard = shared.queue.lock().unwrap();
+                                guard.current[slot_index].take()
+                            };
+                            if let Some(chunk) = live {
+                                let partial =
+                                    shared.chunk_received[chunk].swap(0, Ordering::Relaxed);
+                                // fetch_sub is a single atomic RMW: it
+                                // cannot fail spuriously. The swap(0)
+                                // above guarantees each chunk's bytes are
+                                // subtracted at most once, and only bytes
+                                // previously added to `received` (both
+                                // counters are incremented together, with
+                                // no await between them — see R1). The
+                                // debug_assert pins that ordering for
+                                // future refactors: if it ever trips in a
+                                // debug run, the pairing has been broken.
+                                debug_assert!(partial <= received.load(Ordering::Relaxed));
+                                received.fetch_sub(partial, Ordering::Relaxed);
+                                run_stats.stall_requeues += 1;
+                                let mut guard = shared.queue.lock().unwrap();
+                                guard.pending.push_front(chunk);
+                            }
+                        }
+                    } else if first_error.is_none() {
+                        first_error = Some(join_error.into());
+                    }
                 }
             }
         }
-        // One bad segment decides the outcome for the whole download; stop
-        // the rest instead of letting them write into a doomed checkpoint.
-        // Pause needs no abort: every task notices the paused control at
-        // its next chunk boundary and stops on its own.
-        if saw_validator_changed || saw_cancelled || first_error.is_some() {
-            tasks.abort_all();
+
+        let terminating = saw_validator_changed || saw_cancelled || first_error.is_some();
+        // F4: once the user asked for Pause, the watchdog stands down —
+        // no aborts, no stall-limit errors, no replacement workers
+        // issuing fresh Range requests while the run is draining. The
+        // pausing workers exit on their own at the next chunk boundary.
+        let paused = saw_paused || *control.borrow() == DownloadControl::Paused;
+        if terminating {
+            // One bad chunk decides the outcome for the whole download;
+            // stop the rest instead of letting them write into a doomed
+            // checkpoint. Pause needs no abort: every worker notices the
+            // paused control at its next chunk boundary and stops on its
+            // own.
+            for slot in slots.iter_mut() {
+                if let Some(abort) = slot.abort.take() {
+                    abort.abort();
+                }
+            }
+        } else if !paused {
+            // Stall watchdog: a slot whose current chunk received
+            // nothing for `stall_timeout` is stuck on a dead connection
+            // (the client sets no read timeout, so a hung chunk would
+            // otherwise block the tail forever). Abort that one worker,
+            // re-queue its chunk for a fresh connection, and spawn a
+            // replacement. A chunk that stalls too often is a real
+            // failure: error out with the checkpoint preserved.
+            let now = Instant::now();
+            for slot_index in 0..slots.len() {
+                if slots[slot_index].handle.is_none()
+                    || slots[slot_index].aborting_chunk.is_some()
+                {
+                    continue;
+                }
+                let stalled_chunk = {
+                    let guard = shared.queue.lock().unwrap();
+                    guard.current[slot_index].filter(|_| {
+                        shared.activities[slot_index]
+                            .lock()
+                            .map(|last| now.duration_since(*last) > stall_timeout)
+                            .unwrap_or(false)
+                    })
+                };
+                let Some(chunk) = stalled_chunk else { continue };
+                // F1: re-validate immediately before aborting. The
+                // worker may have completed this chunk and claimed the
+                // next one since detection; aborting it now would kill
+                // the next chunk for the old chunk's stall. (The reap
+                // path re-queues the live current chunk, so even a
+                // residual race cannot lose a chunk — this check only
+                // avoids spurious aborts.)
+                let still_stalled = {
+                    let guard = shared.queue.lock().unwrap();
+                    guard.current[slot_index] == Some(chunk)
+                        && shared.activities[slot_index]
+                            .lock()
+                            .map(|last| now.duration_since(*last) > stall_timeout)
+                            .unwrap_or(false)
+                };
+                if !still_stalled {
+                    continue;
+                }
+                let stalls = {
+                    let guard = shared.queue.lock().unwrap();
+                    guard.stalls[chunk]
+                };
+                if stalls >= MAX_STALL_REQUEUES {
+                    if first_error.is_none() {
+                        first_error = Some(anyhow!(
+                            "Download stalled repeatedly on one range; the connection is not delivering data. Partial data is preserved; Resume can retry."
+                        ));
+                    }
+                    break;
+                }
+                {
+                    let mut guard = shared.queue.lock().unwrap();
+                    guard.stalls[chunk] += 1;
+                }
+                if let Some(abort) = slots[slot_index].abort.take() {
+                    abort.abort();
+                }
+                slots[slot_index].aborting_chunk = Some(chunk);
+            }
+            // Replace slots emptied by the watchdog while work remains.
+            // (A slot whose worker drained the queue exits with nothing
+            // pending, so no replacement is needed there.)
+            for slot_index in 0..slots.len() {
+                if slots[slot_index].handle.is_some()
+                    || slots[slot_index].aborting_chunk.is_some()
+                {
+                    continue;
+                }
+                let has_pending = {
+                    let guard = shared.queue.lock().unwrap();
+                    !guard.pending.is_empty()
+                };
+                if has_pending {
+                    spawn_chunk_worker(&shared, &control, slot_index, &mut slots[slot_index]);
+                }
+            }
         }
+
+        let all_idle = slots
+            .iter()
+            .all(|slot| slot.handle.is_none() && slot.aborting_chunk.is_none());
+        let queue_empty = {
+            let guard = shared.queue.lock().unwrap();
+            guard.pending.is_empty()
+        };
+        // A terminating run ends once every slot is idle even if chunks
+        // are still pending (they stay in the checkpoint for Resume).
+        if all_idle && (queue_empty || saw_paused || terminating) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    // Drain aborted tasks so no segment keeps writing after we return.
-    while tasks.join_next().await.is_some() {}
 
     if saw_validator_changed {
-        return Ok(SegmentedRun::ValidatorChanged);
+        return Ok((SegmentedRun::ValidatorChanged, run_stats));
     }
     if saw_cancelled {
         remove_resume_files(
@@ -1038,31 +1563,46 @@ async fn run_segmented_download(
             target,
         )
         .await;
-        return Ok(SegmentedRun::Finished(DownloadOutcome::Cancelled));
+        return Ok((SegmentedRun::Finished(DownloadOutcome::Cancelled), run_stats));
     }
     if let Some(error) = first_error {
         return Err(error);
     }
     if saw_paused {
         // Persist the final completion state (completions are already
-        // written as segments finish; this covers a task that finished
+        // written as chunks finish; this covers a worker that finished
         // between its last mark and the abort of its siblings).
         let guard = checkpoint.lock().await;
         write_resume_metadata(&guard.metadata_path, &guard.metadata).await?;
-        let downloaded = received.load(Ordering::Relaxed);
+        // Report the running maximum, not the post-subtraction count:
+        // progress must never go backwards within a run.
+        let downloaded = reported.load(Ordering::Relaxed);
         let _ = progress_tx.send(DownloadProgress {
             downloaded,
             total: Some(total),
             percent: Some(downloaded as f64 * 100.0 / total as f64),
             phase: "paused".into(),
         });
-        return Ok(SegmentedRun::Finished(DownloadOutcome::Paused));
+        return Ok((SegmentedRun::Finished(DownloadOutcome::Paused), run_stats));
     }
     let size = fs::metadata(part).await.map(|meta| meta.len()).unwrap_or(0);
     if size != total {
         return Err(anyhow!(
             "Segmented download ended at {size} bytes, but the server reported {total}. Partial data is preserved; Resume can retry."
         ));
+    }
+    // Defense in depth (F1): the part file is preallocated, so its size
+    // can never prove coverage — confirm every chunk is marked done in
+    // the checkpoint before committing. A lost chunk fails loudly here
+    // instead of delivering wrong bytes as Completed; Resume re-fetches
+    // it from the preserved checkpoint.
+    {
+        let guard = checkpoint.lock().await;
+        if !all_segments_done(&guard.metadata) {
+            return Err(anyhow!(
+                "Segmented download ended with unfinished chunks; partial data is preserved, Resume can retry."
+            ));
+        }
     }
     replace_file(part, target).await?;
     let metadata_path = checkpoint.lock().await.metadata_path.clone();
@@ -1073,7 +1613,7 @@ async fn run_segmented_download(
         percent: Some(100.0),
         phase: "complete".into(),
     });
-    Ok(SegmentedRun::Finished(DownloadOutcome::Completed))
+    Ok((SegmentedRun::Finished(DownloadOutcome::Completed), run_stats))
 }
 
 fn fresh_segmented_metadata(
@@ -1083,7 +1623,11 @@ fn fresh_segmented_metadata(
     server: &ServerInfo,
     session: Option<&SessionHeaders>,
 ) -> ResumeMetadata {
-    let segments = segment_ranges(total, connections)
+    // Fresh segmented downloads use the dynamic chunk plan (Slice 8):
+    // near-equal chunks, one per checkpoint entry, pulled work-stealing
+    // style by the connection workers. The connection count is still
+    // recorded — it is the worker count, not the chunk count.
+    let segments = chunk_ranges(total)
         .into_iter()
         .map(|(start, end)| SegmentState { start, end, done: false })
         .collect();
@@ -1094,6 +1638,7 @@ fn fresh_segmented_metadata(
         total: Some(total),
         connections: Some(connections),
         segments: Some(segments),
+        dynamic: Some(true),
         session: session.cloned(),
     }
 }
@@ -1137,6 +1682,7 @@ async fn run_segmented_with_restart(
         let checkpoint = Arc::new(AsyncMutex::new(SegmentCheckpoint {
             metadata_path: metadata_path.to_path_buf(),
             metadata: metadata.clone(),
+            last_write: Instant::now(),
         }));
         match run_segmented_download(
             client,
@@ -1526,6 +2072,7 @@ async fn download_sequential_resumable(
         // Sequential checkpoint: no segment layout.
         connections: None,
         segments: None,
+        dynamic: None,
         session: session.cloned(),
     };
     write_resume_metadata(&metadata_path, &current_metadata).await?;
@@ -2170,6 +2717,7 @@ mod resume_metadata_tests {
             total: Some(1000),
             connections: None,
             segments: None,
+            dynamic: None,
             session: None,
         };
         assert!(resume_identity_matches(&saved, "https://example.test/file.bin", Some("\"v1\""), None, Some(1000)));
@@ -2187,6 +2735,7 @@ mod resume_metadata_tests {
             total: None,
             connections: None,
             segments: None,
+            dynamic: None,
             session: None,
         };
         assert!(resume_identity_matches(&saved, "https://example.test/file.bin", None, Some("Wed, 21 Oct 2015 07:28:00 GMT"), None));
@@ -2725,8 +3274,8 @@ mod segmented_resumable_tests {
         assert_eq!(outcome, DownloadOutcome::Completed);
         assert_eq!(
             fixture.range_requests.load(Ordering::Relaxed),
-            4,
-            "expected exactly 4 segment Range requests"
+            super::chunk_ranges(SMALL_BODY as u64).len(),
+            "expected exactly one Range request per chunk of the dynamic plan (Slice 8)"
         );
         let bytes = tokio::fs::read(&target).await.unwrap();
         assert_eq!(bytes, body_for(1, SMALL_BODY));
@@ -2751,7 +3300,7 @@ mod segmented_resumable_tests {
         let metadata_path = partial_download_metadata_path(&target);
         let metadata = read_resume_metadata(&metadata_path).await.expect("checkpoint metadata missing");
         let segments = metadata.segments.expect("segmented checkpoint must list segments");
-        assert_eq!(segments.len(), 4);
+        assert_eq!(segments.len(), super::chunk_ranges(LARGE_BODY as u64).len());
         assert_eq!(metadata.total, Some(LARGE_BODY as u64));
 
         fixture.slow.store(false, Ordering::Relaxed);
@@ -2818,6 +3367,7 @@ mod segmented_resumable_tests {
                     })
                     .collect(),
             ),
+            dynamic: None,
             session: None,
         };
         let metadata_path = partial_download_metadata_path(&target);
@@ -2890,6 +3440,7 @@ mod segmented_resumable_tests {
                     })
                     .collect(),
             ),
+            dynamic: None,
             session: None,
         };
         let metadata_path = partial_download_metadata_path(&target);
@@ -2965,14 +3516,718 @@ mod segmented_resumable_tests {
         assert_eq!(outcome, DownloadOutcome::Completed);
         assert_eq!(
             fixture.range_requests.load(Ordering::Relaxed) - before,
-            4,
-            "changed ETag must restart with a fresh set of 4 segment requests"
+            super::chunk_ranges(LARGE_BODY as u64).len(),
+            "changed ETag must restart with a fresh set of chunk requests (Slice 8)"
         );
         let bytes = tokio::fs::read(&target).await.unwrap();
         assert_eq!(bytes, body_for(2, LARGE_BODY));
         assert!(!tokio::fs::try_exists(&part).await.unwrap());
         assert!(!tokio::fs::try_exists(partial_download_metadata_path(&target)).await.unwrap());
         fixture.stop();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod dynamic_segmentation_tests {
+    use super::{
+        chunk_ranges, download_url_resumable_with_connections, dynamic_layout_matches,
+        ensure_segmented_part, fresh_segmented_metadata, partial_download_metadata_path,
+        partial_download_path, read_resume_metadata, reserve_download_path,
+        run_segmented_download_with_stats, segment_ranges, write_resume_metadata,
+        DownloadControl, DownloadOutcome, GlobalRateLimiter, ResumeMetadata, SegmentCheckpoint,
+        SegmentState, SegmentedRun, ServerInfo,
+    };
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        },
+        thread,
+        time::{Duration, Instant},
+    };
+    use tokio::sync::{mpsc, watch};
+
+    const BODY_SIZE: usize = 8 * 1024 * 1024;
+
+    fn body() -> Vec<u8> {
+        body_sized(BODY_SIZE)
+    }
+
+    fn body_sized(size: usize) -> Vec<u8> {
+        (0..size).map(|index| (index % 251) as u8).collect()
+    }
+
+    const SMALL_BODY: usize = 2 * 1024 * 1024 + 37;
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("thunderload-dynamic-{name}-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn chunk_plan_is_contiguous_near_equal_and_bounded() {
+        for total in [0_u64, 1, 100, 256 * 1024, 2 * 1024 * 1024, 2 * 1024 * 1024 + 37, 8 * 1024 * 1024, 1024 * 1024 * 1024, 100 * 1024 * 1024 * 1024] {
+            let ranges = chunk_ranges(total);
+            if total == 0 {
+                assert!(ranges.is_empty());
+                continue;
+            }
+            assert!(!ranges.is_empty() && ranges.len() <= super::MAX_CHUNKS, "total {total}: {} chunks", ranges.len());
+            let mut expected_start = 0_u64;
+            let mut sizes = Vec::new();
+            for (start, end) in &ranges {
+                assert_eq!(*start, expected_start, "total {total}: gap or overlap at {start}");
+                assert!(*end >= *start && *end < total, "total {total}: range {start}-{end} out of bounds");
+                sizes.push(end - start + 1);
+                expected_start = end + 1;
+            }
+            assert_eq!(expected_start, total, "total {total}: plan does not cover the file");
+            let (min, max) = (*sizes.iter().min().unwrap(), *sizes.iter().max().unwrap());
+            assert!(max - min <= 1, "total {total}: chunks are not near-equal ({min}..{max})");
+            if total >= super::MIN_CHUNK_SIZE {
+                assert!(min >= super::MIN_CHUNK_SIZE, "total {total}: a chunk is below the minimum ({min})");
+            }
+            assert_eq!(ranges.len(), ((total / super::MIN_CHUNK_SIZE) as usize).min(super::MAX_CHUNKS).max(1));
+        }
+        // The sizes the production path actually uses.
+        assert_eq!(chunk_ranges(2 * 1024 * 1024 + 37).len(), 8);
+        assert_eq!(chunk_ranges(8 * 1024 * 1024).len(), 32);
+        // Every chunk of a just-over-a-multiple total stays at or above
+        // the minimum (F3: the old ceiling count shrank them to 233,021 B).
+        assert!(chunk_ranges(2 * 1024 * 1024 + 37).iter().all(|(start, end)| end - start + 1 >= super::MIN_CHUNK_SIZE));
+    }
+
+    fn metadata_with(segments: Vec<SegmentState>, total: u64, dynamic: Option<bool>) -> ResumeMetadata {
+        ResumeMetadata {
+            url: "https://example.test/file.bin".into(),
+            etag: Some("\"v1\"".into()),
+            last_modified: None,
+            total: Some(total),
+            connections: Some(8),
+            segments: Some(segments),
+            dynamic,
+            session: None,
+        }
+    }
+
+    #[test]
+    fn dynamic_layout_matches_requires_full_coverage() {
+        let total = 8 * 1024 * 1024_u64;
+        let good: Vec<SegmentState> = chunk_ranges(total)
+            .into_iter()
+            .map(|(start, end)| SegmentState { start, end, done: false })
+            .collect();
+        assert!(dynamic_layout_matches(&metadata_with(good.clone(), total, Some(true))));
+        // A gap: drop a middle chunk.
+        let mut gapped = good.clone();
+        gapped.remove(5);
+        assert!(!dynamic_layout_matches(&metadata_with(gapped, total, Some(true))));
+        // An overlap: extend one chunk into the next.
+        let mut overlapped = good.clone();
+        overlapped[3].end = overlapped[4].end;
+        assert!(!dynamic_layout_matches(&metadata_with(overlapped, total, Some(true))));
+        // Wrong total: the plan no longer covers the file.
+        assert!(!dynamic_layout_matches(&metadata_with(good.clone(), total + 1, Some(true))));
+        // Empty plan covers nothing.
+        assert!(!dynamic_layout_matches(&metadata_with(Vec::new(), total, Some(true))));
+        // The old fixed layout still validates through the shared entry
+        // point when `dynamic` is absent — and a wrong connection count
+        // still rejects it.
+        let fixed: Vec<SegmentState> = segment_ranges(total, 8)
+            .into_iter()
+            .map(|(start, end)| SegmentState { start, end, done: false })
+            .collect();
+        assert!(super::segmented_layout_matches(&metadata_with(fixed.clone(), total, None)));
+        let mut wrong_connections = metadata_with(fixed, total, None);
+        wrong_connections.connections = Some(4);
+        assert!(!super::segmented_layout_matches(&wrong_connections));
+    }
+
+    #[test]
+    fn all_segments_done_is_the_commit_gate() {
+        // F1 safety net: the predicate behind the pre-commit coverage
+        // check. All done → true; one unfinished → false; empty list or
+        // no list → false (an empty checkpoint must never commit).
+        let done = |flags: &[bool]| {
+            metadata_with(
+                flags
+                    .iter()
+                    .enumerate()
+                    .map(|(index, done)| SegmentState {
+                        start: index as u64,
+                        end: index as u64,
+                        done: *done,
+                    })
+                    .collect(),
+                3,
+                Some(true),
+            )
+        };
+        assert!(super::all_segments_done(&done(&[true, true, true])));
+        assert!(!super::all_segments_done(&done(&[true, false, true])));
+        assert!(!super::all_segments_done(&done(&[false, false, false])));
+        assert!(!super::all_segments_done(&metadata_with(Vec::new(), 3, Some(true))));
+        let mut no_segments = done(&[true]);
+        no_segments.segments = None;
+        assert!(!super::all_segments_done(&no_segments));
+    }
+
+    /// A keep-alive fixture server. `SlowFirstConnection` mode makes
+    /// the first connection to issue a ranged GET drip its body (16 KiB
+    /// per 25 ms ≈ 655 KB/s); every other connection serves at full
+    /// localhost speed. That models one slow route among fast ones — the
+    /// case fixed segmentation cannot adapt to. `StallOnce` mode hangs
+    /// the first request for one range (until shutdown) and serves every
+    /// later request fast: a connection that hangs once, then recovers.
+
+    enum UnevenMode {
+        SlowFirstConnection,
+        StallOnce { start: usize },
+    }
+
+    struct RangedFixture {
+        url: String,
+        range_requests: Arc<AtomicUsize>,
+        shutdown: Arc<AtomicBool>,
+        handle: thread::JoinHandle<()>,
+    }
+
+    impl RangedFixture {
+        fn stop(self) {
+            self.shutdown.store(true, Ordering::Relaxed);
+            self.handle.join().unwrap();
+        }
+    }
+
+    fn spawn_uneven_server() -> RangedFixture {
+        spawn_ranged_server(BODY_SIZE, UnevenMode::SlowFirstConnection)
+    }
+
+    fn spawn_stall_once_server(stall_start: usize) -> RangedFixture {
+        spawn_ranged_server(BODY_SIZE, UnevenMode::StallOnce { start: stall_start })
+    }
+
+    fn spawn_ranged_server(body_size: usize, mode: UnevenMode) -> RangedFixture {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let slow_taken = Arc::new(AtomicBool::new(false));
+        let stalled_once = Arc::new(AtomicBool::new(false));
+        let range_requests = Arc::new(AtomicUsize::new(0));
+        let body = Arc::new(body_sized(body_size));
+        let thread_shutdown = shutdown.clone();
+        let thread_requests = range_requests.clone();
+        let handle = thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let _ = stream.set_nonblocking(false);
+                let body = body.clone();
+                let slow_taken = slow_taken.clone();
+                let stalled_once = stalled_once.clone();
+                let shutdown = thread_shutdown.clone();
+                let requests = thread_requests.clone();
+                let mode_slow = matches!(mode, UnevenMode::SlowFirstConnection);
+                let stall_start = match mode {
+                    UnevenMode::StallOnce { start } => Some(start),
+                    UnevenMode::SlowFirstConnection => None,
+                };
+                thread::spawn(move || {
+                    // This connection is slow iff it is the first one to
+                    // issue a ranged GET (SlowFirstConnection mode).
+                    let mut slow_connection = false;
+                    loop {
+                        let mut raw = Vec::new();
+                        let mut buffer = [0_u8; 1024];
+                        let head_complete = loop {
+                            match stream.read(&mut buffer) {
+                                Ok(0) => return,
+                                Ok(count) => {
+                                    raw.extend_from_slice(&buffer[..count]);
+                                    if raw.windows(4).any(|window| window == b"\r\n\r\n") {
+                                        break true;
+                                    }
+                                }
+                                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                    thread::sleep(Duration::from_millis(1));
+                                }
+                                Err(_) => return,
+                            }
+                        };
+                        if !head_complete {
+                            return;
+                        }
+                        let request = String::from_utf8_lossy(&raw);
+                        let method = request.split_whitespace().next().unwrap_or("");
+                        let header = |name: &str| {
+                            request.lines().find_map(|line| {
+                                let (key, value) = line.split_once(':')?;
+                                key.eq_ignore_ascii_case(name).then(|| value.trim().to_string())
+                            })
+                        };
+                        let range = header("range");
+                        let if_range = header("if-range");
+                        if range.is_some() {
+                            requests.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if method == "HEAD" {
+                            let headers = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {body_size}\r\nETag: \"v1\"\r\nAccept-Ranges: bytes\r\n\r\n"
+                            );
+                            if stream.write_all(headers.as_bytes()).is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                        let bounds = range.as_deref()
+                            .and_then(|value| value.strip_prefix("bytes="))
+                            .and_then(|value| value.split_once('-'))
+                            .and_then(|(start, end)| {
+                                Some((start.parse::<usize>().ok()?, end.parse::<usize>().ok()?))
+                            });
+                        let honored = bounds.is_some_and(|(start, end)| {
+                            start <= end
+                                && end < body_size
+                                && (if_range.as_deref() == Some("\"v1\"") || if_range.is_none())
+                        });
+                        let (start, end) = if honored {
+                            bounds.unwrap()
+                        } else {
+                            (0, body_size - 1)
+                        };
+                        // First ranged GET on this connection claims the
+                        // slow slot (SlowFirstConnection mode only).
+                        if range.is_some() && mode_slow && !slow_taken.swap(true, Ordering::Relaxed) {
+                            slow_connection = true;
+                        }
+                        // StallOnce mode: hang the first request for the
+                        // chosen range until the test shuts down.
+                        if let Some(stall) = stall_start {
+                            if start == stall && !stalled_once.swap(true, Ordering::Relaxed) {
+                                while !shutdown.load(Ordering::Relaxed) {
+                                    thread::sleep(Duration::from_millis(100));
+                                }
+                                return;
+                            }
+                        }
+                        let payload_len = end - start + 1;
+                        let headers = if honored {
+                            format!(
+                                "HTTP/1.1 206 Partial Content\r\nContent-Length: {payload_len}\r\nETag: \"v1\"\r\nContent-Range: bytes {start}-{end}/{body_size}\r\n\r\n"
+                            )
+                        } else {
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {payload_len}\r\nETag: \"v1\"\r\n\r\n"
+                            )
+                        };
+                        if stream.write_all(headers.as_bytes()).is_err() {
+                            return;
+                        }
+                        let payload = &body[start..=end];
+                        if slow_connection {
+                            for chunk in payload.chunks(16 * 1024) {
+                                if stream.write_all(chunk).is_err() {
+                                    return;
+                                }
+                                thread::sleep(Duration::from_millis(25));
+                            }
+                        } else if stream.write_all(payload).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        RangedFixture { url: format!("http://{address}/file.bin"), range_requests, shutdown, handle }
+    }
+
+    async fn run_dynamic(
+        url: &str,
+        target: &std::path::Path,
+        connections: usize,
+        stall_timeout: Duration,
+    ) -> (SegmentedRun, super::SegmentRunStats, Vec<super::DownloadProgress>) {
+        let server = ServerInfo {
+            total: Some(BODY_SIZE as u64),
+            supports_ranges: true,
+            etag: Some("\"v1\"".into()),
+            last_modified: None,
+        };
+        let part = partial_download_path(target);
+        let metadata_path = partial_download_metadata_path(target);
+        let metadata = fresh_segmented_metadata(url, BODY_SIZE as u64, connections, &server, None);
+        ensure_segmented_part(&part, BODY_SIZE as u64).await.unwrap();
+        write_resume_metadata(&metadata_path, &metadata).await.unwrap();
+        let checkpoint = Arc::new(tokio::sync::Mutex::new(SegmentCheckpoint {
+            metadata_path: metadata_path.clone(),
+            metadata,
+            last_write: Instant::now(),
+        }));
+        let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        let client = super::client().unwrap();
+        let (run, stats) = run_segmented_download_with_stats(
+            &client,
+            url,
+            target,
+            &part,
+            &checkpoint,
+            BODY_SIZE as u64,
+            Some("\"v1\"".into()),
+            None,
+            control_rx,
+            Arc::new(GlobalRateLimiter::new()),
+            progress_tx,
+            stall_timeout,
+        )
+        .await
+        .unwrap();
+        drop(control_tx);
+        let mut events = Vec::new();
+        while let Ok(event) = progress_rx.try_recv() {
+            events.push(event);
+        }
+        (run, stats, events)
+    }
+
+    #[tokio::test]
+    async fn uneven_connection_speeds_share_work() {
+        let fixture = spawn_uneven_server();
+        let directory = temp_dir("uneven");
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("file.bin")).await.unwrap();
+        let started = Instant::now();
+        let (run, stats, _events) =
+            run_dynamic(&fixture.url, &target, 8, Duration::from_secs(30)).await;
+        let elapsed = started.elapsed();
+        assert!(matches!(run, SegmentedRun::Finished(DownloadOutcome::Completed)), "run: {run:?}");
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(bytes, body());
+        // 32 chunks shared across 8 workers: the slow connection's worker
+        // finishes ~1 chunk while the fast workers drain the rest, so the
+        // per-worker counts must skew. Fixed segmentation (one 1 MiB
+        // segment on the slow connection at 655 KB/s) cannot finish
+        // faster than ~1.6 s; the dynamic run must beat that bound.
+        let total_chunks: usize = stats.workers.iter().map(|worker| worker.chunks_completed).sum();
+        assert_eq!(total_chunks, 32, "every chunk must be completed exactly once");
+        let min_chunks = stats.workers.iter().map(|worker| worker.chunks_completed).min().unwrap();
+        let max_chunks = stats.workers.iter().map(|worker| worker.chunks_completed).max().unwrap();
+        assert!(min_chunks <= 2, "slow worker must not be stuck with a large share; min was {min_chunks}");
+        assert!(max_chunks >= 4, "fast workers must pick up the slack; max was {max_chunks}");
+        for worker in &stats.workers {
+            if worker.chunks_completed > 0 {
+                assert!(worker.ewma_bytes_per_sec > 0.0, "throughput must be measured per worker");
+            }
+        }
+        assert!(
+            elapsed < Duration::from_millis(900),
+            "dynamic run took {elapsed:?}; fixed segmentation needs ~1.6 s on the slow segment"
+        );
+        fixture.stop();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stall_watchdog_reassigns_hung_chunk_and_completes() {
+        // Chunk index 3's start, from the plan itself; all 8 workers
+        // claim a chunk at start, so this range is in flight from the
+        // beginning.
+        let stall_start = chunk_ranges(BODY_SIZE as u64)[3].0 as usize;
+        let fixture = spawn_stall_once_server(stall_start);
+        let directory = temp_dir("stall");
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("file.bin")).await.unwrap();
+        let started = Instant::now();
+        let (run, stats, events) =
+            run_dynamic(&fixture.url, &target, 8, Duration::from_secs(1)).await;
+        let elapsed = started.elapsed();
+        assert!(matches!(run, SegmentedRun::Finished(DownloadOutcome::Completed)), "run: {run:?}");
+        assert!(stats.stall_requeues >= 1, "watchdog must have re-queued the hung chunk");
+        assert!(elapsed < Duration::from_secs(10), "run took {elapsed:?}");
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(bytes, body());
+        // Progress never goes backwards, even across the re-queue
+        // subtraction, and never exceeds the total.
+        let mut previous = 0_u64;
+        for event in &events {
+            assert!(
+                event.downloaded >= previous,
+                "progress went backwards: {} after {previous}",
+                event.downloaded
+            );
+            assert!(event.downloaded <= BODY_SIZE as u64, "progress exceeded the total");
+            previous = event.downloaded;
+        }
+        assert_eq!(previous, BODY_SIZE as u64, "final progress must reach the total");
+        fixture.stop();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn old_checkpoint_json_without_dynamic_field_resumes_with_exact_bytes() {
+        // The old wire format: serialize a checkpoint with `dynamic:
+        // None` — `skip_serializing_if` omits the key entirely, exactly
+        // like a Slice 1-7 build wrote it — then resume through the real
+        // dispatcher and prove the fixed layout still completes.
+        let fixture = spawn_ranged_server(SMALL_BODY, UnevenMode::SlowFirstConnection);
+        let directory = temp_dir("old-json");
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("file.bin")).await.unwrap();
+        let ranges = segment_ranges(SMALL_BODY as u64, 4);
+        let expected = body_sized(SMALL_BODY);
+        let part = partial_download_path(&target);
+        {
+            let file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .open(&part)
+                .await
+                .unwrap();
+            file.set_len(SMALL_BODY as u64).await.unwrap();
+            for (index, (start, end)) in ranges.iter().enumerate() {
+                if index == 0 || index == 2 {
+                    use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
+                    let mut file = file.try_clone().await.unwrap();
+                    file.seek(SeekFrom::Start(*start)).await.unwrap();
+                    file.write_all(&expected[*start as usize..=*end as usize]).await.unwrap();
+                    file.flush().await.unwrap();
+                }
+            }
+        }
+        let metadata = ResumeMetadata {
+            url: fixture.url.clone(),
+            etag: Some("\"v1\"".into()),
+            last_modified: None,
+            total: Some(SMALL_BODY as u64),
+            connections: Some(4),
+            segments: Some(
+                ranges
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (start, end))| SegmentState {
+                        start: *start,
+                        end: *end,
+                        done: index == 0 || index == 2,
+                    })
+                    .collect(),
+            ),
+            dynamic: None,
+            session: None,
+        };
+        let json = serde_json::to_string(&metadata).unwrap();
+        assert!(!json.contains("dynamic"), "old wire format must not carry the new key: {json}");
+        let metadata_path = partial_download_metadata_path(&target);
+        tokio::fs::write(&metadata_path, json.as_bytes()).await.unwrap();
+        // The file on disk parses back with `dynamic: None`.
+        let reparsed = read_resume_metadata(&metadata_path).await.unwrap();
+        assert_eq!(reparsed.dynamic, None);
+
+        let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        let outcome = download_url_resumable_with_connections(
+            &fixture.url,
+            &target,
+            None,
+            4,
+            control_rx,
+            Arc::new(GlobalRateLimiter::new()),
+            progress_tx,
+        )
+        .await
+        .unwrap();
+        drop(control_tx);
+        assert_eq!(outcome, DownloadOutcome::Completed);
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(bytes, expected);
+        fixture.stop();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dynamic_checkpoint_resume_requests_only_unfinished_chunks() {
+        // A paused dynamic download resumes at chunk granularity: done
+        // chunks are never re-requested.
+        let fixture = spawn_ranged_server(SMALL_BODY, UnevenMode::SlowFirstConnection);
+        let directory = temp_dir("dynamic-resume");
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("file.bin")).await.unwrap();
+        let ranges = chunk_ranges(SMALL_BODY as u64);
+        assert_eq!(ranges.len(), 8);
+        let expected = body_sized(SMALL_BODY);
+        let part = partial_download_path(&target);
+        {
+            let file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .open(&part)
+                .await
+                .unwrap();
+            file.set_len(SMALL_BODY as u64).await.unwrap();
+            for (index, (start, end)) in ranges.iter().enumerate() {
+                if index == 0 || index == 2 {
+                    use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
+                    let mut file = file.try_clone().await.unwrap();
+                    file.seek(SeekFrom::Start(*start)).await.unwrap();
+                    file.write_all(&expected[*start as usize..=*end as usize]).await.unwrap();
+                    file.flush().await.unwrap();
+                }
+            }
+        }
+        let metadata = ResumeMetadata {
+            url: fixture.url.clone(),
+            etag: Some("\"v1\"".into()),
+            last_modified: None,
+            total: Some(SMALL_BODY as u64),
+            connections: Some(4),
+            segments: Some(
+                ranges
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (start, end))| SegmentState {
+                        start: *start,
+                        end: *end,
+                        done: index == 0 || index == 2,
+                    })
+                    .collect(),
+            ),
+            dynamic: Some(true),
+            session: None,
+        };
+        let metadata_path = partial_download_metadata_path(&target);
+        write_resume_metadata(&metadata_path, &metadata).await.unwrap();
+
+        let before = fixture.range_requests.load(Ordering::Relaxed);
+        let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        let outcome = download_url_resumable_with_connections(
+            &fixture.url,
+            &target,
+            None,
+            4,
+            control_rx,
+            Arc::new(GlobalRateLimiter::new()),
+            progress_tx,
+        )
+        .await
+        .unwrap();
+        drop(control_tx);
+        assert_eq!(outcome, DownloadOutcome::Completed);
+        assert_eq!(
+            fixture.range_requests.load(Ordering::Relaxed) - before,
+            6,
+            "resume must request only the 6 unfinished chunks"
+        );
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(bytes, expected);
+        fixture.stop();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod mark_coalesce_tests {
+    use super::{
+        mark_segment_done, partial_download_metadata_path, read_resume_metadata,
+        reserve_download_path, write_resume_metadata, ResumeMetadata, SegmentCheckpoint,
+        SegmentState,
+    };
+    use std::time::Instant;
+
+    #[tokio::test]
+    async fn checkpoint_marks_coalesce_until_all_done() {
+        // F6: a non-final mark inside the throttle window must not touch
+        // the file; the mark that completes the last chunk must flush.
+        // No timing dependence: the checkpoint was just constructed, so
+        // every mark here is inside the 500 ms window.
+        let directory = std::env::temp_dir().join(format!("thunderload-coalesce-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("file.bin")).await.unwrap();
+        let metadata_path = partial_download_metadata_path(&target);
+        let metadata = ResumeMetadata {
+            url: "https://example.test/file.bin".into(),
+            etag: Some("\"v1\"".into()),
+            last_modified: None,
+            total: Some(3),
+            connections: Some(1),
+            segments: Some(vec![
+                SegmentState { start: 0, end: 0, done: false },
+                SegmentState { start: 1, end: 1, done: false },
+                SegmentState { start: 2, end: 2, done: false },
+            ]),
+            dynamic: Some(true),
+            session: None,
+        };
+        write_resume_metadata(&metadata_path, &metadata).await.unwrap();
+        let checkpoint = std::sync::Arc::new(tokio::sync::Mutex::new(SegmentCheckpoint {
+            metadata_path: metadata_path.clone(),
+            metadata,
+            last_write: Instant::now(),
+        }));
+        let before = tokio::fs::read(&metadata_path).await.unwrap();
+        mark_segment_done(&checkpoint, 0).await.unwrap();
+        assert_eq!(tokio::fs::read(&metadata_path).await.unwrap(), before, "non-final mark must not rewrite the file");
+        mark_segment_done(&checkpoint, 1).await.unwrap();
+        assert_eq!(tokio::fs::read(&metadata_path).await.unwrap(), before, "non-final mark must not rewrite the file");
+        mark_segment_done(&checkpoint, 2).await.unwrap();
+        let after = read_resume_metadata(&metadata_path).await.unwrap();
+        assert!(after.segments.unwrap().iter().all(|state| state.done), "final mark must flush all done flags");
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod mark_coalesce_expiry_tests {
+    use super::{
+        mark_segment_done, partial_download_metadata_path, read_resume_metadata,
+        reserve_download_path, write_resume_metadata, ResumeMetadata, SegmentCheckpoint,
+        SegmentState,
+    };
+    use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn expired_throttle_window_flushes_non_final_mark() {
+        // R4: the 500 ms throttle-expiry branch — a non-final mark must
+        // still reach the file once the window has expired. No timing
+        // dependence: the checkpoint is constructed with last_write
+        // already 600 ms in the past.
+        let directory = std::env::temp_dir().join(format!("thunderload-coalesce-exp-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("file.bin")).await.unwrap();
+        let metadata_path = partial_download_metadata_path(&target);
+        let metadata = ResumeMetadata {
+            url: "https://example.test/file.bin".into(),
+            etag: Some("\"v1\"".into()),
+            last_modified: None,
+            total: Some(3),
+            connections: Some(1),
+            segments: Some(vec![
+                SegmentState { start: 0, end: 0, done: false },
+                SegmentState { start: 1, end: 1, done: false },
+                SegmentState { start: 2, end: 2, done: false },
+            ]),
+            dynamic: Some(true),
+            session: None,
+        };
+        write_resume_metadata(&metadata_path, &metadata).await.unwrap();
+        let checkpoint = std::sync::Arc::new(tokio::sync::Mutex::new(SegmentCheckpoint {
+            metadata_path: metadata_path.clone(),
+            metadata,
+            last_write: Instant::now() - Duration::from_millis(600),
+        }));
+        mark_segment_done(&checkpoint, 0).await.unwrap();
+        let flushed = read_resume_metadata(&metadata_path).await.unwrap();
+        let segments = flushed.segments.unwrap();
+        assert!(segments[0].done, "expired window must flush the mark");
+        assert!(!segments[1].done && !segments[2].done, "only the marked chunk is done");
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 }
