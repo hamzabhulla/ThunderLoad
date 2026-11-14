@@ -1,3 +1,9 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Release builds on Windows must not show a console window: without this
+// attribute the desktop binary is built with the console subsystem, so
+// Windows opens a black console titled with the exe path next to the app
+// window — and closing that console kills the app process. Debug builds
+// keep the console so eprintln! logs stay visible during development.
 use std::{collections::HashMap, path::{Path, PathBuf}, process::Command, sync::{Arc, Mutex, OnceLock}, time::{Duration, Instant}};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -5,6 +11,33 @@ use serde_json::{json, Value};
 use tauri::{Emitter, Manager};
 use thunderload_engine::{dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_resumable, download_url_resumable, grab_page_media as engine_grab_page_media, hls_work_dir, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, store_file_name, DownloadControl, DownloadOutcome, DownloadProgress, GlobalRateLimiter, JobKind, JobOrigin, JobRecord, JobState, JobStore, PageMediaList, SessionHeaders};
 use tokio::{process::Command as TokioCommand, sync::{mpsc, watch}};
+
+/// Build a child-process command that never shows a console window on
+/// Windows. The app is windowless since Fix 5, so a console-subsystem
+/// child (reg, powershell.exe, ffmpeg, explorer) would otherwise get
+/// its own visible black window on every spawn — notably `reg query`,
+/// which runs on every startup for each saved browser ID. On other
+/// platforms this is just `Command::new`.
+fn hidden_command<S: AsRef<std::ffi::OsStr>>(program: S) -> Command {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut command = Command::new(program);
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        command
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Command::new(program)
+    }
+}
+
+/// Same as `hidden_command`, for async spawns: tokio's Command exposes
+/// no creation flag, so the flag is set on a std command and converted
+/// (From<std::process::Command> for tokio::process::Command).
+fn hidden_tokio_command<S: AsRef<std::ffi::OsStr>>(program: S) -> TokioCommand {
+    TokioCommand::from(hidden_command(program))
+}
 
 #[tauri::command]
 async fn inspect_video_url(url: String, referer: Option<String>) -> Result<Vec<thunderload_engine::VideoVariant>, String> {
@@ -372,7 +405,7 @@ async fn schedule_app_wake(
         let command = format!(
             "$when = [datetime]::ParseExact('{datetime_ps}', 'yyyy-MM-ddTHH:mm', [Globalization.CultureInfo]::InvariantCulture);              if ($when -le (Get-Date)) {{ throw 'The scheduled time must be in the future.' }};              $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File \"{script_path_ps}\"';              $trigger = New-ScheduledTaskTrigger -Once -At $when;              $settings = New-ScheduledTaskSettingsSet -WakeToRun -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries;              $principal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited;              Register-ScheduledTask -TaskName '{task_name_ps}' -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null"
         );
-        let result = Command::new("powershell.exe")
+        let result = hidden_command("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &command])
             .output()
             .map_err(|error| format!("Could not start Windows Task Scheduler: {error}"))?;
@@ -484,7 +517,7 @@ async fn cancel_app_wake(job_id: String, app: tauri::AppHandle) -> Result<(), St
     {
         let task_name = powershell_literal(&format!("ThunderLoad-{job_id}"));
         let command = format!("Unregister-ScheduledTask -TaskName '{task_name}' -Confirm:$false -ErrorAction SilentlyContinue");
-        let result = Command::new("powershell.exe")
+        let result = hidden_command("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &command])
             .output()
             .map_err(|error| format!("Could not update Windows Task Scheduler: {error}"))?;
@@ -806,6 +839,62 @@ fn native_manifest_dir(browser: &str, home: &Path) -> Option<PathBuf> {
     Some(dir)
 }
 
+/// Windows registry key for one browser's native-messaging host.
+/// Chromium has a family but no Windows registry path here, so it maps
+/// to None and callers reject it with the same message as before.
+#[cfg(target_os = "windows")]
+fn windows_native_registry_path(browser: &str) -> Option<&'static str> {
+    match browser {
+        "chrome" => Some(r"HKCU\Software\Google\Chrome\NativeMessagingHosts\com.thunderload.host"),
+        "edge" => Some(r"HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.thunderload.host"),
+        "brave" => Some(
+            r"HKCU\Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.thunderload.host",
+        ),
+        "firefox" => Some(r"HKCU\Software\Mozilla\NativeMessagingHosts\com.thunderload.host"),
+        _ => None,
+    }
+}
+
+/// Whether the manifest on disk actually authorises this extension ID
+/// and points at a host binary that still exists. A stale manifest
+/// (different ID, deleted host) does not count as registered.
+fn native_host_manifest_matches(
+    manifest_path: &Path,
+    family: NativeBrowserFamily,
+    extension_id: &str,
+) -> bool {
+    let text = match std::fs::read_to_string(manifest_path) {
+        Ok(text) => text,
+        Err(_) => return false,
+    };
+    let manifest: Value = match serde_json::from_str(&text) {
+        Ok(manifest) => manifest,
+        Err(_) => return false,
+    };
+    let authorised = match family {
+        NativeBrowserFamily::Chromium => {
+            manifest["allowed_origins"]
+                .as_array()
+                .map_or(false, |origins| {
+                    origins.iter().any(|origin| {
+                        origin.as_str() == Some(&format!("chrome-extension://{extension_id}/"))
+                    })
+                })
+        }
+        NativeBrowserFamily::Firefox => manifest["allowed_extensions"]
+            .as_array()
+            .map_or(false, |ids| {
+                ids.iter().any(|id| id.as_str() == Some(extension_id))
+            }),
+    };
+    if !authorised {
+        return false;
+    }
+    manifest["path"]
+        .as_str()
+        .map_or(false, |host| Path::new(host).is_file())
+}
+
 #[tauri::command]
 async fn register_native_host(
     browser: String,
@@ -819,16 +908,8 @@ async fn register_native_host(
         let family = native_browser_family(&browser)
             .ok_or_else(|| "Choose Chrome, Edge, Brave or Firefox.".to_string())?;
         validate_native_extension_id(family, extension_id)?;
-        let registry_path = match browser.as_str() {
-            "chrome" => r"HKCU\Software\Google\Chrome\NativeMessagingHosts\com.thunderload.host",
-            "edge" => r"HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.thunderload.host",
-            "brave" => {
-                r"HKCU\Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.thunderload.host"
-            }
-            "firefox" => r"HKCU\Software\Mozilla\NativeMessagingHosts\com.thunderload.host",
-            // "chromium" maps to a family above but has no Windows registry path.
-            _ => return Err("Choose Chrome, Edge, Brave or Firefox.".into()),
-        };
+        let registry_path = windows_native_registry_path(&browser)
+            .ok_or_else(|| "Choose Chrome, Edge, Brave or Firefox.".to_string())?;
         let resource_dir = app.path().resource_dir().map_err(|error| error.to_string())?;
         let source = resource_dir.join("native-host").join("thunderload-host.exe");
         if !source.is_file() {
@@ -844,7 +925,7 @@ async fn register_native_host(
         let manifest_path = install_dir.join(format!("{browser}-native-host.json"));
         let bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?;
         std::fs::write(&manifest_path, bytes).map_err(|error| format!("Could not write native host manifest: {error}"))?;
-        let status = Command::new("reg").args([
+        let status = hidden_command("reg").args([
             "add", registry_path, "/ve", "/t", "REG_SZ", "/d",
             manifest_path.to_string_lossy().as_ref(), "/f"
         ]).status().map_err(|error| format!("Could not register native host in Windows: {error}"))?;
@@ -898,6 +979,64 @@ async fn register_native_host(
     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
     {
         let _ = (browser, extension_id, app);
+        Err("Browser native-host setup is not supported on this platform.".into())
+    }
+}
+
+/// Whether the native host is currently registered for this browser and
+/// extension ID. The desktop checks this on startup so it can
+/// re-register silently when a saved ID exists but the registration
+/// went missing (browser reset, registry cleaner, moved install).
+/// Windows: the registry key must exist and point at the manifest file
+/// on disk. Other platforms: the manifest file in the browser's
+/// NativeMessagingHosts directory must authorise this ID. A manifest
+/// naming a different ID never counts as registered.
+#[tauri::command]
+async fn check_native_host(browser: String, extension_id: String) -> Result<bool, String> {
+    let browser = browser.trim().to_ascii_lowercase();
+    let extension_id = extension_id.trim();
+    #[cfg(target_os = "windows")]
+    {
+        let family = native_browser_family(&browser)
+            .ok_or_else(|| "Choose Chrome, Edge, Brave or Firefox.".to_string())?;
+        validate_native_extension_id(family, extension_id)?;
+        let registry_path = windows_native_registry_path(&browser)
+            .ok_or_else(|| "Choose Chrome, Edge, Brave or Firefox.".to_string())?;
+        let local_app_data = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .ok_or_else(|| "LOCALAPPDATA is not available.".to_string())?;
+        let manifest_path = local_app_data
+            .join("ThunderLoad")
+            .join("native-host")
+            .join(format!("{browser}-native-host.json"));
+        if !native_host_manifest_matches(&manifest_path, family, extension_id) {
+            return Ok(false);
+        }
+        let output = hidden_command("reg")
+            .args(["query", registry_path, "/ve"])
+            .output()
+            .map_err(|error| format!("Could not read native host registration: {error}"))?;
+        Ok(output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .contains(&manifest_path.to_string_lossy().into_owned()))
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let family = native_browser_family(&browser)
+            .ok_or_else(|| "Choose Chrome, Chromium, Edge, Brave or Firefox.".to_string())?;
+        validate_native_extension_id(family, extension_id)?;
+        let home = home_dir()?;
+        let manifest_dir = native_manifest_dir(&browser, &home)
+            .ok_or_else(|| "Choose Chrome, Chromium, Edge, Brave or Firefox.".to_string())?;
+        Ok(native_host_manifest_matches(
+            &manifest_dir.join("com.thunderload.host.json"),
+            family,
+            extension_id,
+        ))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (browser, extension_id);
         Err("Browser native-host setup is not supported on this platform.".into())
     }
 }
@@ -1048,7 +1187,7 @@ async fn set_ffmpeg_path(path: String, app: tauri::AppHandle) -> Result<String, 
         std::env::remove_var("THUNDERLOAD_FFMPEG");
         return Ok("Custom FFmpeg path cleared. ThunderLoad will look for ffmpeg on PATH.".into());
     }
-    let result = TokioCommand::new(&value).arg("-version").output().await
+    let result = hidden_tokio_command(&value).arg("-version").output().await
         .map_err(|error| format!("Could not start FFmpeg at '{value}': {error}"))?;
     if !result.status.success() {
         return Err(format!("FFmpeg returned a non-zero exit code when checking '{value}'."));
@@ -1463,7 +1602,7 @@ async fn open_download_folder() -> Result<(), String> {
     let folder = default_download_dir();
     std::fs::create_dir_all(&folder).map_err(|error| error.to_string())?;
     #[cfg(target_os = "windows")]
-    let result = Command::new("explorer").arg(&folder).spawn();
+    let result = hidden_command("explorer").arg(&folder).spawn();
     #[cfg(target_os = "macos")]
     let result = Command::new("open").arg(&folder).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -1512,7 +1651,7 @@ fn main() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![inspect_video_url, grab_page_media, start_download, pause_download, cancel_download, set_speed_limit, schedule_app_wake, cancel_app_wake, start_hls_download, start_dash_download, get_ffmpeg_path, set_ffmpeg_path, get_native_downloads, control_native_download, dismiss_native_download, register_native_host, open_download_folder, save_extension_file, get_jobs, sync_jobs, remove_job, cancel_queued_job])
+        .invoke_handler(tauri::generate_handler![inspect_video_url, grab_page_media, start_download, pause_download, cancel_download, set_speed_limit, schedule_app_wake, cancel_app_wake, start_hls_download, start_dash_download, get_ffmpeg_path, set_ffmpeg_path, get_native_downloads, control_native_download, dismiss_native_download, register_native_host, check_native_host, open_download_folder, save_extension_file, get_jobs, sync_jobs, remove_job, cancel_queued_job])
         .run(tauri::generate_context!())
         .expect("error while running ThunderLoad desktop app");
 }
@@ -1655,8 +1794,8 @@ mod scheduler_tests {
 #[cfg(test)]
 mod native_host_tests {
     use super::{
-        native_browser_family, native_host_manifest, validate_native_extension_id,
-        NativeBrowserFamily,
+        native_browser_family, native_host_manifest, native_host_manifest_matches,
+        validate_native_extension_id, NativeBrowserFamily,
     };
     use std::path::Path;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1743,6 +1882,45 @@ mod native_host_tests {
         assert_eq!(firefox["allowed_extensions"][0], "thunderload@example.com");
         assert_eq!(firefox["path"], "/opt/thunderload-host");
         assert!(firefox.get("allowed_origins").is_none());
+    }
+
+    #[test]
+    fn manifest_match_needs_the_same_id_and_a_real_host() {
+        let dir = std::env::temp_dir().join("thunderload-native-host-check-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let host = dir.join("thunderload-host");
+        std::fs::write(&host, b"fake-host").unwrap();
+        let manifest_path = dir.join("com.thunderload.host.json");
+        let manifest = native_host_manifest(
+            NativeBrowserFamily::Chromium,
+            "abcdefghijklmnopabcdefghijklmnop",
+            &host,
+        );
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(native_host_manifest_matches(
+            &manifest_path,
+            NativeBrowserFamily::Chromium,
+            "abcdefghijklmnopabcdefghijklmnop"
+        ));
+        // A different extension ID is not authorised by this manifest.
+        assert!(!native_host_manifest_matches(
+            &manifest_path,
+            NativeBrowserFamily::Chromium,
+            "ponmlkjihgfedcbaponmlkjihgfedcba"
+        ));
+        // A manifest pointing at a deleted host is not a live registration.
+        std::fs::remove_file(&host).unwrap();
+        assert!(!native_host_manifest_matches(
+            &manifest_path,
+            NativeBrowserFamily::Chromium,
+            "abcdefghijklmnopabcdefghijklmnop"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(target_os = "linux")]

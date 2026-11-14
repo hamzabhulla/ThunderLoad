@@ -7,6 +7,22 @@ const sourcesByTab = new Map();
 const truncatedByTab = new Map();
 const MAX_SOURCES_PER_TAB = 100;
 
+// Fix 3: the ThunderLoad app / native host is required for Direct
+// media. A googlevideo segment downloaded by the browser is one
+// audio/video chunk, not the video, so there is no silent browser
+// fallback any more: a missing permission or a disconnected host
+// surfaces this error instead, pointing at the desktop app's
+// one-time Browser setup (the setup steps themselves live in the
+// desktop app, not here).
+const NATIVE_NOT_CONNECTED_ERROR = "ThunderLoad app is not connected. Open the ThunderLoad desktop app and complete the one-time Browser setup, then try again.";
+function isNativeConnectionError(message) {
+  return /permission has not been granted|disconnected|timed out|native messaging host not found/i.test(String(message || ""));
+}
+function nativeErrorMessage(message) {
+  const text = String(message || "");
+  return isNativeConnectionError(text) ? NATIVE_NOT_CONNECTED_ERROR : text;
+}
+
 async function browserDownload(url, filename) {
   const options = { url, filename: filename || undefined, saveAs: false, conflictAction: "uniquify" };
   try {
@@ -113,58 +129,46 @@ function safeFilenameFromUrl(url, fallback = "download.bin") {
 
 async function quickDownloadMedia({ url, kind, pageUrl, filename, selectedVariant }) {
   const name = filename || safeFilenameFromUrl(url, kind === "HLS playlist" ? "video.mp4" : "download.bin");
-  const nativePermission = await hasNativePermission();
 
-  // Prefer the ThunderLoad engine when the optional native bridge is installed.
-  // A failed inspection/start must never block an ordinary direct-file download.
-  if (nativePermission) {
-    const inspected = await requestNative("video.inspect", { url, referer: pageUrl || "" });
-    if (inspected?.ok) {
-      const variants = Array.isArray(inspected.data?.variants) ? inspected.data.variants : [];
-      const downloadable = variants.filter((item) => item?.downloadable && item?.url);
-      downloadable.sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bandwidth || 0) - (a.bandwidth || 0));
-      const selected = selectedVariant && selectedVariant.downloadable && selectedVariant.url
-        ? selectedVariant
-        : downloadable[0];
-      if (selected) {
-        const action = selected.kind === "hls" ? "video.download" : selected.kind === "dash" ? "dash.download" : "download.start";
-        const result = await requestNative(action, {
-          url: selected.url,
-          filename: selected.kind === "hls" || selected.kind === "dash" ? (name.replace(/\.[^.]+$/, "") + ".mp4") : name,
-          referer: pageUrl || "",
-          representationId: selected.representationId,
-          audioRepresentationId: selected.audioRepresentationId || ""
-        });
-        if (result?.ok) {
-          return { ok: true, message: selected.quality && variants.length > 1
-            ? "Downloading " + selected.quality + " in ThunderLoad."
-            : "Download started in ThunderLoad." };
-        }
-        if (kind !== "Direct media") {
-          return { ok: false, error: result?.error || "ThunderLoad could not start this download." };
-        }
-      } else if (kind !== "Direct media") {
-        return { ok: false, error: variants[0]?.note || "No downloadable stream was exposed by this page." };
-      }
-    } else if (kind !== "Direct media") {
-      return { ok: false, error: inspected?.error || "Could not inspect this media source." };
-    }
+  // Fix 3: no silent browser fallback. A "Direct media" entry is
+  // often one googlevideo DASH segment — a single audio or video
+  // chunk, not the video — so downloading it in the browser produced
+  // the audio-only bug with no error at all. Every path below either
+  // starts the download in the ThunderLoad engine or returns a clear
+  // error telling the user the desktop app / native host is not
+  // connected and to complete the one-time Browser setup in the
+  // desktop app. There is no explicit "Download in browser" action
+  // in the overlay, so no browser-download path remains here.
+  if (!(await hasNativePermission())) {
+    return { ok: false, error: NATIVE_NOT_CONNECTED_ERROR };
   }
-
-  // Direct files always have a browser-download fallback, whether the native
-  // permission is absent, the host is disconnected, or the desktop engine fails.
-  if (kind === "Direct media") {
-    const result = await browserDownload(url, name);
-    if (result?.ok) return { ok: true, message: "Download started in your browser." };
-    return { ok: false, error: result?.error || "Your browser could not start this download." };
+  const inspected = await requestNative("video.inspect", { url, referer: pageUrl || "" });
+  if (!inspected?.ok) {
+    return { ok: false, error: nativeErrorMessage(inspected?.error || "Could not inspect this media source.") };
   }
-
-  return {
-    ok: false,
-    error: nativePermission
-      ? "Adaptive video could not be started by the ThunderLoad engine."
-      : "Adaptive video needs the desktop companion. Open the extension popup and choose Download to grant its connection permission."
-  };
+  const variants = Array.isArray(inspected.data?.variants) ? inspected.data.variants : [];
+  const downloadable = variants.filter((item) => item?.downloadable && item?.url);
+  downloadable.sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bandwidth || 0) - (a.bandwidth || 0));
+  const selected = selectedVariant && selectedVariant.downloadable && selectedVariant.url
+    ? selectedVariant
+    : downloadable[0];
+  if (!selected) {
+    return { ok: false, error: variants[0]?.note || "No downloadable stream was exposed by this page." };
+  }
+  const action = selected.kind === "hls" ? "video.download" : selected.kind === "dash" ? "dash.download" : "download.start";
+  const result = await requestNative(action, {
+    url: selected.url,
+    filename: selected.kind === "hls" || selected.kind === "dash" ? (name.replace(/\.[^.]+$/, "") + ".mp4") : name,
+    referer: pageUrl || "",
+    representationId: selected.representationId,
+    audioRepresentationId: selected.audioRepresentationId || ""
+  });
+  if (result?.ok) {
+    return { ok: true, message: selected.quality && variants.length > 1
+      ? "Downloading " + selected.quality + " in ThunderLoad."
+      : "Download started in ThunderLoad." };
+  }
+  return { ok: false, error: nativeErrorMessage(result?.error || "ThunderLoad could not start this download.") };
 }
 
 api.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -172,8 +176,8 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const tabId = sender.tab?.id;
     if (typeof tabId === "number") {
       const map = new Map((sourcesByTab.get(tabId) || []).map((item) => [item.url, item]));
-      for (const item of (message.sources || [])) if (item?.url && /^https?:\/\//i.test(item.url)) map.set(item.url, item);
-      const all = Array.from(map.values());
+      for (const item of (message.sources || [])) if (item?.url && /^https?:\/\//i.test(item.url)) map.set(item.url, enrichSource(item));
+      const all = sortSources(Array.from(map.values()));
       if (all.length > MAX_SOURCES_PER_TAB || message.truncated) truncatedByTab.set(tabId, true);
       sourcesByTab.set(tabId, all.slice(0, MAX_SOURCES_PER_TAB));
     }
@@ -202,7 +206,7 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
         // (content script blocked) clears the flag as well.
         if (scanResult?.truncated) truncatedByTab.set(tab.id, true);
         else truncatedByTab.delete(tab.id);
-        sendResponse({ ok: true, tabId: tab.id, sources: sourcesByTab.get(tab.id) || [], pageUrl: tab.url || "", truncated: !!truncatedByTab.get(tab.id) });
+        sendResponse({ ok: true, tabId: tab.id, sources: sortSources(sourcesByTab.get(tab.id) || []), pageUrl: tab.url || "", truncated: !!truncatedByTab.get(tab.id) });
       } catch (error) {
         sendResponse({ ok: false, error: error?.message || "This page does not allow extension scanning" });
       }
@@ -240,10 +244,64 @@ api.tabs.onRemoved.addListener((tabId) => { sourcesByTab.delete(tabId); truncate
 // extension used by content.js so both paths report the same kinds.
 const NETWORK_MEDIA_EXT = /\.(?:m3u8|mpd|mp4|m4v|mov|webm|mkv|avi|mp3|m4a|aac|wav|ogg|opus|flac|pdf|zip)(?:$|[?#])/i;
 const NETWORK_SEGMENT_EXT = /\.(?:ts|m4s|cmfv|cmfa)(?:$|[?#])/i;
+// Fix 3 — YouTube segment labels + DASH-manifest-first ordering.
+// A googlevideo segment URL carries its media type in query params
+// (mime=audio/mp4 vs mime=video/mp4, itag=140 for audio-only AAC),
+// so the popup can tell an audio chunk from a video chunk instead
+// of listing every segment as a blind "Direct media" card.
+const YOUTUBE_DASH_MANIFEST = /(?:^|[\/.])youtube\.com\/api\/manifest\/dash(?:[\/?#]|$)/i;
+const DASH_NOTE = "Downloads the full video with audio via the ThunderLoad app.";
+function parseGoogleVideoSegment(url) {
+  try {
+    const parsed = new URL(url);
+    if (!/\.googlevideo\.com$/i.test(parsed.hostname)) return null;
+    const mime = parsed.searchParams.get("mime") || "";
+    const itag = parsed.searchParams.get("itag") || "";
+    if (!mime && !itag) return null;
+    const mediaType = /^audio\//i.test(mime) ? "audio" : /^video\//i.test(mime) ? "video" : null;
+    if (!mediaType && !/^\d+$/.test(itag)) return null;
+    return { mediaType, itag: itag || null };
+  } catch (_) { return null; }
+}
+function enrichSource(item) {
+  if (!item?.url) return item;
+  const url = item.url;
+  if (YOUTUBE_DASH_MANIFEST.test(url)) {
+    return { ...item, kind: "DASH manifest", label: "YouTube video (DASH)", note: DASH_NOTE, isYouTubeDash: true };
+  }
+  if (item.kind === "DASH manifest") {
+    return { ...item, label: "DASH manifest", note: DASH_NOTE };
+  }
+  if (item.kind === "Direct media") {
+    const segment = parseGoogleVideoSegment(url);
+    if (segment) {
+      const type = segment.mediaType === "audio" ? "Audio" : segment.mediaType === "video" ? "Video" : "Media";
+      return { ...item, label: segment.itag ? type + " (itag " + segment.itag + ")" : type, mediaType: segment.mediaType, itag: segment.itag };
+    }
+  }
+  return item;
+}
+function sourceRank(item) {
+  if (item.kind === "DASH manifest") return item.isYouTubeDash ? 0 : 1;
+  if (item.kind === "HLS playlist") return 2;
+  if (item.kind === "Direct media") return item.mediaType === "video" ? 3 : item.mediaType === "audio" ? 4 : 5;
+  return 6;
+}
+function sortSources(list) {
+  return [...list].sort((a, b) => sourceRank(a) - sourceRank(b) || (a.discoveredAt || 0) - (b.discoveredAt || 0));
+}
 function classifyNetworkResponse(url, headers) {
   if (!url || !/^https?:\/\//i.test(url)) return null;
   const contentType = (headers || []).find((header) => header.name?.toLowerCase() === "content-type")?.value?.toLowerCase() || "";
   if (/\.m3u8(?:$|[?#])/i.test(url) || contentType.includes("application/x-mpegurl") || contentType.includes("application/vnd.apple.mpegurl")) return "HLS playlist";
+  // YouTube's DASH manifest has no .mpd suffix, and its Content-Type
+  // is not relied on here: match the manifest URL pattern itself, so
+  // detection works whichever Content-Type YouTube serves it with.
+  // (The application/dash+xml check below stays as a second trigger
+  // for manifests served with that type.) The manifest is fetched
+  // via XHR, which the onHeadersReceived listener below already
+  // observes, so no new webRequest filter was needed.
+  if (YOUTUBE_DASH_MANIFEST.test(url)) return "DASH manifest";
   if (/\.mpd(?:$|[?#])/i.test(url) || contentType.includes("application/dash+xml")) return "DASH manifest";
   if (NETWORK_SEGMENT_EXT.test(url)) return null;
   if (contentType.startsWith("video/") || contentType.startsWith("audio/")) return "Direct media";
@@ -253,8 +311,12 @@ function classifyNetworkResponse(url, headers) {
 function recordNetworkSource(tabId, url, kind) {
   if (typeof tabId !== "number" || tabId < 0) return;
   const map = new Map((sourcesByTab.get(tabId) || []).map((item) => [item.url, item]));
-  if (!map.has(url)) map.set(url, { url, kind, label: kind, discoveredAt: Date.now() });
-  const all = Array.from(map.values());
+  // Re-enrich an existing entry too: a segment first seen by the DOM
+  // scan arrives as a bare "Direct media" label, and only the network
+  // observer knows its mime/itag.
+  const previous = map.get(url);
+  map.set(url, enrichSource({ url, kind, label: previous?.label || kind, discoveredAt: previous?.discoveredAt || Date.now() }));
+  const all = sortSources(Array.from(map.values()));
   if (all.length > MAX_SOURCES_PER_TAB) truncatedByTab.set(tabId, true);
   sourcesByTab.set(tabId, all.slice(0, MAX_SOURCES_PER_TAB));
 }

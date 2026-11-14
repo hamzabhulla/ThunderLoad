@@ -10,6 +10,7 @@ button{cursor:pointer}.secondary{min-height:30px;padding:0 10px;border:1px solid
 .section-head{margin-bottom:10px}.section-head h2{margin:0 0 3px;color:#e8eef5;font-size:12px;font-weight:650}.count{min-width:23px;padding:4px 7px;border:1px solid #34495e;border-radius:5px;background:#1a2837;color:#bad7f7;text-align:center;font-size:9px}
 .source-list{display:grid;gap:8px;max-height:280px;overflow:auto}.source-card{padding:11px;border:1px solid #2c3845;border-radius:7px;background:#1a222c}
 .source-head{display:flex;justify-content:space-between;align-items:flex-start;gap:9px}.source-info{min-width:0}.source-title{overflow:hidden;color:#e6edf5;font-size:11px;font-weight:600;text-overflow:ellipsis;white-space:nowrap}.kind{margin-top:3px;color:#8b9eb2;font-size:9px}
+.source-note{margin-top:3px;color:#8daed1;font-size:9px;line-height:1.5}
 .grab-bar{display:flex;gap:7px;margin-bottom:10px}.grab-bar .primary{flex:1}.grab-bar[hidden]{display:none}
 .source-check{margin-top:2px;flex:none;accent-color:#4a79aa}
 .truncated-note{margin-bottom:10px;padding:7px 9px;border:1px solid #55472d;border-radius:5px;background:#241f16;color:#c8ae77;font-size:9px;line-height:1.5}.truncated-note[hidden]{display:none}

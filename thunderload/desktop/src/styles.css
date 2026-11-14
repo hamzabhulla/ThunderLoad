@@ -24,6 +24,15 @@
 .native-host-grid .field{height:34px;font-size:10px}
 .native-host-grid .secondary-button{height:34px;white-space:nowrap}
 .native-host-notice{padding:9px 10px;border:1px solid #34465a;border-radius:5px;background:#121a23}
+.setup-banner{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:14px;padding:12px 14px;border:1px solid #8a6d1f;border-radius:8px;background:#241d0c}
+.setup-banner strong{display:block;color:#f5cf6b;font-size:12px}
+.setup-banner p{margin:4px 0 0;color:#d8c690;font-size:11px;line-height:1.5}
+.setup-banner-actions{display:flex;gap:8px;align-items:center;flex-shrink:0}
+.setup-banner-actions .primary-button{height:34px;white-space:nowrap}
+.setup-steps{margin:12px 0 0;padding-left:18px;color:#91a0b0;font-size:11px;line-height:1.6}
+.setup-steps li{margin-bottom:6px}
+.setup-steps strong{color:#c6d2e0}
+.setup-steps code{color:#c6d2e0}
 @media(max-width:1100px){.native-host-grid{grid-template-columns:1fr 1fr}.native-host-grid>button{grid-column:2}}
 
 .schedule-row{display:grid;grid-template-columns:110px minmax(200px,360px);align-items:center;gap:12px;margin-top:14px}

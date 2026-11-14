@@ -8,7 +8,7 @@ use quick_xml::{events::Event, Reader};
 use futures_util::StreamExt;
 use std::collections::{HashMap, HashSet};
 use url::Url;
-use crate::download::{default_download_dir, partial_download_metadata_path, safe_filename, DownloadControl, DownloadOutcome, DownloadProgress, GlobalRateLimiter};
+use crate::download::{default_download_dir, partial_download_metadata_path, safe_filename, DownloadControl, DownloadOutcome, DownloadProgress, GlobalRateLimiter, WEBPAGE_NOT_MEDIA_MESSAGE};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -143,9 +143,7 @@ pub async fn inspect_video(url: &str, session: Option<&SessionHeaders>) -> Resul
         return Ok(vec![direct_variant(url)]);
     }
 
-    Err(anyhow!(
-        "This URL is a webpage, not a direct media file. Paste an MP4/audio URL or an HLS playlist. Page extraction is not available for this source."
-    ))
+    Err(anyhow!(WEBPAGE_NOT_MEDIA_MESSAGE))
 }
 
 async fn fetch_text(url: &str, session: Option<&SessionHeaders>) -> Result<String> {
@@ -1437,9 +1435,30 @@ fn parse_dash_representations(body: &str, manifest_url: &str) -> Vec<VideoVarian
     out
 }
 
+/// Build a child-process command that never shows a console window on
+/// Windows (CREATE_NO_WINDOW, 0x08000000). The engine runs inside the
+/// windowless desktop app and native host, so a console-subsystem child
+/// (ffmpeg/ffprobe) would otherwise flash its own black window on every
+/// spawn — including every DASH/HLS mux. On other platforms this is just
+/// `TokioCommand::new`. tokio's Command exposes no creation flag, so the
+/// flag is set on a std command and converted
+/// (From<std::process::Command> for tokio::process::Command).
+fn hidden_command<S: AsRef<std::ffi::OsStr>>(program: S) -> TokioCommand {
+    #[cfg(target_os = "windows")]
+    let std_command = {
+        use std::os::windows::process::CommandExt;
+        let mut std_command = std::process::Command::new(program);
+        std_command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        std_command
+    };
+    #[cfg(not(target_os = "windows"))]
+    let std_command = std::process::Command::new(program);
+    TokioCommand::from(std_command)
+}
+
 async fn ffmpeg_available() -> bool {
     let executable = std::env::var_os("THUNDERLOAD_FFMPEG").unwrap_or_else(|| "ffmpeg".into());
-    TokioCommand::new(executable).arg("-version").output().await
+    hidden_command(executable).arg("-version").output().await
         .map(|output| output.status.success()).unwrap_or(false)
 }
 
@@ -1857,7 +1876,7 @@ async fn assemble_hls_track(work_dir: &Path, state: &HlsJobState, audio: bool, o
 /// at the mux step instead of re-downloading.
 async fn mux_hls_tracks(video_track: &Path, audio_track: &Path, output: &Path) -> Result<()> {
     let executable = std::env::var_os("THUNDERLOAD_FFMPEG").unwrap_or_else(|| "ffmpeg".into());
-    let result = TokioCommand::new(&executable)
+    let result = hidden_command(&executable)
         .arg("-hide_banner").arg("-loglevel").arg("error").arg("-y")
         .arg("-i").arg(video_track)
         .arg("-i").arg(audio_track)
@@ -2535,7 +2554,7 @@ async fn ffmpeg_mux_dash_tracks(
     output: &Path,
 ) -> Result<()> {
     let executable = std::env::var_os("THUNDERLOAD_FFMPEG").unwrap_or_else(|| "ffmpeg".into());
-    let result = TokioCommand::new(executable)
+    let result = hidden_command(executable)
         .arg("-hide_banner").arg("-loglevel").arg("error").arg("-y")
         .arg("-i").arg(video_file)
         .arg("-i").arg(audio_file)
@@ -2565,7 +2584,7 @@ async fn ffmpeg_concat_dash_tracks(files: &[PathBuf], output: &Path) -> Result<(
     }
     fs::write(&list_path, list).await?;
     let executable = std::env::var_os("THUNDERLOAD_FFMPEG").unwrap_or_else(|| "ffmpeg".into());
-    let result = TokioCommand::new(executable)
+    let result = hidden_command(executable)
         .arg("-hide_banner").arg("-loglevel").arg("error").arg("-y")
         .arg("-f").arg("concat").arg("-safe").arg("0")
         .arg("-i").arg(&list_path)
@@ -3174,7 +3193,7 @@ async fn dash_stopped_outcome(stopped: DownloadControl, target: &Path) -> Downlo
 mod tests {
     use super::{
         dash_output_extension, dash_work_dir, download_dash_into, download_dash_resumable,
-        expand_dash_template, is_complete_vod_playlist, parse_dash_document,
+        expand_dash_template, hidden_command, is_complete_vod_playlist, parse_dash_document,
         parse_dash_representations, parse_dash_sidx, parse_hls_master, resolve_dash_track,
         unsupported_hls_master_reason, unsupported_hls_reason, DashCheckpointTrack, DashJobState,
         DownloadControl, DownloadOutcome, partial_download_metadata_path, SessionHeaders,
@@ -3792,7 +3811,7 @@ mod tests {
     async fn generate_dash_fmp4_track(dir: &std::path::Path, video: bool) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
         tokio::fs::create_dir_all(dir).await.ok()?;
         let executable = std::env::var_os("THUNDERLOAD_FFMPEG").unwrap_or_else(|| "ffmpeg".into());
-        let mut command = tokio::process::Command::new(&executable);
+        let mut command = hidden_command(&executable);
         command.arg("-y");
         if video {
             command.arg("-f").arg("lavfi").arg("-i").arg("testsrc=duration=2:size=128x72:rate=10")
@@ -3828,7 +3847,7 @@ mod tests {
     /// Lists the stream types of a media file with ffprobe plus its
     /// duration in seconds, or None when ffprobe is not available.
     async fn probe_dash_media(path: &std::path::Path) -> Option<(Vec<String>, f64)> {
-        let output = tokio::process::Command::new("ffprobe")
+        let output = hidden_command("ffprobe")
             .arg("-v").arg("error")
             .arg("-show_entries").arg("stream=codec_type")
             .arg("-show_entries").arg("format=duration")
@@ -4734,7 +4753,7 @@ mod tests {
 #[cfg(test)]
 mod hls_download_tests {
     use super::{
-        download_hls_resumable, ffmpeg_available, hls_output_extension, hls_work_dir,
+        download_hls_resumable, ffmpeg_available, hidden_command, hls_output_extension, hls_work_dir,
         partial_download_metadata_path, validate_hls_content_range,
         DownloadControl, DownloadOutcome, GlobalRateLimiter, SessionHeaders,
     };
@@ -4991,7 +5010,7 @@ mod hls_download_tests {
     async fn generate_fmp4_track(dir: &std::path::Path, video: bool) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
         tokio::fs::create_dir_all(dir).await.ok()?;
         let executable = std::env::var_os("THUNDERLOAD_FFMPEG").unwrap_or_else(|| "ffmpeg".into());
-        let mut command = tokio::process::Command::new(&executable);
+        let mut command = hidden_command(&executable);
         command.arg("-y");
         if video {
             command.arg("-f").arg("lavfi").arg("-i").arg("testsrc=duration=2:size=128x72:rate=10")
@@ -5027,7 +5046,7 @@ mod hls_download_tests {
     /// Lists the stream types of a media file with ffprobe, or None when
     /// ffprobe is not available (the caller falls back to an ftyp check).
     async fn probe_stream_types(path: &std::path::Path) -> Option<Vec<String>> {
-        let output = tokio::process::Command::new("ffprobe")
+        let output = hidden_command("ffprobe")
             .arg("-v").arg("error")
             .arg("-show_entries").arg("stream=codec_type")
             .arg("-of").arg("csv=p=0")
