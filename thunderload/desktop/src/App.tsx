@@ -336,11 +336,11 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     // so it survives a restart even if it never gets a download slot
     // before the app closes.
     void invoke("sync_jobs", { jobs: [itemToSyncJob(item)] }).catch(() => {});
-    setNotice(scheduledAt ? "Added to queue. Registering Windows wake task…" : "Added to queue.");
+    setNotice(scheduledAt ? "Added to queue. Registering scheduled wake…" : "Added to queue.");
     if (scheduledAt) {
       void invoke<string>("schedule_app_wake", { jobId: item.id, localDateTime: scheduleAt })
         .then((status) => setNotice(status))
-        .catch((error) => setNotice("Queued locally, but Windows could not register a wake task: " + String(error)));
+        .catch((error) => setNotice("Queued locally, but a scheduled wake task could not be registered: " + String(error)));
     }
     setUrl(""); setFilename(""); setScheduleAt("");
   }
@@ -727,7 +727,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
             <div><h2>DASH video support</h2><p>Static DASH VOD with separate audio/video tracks needs FFmpeg to combine the selected quality into one MP4 file.</p></div>
             <div className="ffmpeg-row">
               <label htmlFor="ffmpeg-path">FFmpeg executable path</label>
-              <input id="ffmpeg-path" className="field" value={ffmpegPath} onChange={(event) => setFfmpegPath(event.target.value)} placeholder="C:\Tools\ffmpeg\bin\ffmpeg.exe or ffmpeg" />
+              <input id="ffmpeg-path" className="field" value={ffmpegPath} onChange={(event) => setFfmpegPath(event.target.value)} placeholder="ffmpeg" />
               <button className="secondary-button" onClick={saveFfmpegPath} disabled={ffmpegSaving}>{ffmpegSaving ? "Checking…" : "Verify & save"}</button>
             </div>
             {ffmpegStatus && <div className="notice native-host-notice">{ffmpegStatus}</div>}
