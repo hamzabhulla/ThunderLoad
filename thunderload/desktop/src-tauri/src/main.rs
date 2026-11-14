@@ -584,7 +584,7 @@ async fn start_download(
     let name = safe_filename(&filename, "download.bin");
     let target = match target_path {
         Some(path) => PathBuf::from(path),
-        None => reserve_download_path(&default_download_dir().join(name)).await.map_err(|error| error.to_string())?,
+        None => reserve_download_path(&default_download_dir().join(&name)).await.map_err(|error| error.to_string())?,
     };
     let _ = connections; // Resumable transfers use one stream so their checkpoint is continuous.
     let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
@@ -656,7 +656,7 @@ async fn start_hls_download(
     // at start and can offer Cancel while the job is running.
     let target = match target_path {
         Some(path) => PathBuf::from(path),
-        None => reserve_download_path(&default_download_dir().join(name)).await.map_err(|error| error.to_string())?,
+        None => reserve_download_path(&default_download_dir().join(&name)).await.map_err(|error| error.to_string())?,
     };
     let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
     {
