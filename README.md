@@ -1,24 +1,116 @@
 # ThunderLoad
 
-ThunderLoad is a cross-platform download manager project with a Rust transfer engine, a Tauri desktop client, and browser-specific extensions.
+[![CI](https://github.com/hamzabhulla/ThunderLoad/actions/workflows/ci.yml/badge.svg)](https://github.com/hamzabhulla/ThunderLoad/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+![Version](https://img.shields.io/badge/version-0.3.0-blue)
 
-## Project layout
-- thunderload/engine — Rust HTTP range downloader and HLS/DASH inspection.
-- thunderload/desktop — Tauri + React desktop client, with NSIS (Windows), deb/AppImage (Linux) and DMG (macOS) configuration.
-- thunderload/extension — Chromium and Firefox extension source.
-- thunderload/native-host — optional local Native Messaging bridge.
-- thunderload/docs — browser distribution, store submission and privacy notes.
+**A cross-platform download manager that treats an interrupted download as a pause, not a failure — a Rust engine, a Tauri desktop app, and a browser extension that work as one queue.**
 
-## Status
-This is an active release-candidate starter, not a production-ready IDM replacement. HLS is limited to exposed, unencrypted playlists. DASH quality detection exists, but DASH downloading/remuxing is not implemented. Pause/resume persistence, queue persistence, code signing and live browser testing remain release blockers.
+ThunderLoad is an IDM-style download manager for Windows, Linux, and macOS. It downloads files, HLS streams, and DASH videos with multi-connection checkpoint resume, a persistent job queue, and desktop controls for jobs started in the browser — so a closed laptop, a crashed app, or a dead connection costs you the remaining bytes, not the whole file.
 
-## Build and release
-See thunderload/README.md. GitHub Actions checks source on pushes and pull requests; tags beginning with v build a Windows NSIS setup executable and Chromium/Firefox extension packages.
+> **Status:** v0.3.0, active development. CI is green on Windows, Linux, and macOS. 138 engine tests passing, 0 warnings (engine + host). See [Current limitations](#current-limitations) for what is not done yet — no code signing, no real-machine smoke test, no store listings.
 
-## Browser distribution
-- Chromium package: Chrome, Edge, Brave, Opera and Vivaldi starting point.
-- Firefox: separate manifest build; Mozilla AMO signing is required for release/beta Firefox.
-- Safari: separate macOS/Xcode wrapper not included.
+## Quick start
 
-## Privacy
-See the draft privacy policy at thunderload/docs/PRIVACY.md. Before store submission, publish it at a public URL and replace its contact placeholder with a monitored support address.
+Prerequisites: Rust stable + Cargo, Node.js 20+, npm. Windows also needs Microsoft C++ Build Tools and WebView2; Linux needs the Tauri system libraries (see `thunderload/README.md`); macOS needs Xcode Command Line Tools.
+
+```sh
+git clone https://github.com/hamzabhulla/ThunderLoad.git
+cd ThunderLoad/thunderload
+cargo build --release -p thunderload-host
+npm install --prefix desktop
+npm run build --prefix desktop
+npm run tauri --prefix desktop -- build
+```
+
+On Linux and macOS, copy the host binary first, or the build rejects the missing resource:
+
+```sh
+cp target/release/thunderload-host target/release/thunderload-host.exe
+```
+
+Outputs: NSIS setup under `target/release/bundle/nsis/` (Windows), `.deb` / `.AppImage` under `target/release/bundle/deb/` and `target/release/bundle/appimage/` (Linux), `.dmg` under `target/release/bundle/dmg/` (macOS). GitHub Actions builds all three on pushes to main and on pull requests.
+
+Verify the engine yourself:
+
+```sh
+cargo test -p thunderload-engine
+cargo run --release -p thunderload-engine --bin bench
+```
+
+<!-- Screenshots: pending real screenshots from Hamza's machine (docs/screenshots/desktop-queue.png, extension-popup.png, demo.gif). No AI-generated imagery — add the section back once the files exist. -->
+
+## Features
+
+**Downloads that survive interruptions**
+- Multi-connection checkpoint resume: up to 8 parallel connections against one preallocated file, per-segment completion persisted in a metadata sidecar. Pause, resume, and restart recovery all re-fetch only the unfinished bytes.
+- Dynamic segmentation: fresh downloads split into near-equal chunks (≥256 KiB, ≤1024 chunks) and connections pull work-stealing style, so a fast connection takes the larger share. A connection silent for 30 s has its chunk re-assigned (max 3 re-assignments, then the download errors with its checkpoint preserved).
+- A durable job database (`jobs.json`, atomic writes): the queue survives restarts and crashes. Interrupted jobs come back resumable, paused jobs stay paused, orphaned checkpoints on disk are imported as Interrupted jobs.
+- Scheduled starts with a one-time OS wake task — Task Scheduler on Windows, systemd user timer on Linux, launchd agent on macOS.
+
+**Video: HLS and DASH**
+- HLS VOD with pause/resume/cancel, byte-range slices, fMP4 (init + fragments), and separate audio renditions muxed with FFmpeg.
+- DASH VOD with SegmentTemplate, SegmentList, SegmentBase (sidx), and multi-period MPDs; pause/resume/cancel backed by an on-disk checkpoint; separate audio/video muxed with FFmpeg.
+- Live playlists, dynamic MPDs, and DRM are not supported — DRM never, by design.
+
+**Browser integration**
+- Chrome/Firefox extension (Chromium ZIP + Firefox XPI) with automatic media detection, an in-player Download control, and a site grabber: tick what you want from the active page, up to 100 items per batch.
+- The desktop app controls browser-started jobs of every kind — pause, resume, and cancel from one queue — via the local native-messaging host.
+- Cookie/header handoff: the extension passes the download URL's cookies (that URL only), referer, and user-agent to the engine, so cookie-bound and signed URLs work. Cookies are sent only to their own origin, never follow a cross-origin redirect, and are never logged.
+
+**Cross-platform**
+- Windows 10/11, Linux, macOS. Same engine, same queue, same controls everywhere.
+
+## Benchmarks
+
+Measured with the built-in bench binary (`cargo run --release -p thunderload-engine --bin bench`) against localhost fixture servers, Linux VM, 4 CPUs, 2026-11-14. Full methodology in [`thunderload/BENCHMARKS.md`](thunderload/BENCHMARKS.md).
+
+| Bench | Throughput |
+|---|---|
+| Direct, 1 connection | 70 MiB/s |
+| Direct, 2 connections | 126 MiB/s |
+| Direct, 4 connections | 209 MiB/s |
+| Direct, 8 connections | 311 MiB/s |
+| Direct, 16 connections | 615 MiB/s |
+| Direct, sequential (one-shot) | 57 MiB/s |
+| HLS (32 × 1 MiB segments) | 175 MiB/s |
+| DASH (32 × 1 MiB segments) | 173 MiB/s |
+
+The checkpointed 8-connection path is ~5.5× the one-shot sequential path on the same 64 MiB file. These are engine-parallelism numbers under a per-chunk server-latency model — not real-internet throughput, and **no ThunderLoad-vs-IDM comparison has been run or is claimed**.
+
+## Architecture
+
+One Rust engine does all the transferring; thin clients drive it. The desktop app (Tauri 2 + React) owns the queue and the job database, the browser extension finds media and starts jobs, and a small Rust native-messaging host bridges the two on the user's machine. Checkpoints and job state live on disk, so nothing is lost when a process dies.
+
+```
+thunderload/
+├── engine/      Rust transfer engine: HTTP ranges, HLS, DASH, job store, session handoff
+├── desktop/     Tauri 2 + React client (Downloads, Queue, Video Grabber, Settings)
+├── extension/   Chromium + Firefox extension (media detection, grabber, popup)
+├── native-host/ Rust native-messaging bridge between extension and desktop
+└── docs/        Browser distribution, store submission, and privacy notes
+```
+
+## Contributing
+
+Issues and pull requests are welcome. For anything large, open an issue first so the design can be agreed before code is written. A `CONTRIBUTING.md` with setup and review notes is on the way.
+
+## Current limitations
+
+Stated plainly, because a README that hides them is worse than useless:
+
+- **No code signing yet.** Installers will trigger SmartScreen / Gatekeeper warnings until a certificate is configured.
+- **No real-machine smoke test yet.** CI is green on all three platforms, but no one has run the built installers on a real Windows, Linux, or macOS machine.
+- **Store listings not submitted.** Chrome Web Store, Edge Add-ons, and AMO review are all pending.
+- **FFmpeg is required** for HLS/DASH audio muxing and is not bundled — set its path in Settings.
+- **No live or DRM content.** Live HLS playlists, dynamic/live DASH, and encrypted/DRM streams are not supported, by design.
+- **Release packaging is Windows-only for now.** Tagged releases build the Windows NSIS installer and extension packages; Linux/macOS release packaging is a follow-up.
+
+## License
+
+Licensed under the MIT License — see [LICENSE](LICENSE).
+
+## Links
+
+- Repository: https://github.com/hamzabhulla/ThunderLoad
+- Issues: https://github.com/hamzabhulla/ThunderLoad/issues
