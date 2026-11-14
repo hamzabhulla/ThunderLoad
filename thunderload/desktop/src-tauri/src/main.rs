@@ -216,6 +216,9 @@ fn powershell_literal(value: &str) -> String {
 /// ("YYYY-MM-DDTHH:mm") before these run.
 #[cfg(target_os = "macos")]
 fn wake_datetime_parts(local_date_time: &str) -> Option<(u32, u32, u32, u32, u32)> {
+    if !valid_local_datetime_shape(local_date_time) {
+        return None;
+    }
     let year = local_date_time.get(0..4)?.parse().ok()?;
     let month = local_date_time.get(5..7)?.parse().ok()?;
     let day = local_date_time.get(8..10)?.parse().ok()?;

@@ -31,7 +31,7 @@
 
 use std::{
     collections::HashMap,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io,
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -297,7 +297,7 @@ impl JobStore {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let temporary = self.path.with_extension("json.tmp");
         fs::write(&temporary, &bytes)?;
-        File::open(&temporary)?.sync_all()?;
+        OpenOptions::new().write(true).open(&temporary)?.sync_all()?;
         match fs::rename(&temporary, &self.path) {
             Ok(()) => {
                 #[cfg(unix)]
