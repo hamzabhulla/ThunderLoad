@@ -705,7 +705,7 @@ async fn start_hls_download(
 /// Chromium-family browsers vs Firefox: the native-messaging manifest
 /// differs (allowed_origins vs allowed_extensions) and so does the
 /// extension-ID format.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NativeBrowserFamily {
     Chromium,
     Firefox,
