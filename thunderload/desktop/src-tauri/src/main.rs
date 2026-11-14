@@ -1,12 +1,13 @@
 use std::{collections::HashMap, path::{Path, PathBuf}, process::Command, sync::{Arc, Mutex, OnceLock}, time::{Duration, Instant}};
 use serde_json::{json, Value};
 use tauri::{Emitter, Manager};
-use thunderload_engine::{dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_resumable, download_url_resumable, hls_work_dir, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, store_file_name, DownloadControl, DownloadOutcome, GlobalRateLimiter, JobKind, JobOrigin, JobRecord, JobState, JobStore};
+use thunderload_engine::{dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_resumable, download_url_resumable, hls_work_dir, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, store_file_name, DownloadControl, DownloadOutcome, GlobalRateLimiter, JobKind, JobOrigin, JobRecord, JobState, JobStore, SessionHeaders};
 use tokio::{process::Command as TokioCommand, sync::{mpsc, watch}};
 
 #[tauri::command]
 async fn inspect_video_url(url: String, referer: Option<String>) -> Result<Vec<thunderload_engine::VideoVariant>, String> {
-    inspect_video(&url, referer.as_deref()).await.map_err(|error| error.to_string())
+    let session = SessionHeaders::with_referer(referer.as_deref());
+    inspect_video(&url, session.as_ref()).await.map_err(|error| error.to_string())
 }
 
 
@@ -63,6 +64,17 @@ fn with_job_store<F: FnOnce(&mut JobStore)>(f: F) {
             f(&mut store);
         }
     }
+}
+
+/// The stored browser session for one job, if it handed one off.
+/// Desktop-started jobs have none; a desktop resume of a browser-started
+/// job reuses the stored handoff (Slice 4 handover path). The session
+/// never leaves the Rust side — `get_jobs` strips it before returning
+/// rows to the frontend, and it is never logged.
+fn job_session(job_id: &str) -> Option<SessionHeaders> {
+    let store = JOB_STORE.get()?;
+    let store = store.lock().ok()?;
+    store.get(job_id).and_then(|record| record.session.clone())
 }
 
 /// Deletes every resume file a desktop download can leave behind: the
@@ -332,6 +344,9 @@ async fn start_download(
     with_job_store(|store| {
         let _ = store.start_job(record);
     });
+    // A desktop resume of a browser-started job reuses the stored
+    // handoff; a desktop-started job has none (None).
+    let session = job_session(&job_id);
     // Keep a second receiver alive in the task until the outcome is
     // reported: a cancel that arrives while the download is finishing
     // still reaches a live receiver, so `cancel_download` never falls into
@@ -358,7 +373,7 @@ async fn start_download(
                 let _ = progress_app.emit("download-progress", json!({ "jobId": progress_id, "progress": progress }));
             }
         });
-        let result = download_url_resumable(&url, &task_target, None, control_rx, limit, progress_tx).await;
+        let result = download_url_resumable(&url, &task_target, session.as_ref(), control_rx, limit, progress_tx).await;
         let cancelled_while_finishing = *transition_rx.borrow() == DownloadControl::Cancelled;
         finish_desktop_download(&app_for_task, &job_for_task, &task_target, result.map_err(|error| error.to_string()), cancelled_while_finishing).await;
     });
@@ -398,6 +413,8 @@ async fn start_hls_download(
     with_job_store(|store| {
         let _ = store.start_job(record);
     });
+    // Stored browser handoff for a desktop resume (None for desktop jobs).
+    let session = job_session(&job_id);
     // Keep a second receiver alive in the task until the outcome is
     // reported: a cancel that arrives while the download is finishing
     // still reaches a live receiver, so `cancel_download` never falls into
@@ -422,7 +439,7 @@ async fn start_hls_download(
                 let _ = progress_app.emit("download-progress", json!({ "jobId": progress_id, "progress": progress }));
             }
         });
-        let result = download_hls_resumable(&url, &task_target, None, control_rx, progress_tx, rate_limiter()).await;
+        let result = download_hls_resumable(&url, &task_target, session.as_ref(), control_rx, progress_tx, rate_limiter()).await;
         let cancelled_while_finishing = *transition_rx.borrow() == DownloadControl::Cancelled;
         finish_desktop_download(&app_for_task, &job_for_task, &task_target, result.map_err(|error| error.to_string()), cancelled_while_finishing).await;
     });
@@ -541,6 +558,10 @@ async fn start_dash_download(
         return Err("A DASH representation must be selected before downloading".into());
     }
     let name = safe_filename(&filename, "video.mp4");
+    // Stored browser handoff for a desktop resume (None for a fresh
+    // desktop job). Loaded up front because the fresh-job extension
+    // probe below needs it before start_job runs.
+    let session = job_session(&job_id);
     // Resume reuses the paused job's target so the on-disk DASH checkpoint
     // is found; a fresh job resolves the manifest first so the reserved
     // target gets the right extension (webm for a video-only WebM track),
@@ -550,7 +571,7 @@ async fn start_dash_download(
     let target = match target_path {
         Some(path) => PathBuf::from(path),
         None => {
-            let extension = dash_output_extension(&url, &representation_id, audio_representation_id.as_deref(), None).await
+            let extension = dash_output_extension(&url, &representation_id, audio_representation_id.as_deref(), session.as_ref()).await
                 .map_err(|error| error.to_string())?;
             let stem = Path::new(&name).file_stem().and_then(|value| value.to_str()).unwrap_or("video");
             reserve_download_path(&default_download_dir().join(format!("{stem}.{extension}"))).await
@@ -595,7 +616,7 @@ async fn start_dash_download(
             }
         });
         let result = download_dash_resumable(
-            &url, &representation_id, audio_representation_id.as_deref(), &task_target, None,
+            &url, &representation_id, audio_representation_id.as_deref(), &task_target, session.as_ref(),
             control_rx, progress_tx, rate_limiter(),
         ).await;
         let cancelled_while_finishing = *transition_rx.borrow() == DownloadControl::Cancelled;
@@ -716,6 +737,15 @@ async fn get_native_downloads() -> Result<Vec<Value>, String> {
             });
         }
     }
+    // F1: the native state files carry the browser session, but the
+    // frontend must never see it — strip it here. (The mirror upsert
+    // above already read it into the store, and the state files on disk
+    // keep it.) `get_jobs` strips it the same way.
+    for job in &mut jobs {
+        if let Some(object) = job.as_object_mut() {
+            object.remove("session");
+        }
+    }
     Ok(jobs)
 }
 
@@ -741,10 +771,18 @@ fn native_value_to_record(job: &Value) -> Option<JobRecord> {
     };
     let target_path = job.get("targetPath").and_then(Value::as_str).map(str::to_string);
     let now = thunderload_engine::now_ms();
+    // The browser session the host stored in the state file, if any.
+    // Parsed and re-validated against the job URL; anything malformed
+    // or for another origin is dropped (the download then proceeds
+    // without it and an authenticated server fails visibly).
+    let url = job.get("url").and_then(Value::as_str).unwrap_or("");
+    let session = job.get("session")
+        .and_then(|value| serde_json::from_value::<SessionHeaders>(value.clone()).ok())
+        .filter(|session| session.validate(url).is_ok());
     Some(JobRecord {
         id,
         name: job.get("name").and_then(Value::as_str).unwrap_or("Browser download").to_string(),
-        url: job.get("url").and_then(Value::as_str).unwrap_or("").to_string(),
+        url: url.to_string(),
         kind,
         origin: JobOrigin::Native,
         state,
@@ -760,6 +798,7 @@ fn native_value_to_record(job: &Value) -> Option<JobRecord> {
         representation_id: job.get("representationId").and_then(Value::as_str).map(str::to_string),
         audio_representation_id: job.get("audioRepresentationId").and_then(Value::as_str).map(str::to_string),
         scheduled_at_ms: None,
+        session,
         detail: job.get("detail").and_then(Value::as_str).unwrap_or("Started from browser extension").to_string(),
         error: job.get("error").and_then(Value::as_str).map(str::to_string),
         created_at_ms: job.get("createdAt").and_then(Value::as_u64).unwrap_or(now),
@@ -772,8 +811,17 @@ fn native_value_to_record(job: &Value) -> Option<JobRecord> {
 /// rows keep flowing through the `get_native_downloads` poll as well.
 #[tauri::command]
 async fn get_jobs() -> Vec<JobRecord> {
+    // The session (browser cookies) is stripped here: it lives only in
+    // jobs.json on the user's machine and in Rust memory, never in the
+    // JS runtime.
     match JOB_STORE.get() {
-        Some(store) => store.lock().map(|store| store.all().to_vec()).unwrap_or_default(),
+        Some(store) => store.lock().map(|store| {
+            store.all().iter().map(|row| {
+                let mut row = row.clone();
+                row.session = None;
+                row
+            }).collect()
+        }).unwrap_or_default(),
         None => Vec::new(),
     }
 }
@@ -859,6 +907,7 @@ fn sync_job_to_record(job: SyncJob) -> JobRecord {
         representation_id: job.representation_id,
         audio_representation_id: job.audio_representation_id,
         scheduled_at_ms: job.scheduled_at,
+        session: None,
         detail: job.detail,
         error: job.error,
         created_at_ms: if job.created_at == 0 { now } else { job.created_at },

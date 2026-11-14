@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context, Result};
+use crate::session::{apply_session, SessionHeaders};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::{path::{Path, PathBuf}, sync::{atomic::{AtomicU64, AtomicUsize, Ordering}, Arc}};
@@ -37,7 +38,7 @@ fn client() -> Result<Client> {
         .build()?)
 }
 
-pub async fn inspect_video(url: &str, referer: Option<&str>) -> Result<Vec<VideoVariant>> {
+pub async fn inspect_video(url: &str, session: Option<&SessionHeaders>) -> Result<Vec<VideoVariant>> {
     let parsed = Url::parse(url).context("Invalid media URL")?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(anyhow!("Only HTTP and HTTPS media URLs can be inspected"));
@@ -45,10 +46,10 @@ pub async fn inspect_video(url: &str, referer: Option<&str>) -> Result<Vec<Video
     let lower = parsed.path().to_ascii_lowercase();
 
     if lower.ends_with(".m3u8") {
-        let body = fetch_text(url, referer).await?;
+        let body = fetch_text(url, session).await?;
         let mut variants = parse_hls_master(&body, &parsed)?;
         if !variants.is_empty() {
-            annotate_hls_variants(&mut variants, referer).await;
+            annotate_hls_variants(&mut variants, session).await;
             annotate_hls_audio(&mut variants).await;
             if let Some(reason) = unsupported_hls_master_reason(&body) {
                 for variant in &mut variants {
@@ -67,7 +68,7 @@ pub async fn inspect_video(url: &str, referer: Option<&str>) -> Result<Vec<Video
         }]);
     }
     if lower.ends_with(".mpd") {
-        let body = fetch_text(url, referer).await?;
+        let body = fetch_text(url, session).await?;
         let mut reps = parse_dash_representations(&body, url);
         annotate_dash_variants(&mut reps).await;
         if reps.is_empty() {
@@ -89,15 +90,13 @@ pub async fn inspect_video(url: &str, referer: Option<&str>) -> Result<Vec<Video
     }
 
     let client = client()?;
-    let mut request = client.head(url);
-    if let Some(referrer) = referer { request = request.header(reqwest::header::REFERER, referrer); }
+    let request = apply_session(session, client.head(url), url);
     // A number of CDNs block HEAD even when normal downloads are allowed.
     // Retry the metadata probe with a one-byte range GET before rejecting the URL.
     let response = match request.send().await {
         Ok(response) if response.status().is_success() => response,
         _ => {
-            let mut probe = client.get(url).header(reqwest::header::RANGE, "bytes=0-0");
-            if let Some(referrer) = referer { probe = probe.header(reqwest::header::REFERER, referrer); }
+            let probe = apply_session(session, client.get(url).header(reqwest::header::RANGE, "bytes=0-0"), url);
             probe.send().await
                 .context("Could not inspect the URL response headers with HEAD or a one-byte GET")?
                 .error_for_status()
@@ -111,10 +110,10 @@ pub async fn inspect_video(url: &str, referer: Option<&str>) -> Result<Vec<Video
         .split(';').next().unwrap_or("").trim().to_ascii_lowercase();
 
     if content_type.contains("mpegurl") || content_type.contains("vnd.apple.mpegurl") {
-        let body = fetch_text(url, referer).await?;
+        let body = fetch_text(url, session).await?;
         let mut variants = parse_hls_master(&body, &parsed)?;
         if !variants.is_empty() {
-            annotate_hls_variants(&mut variants, referer).await;
+            annotate_hls_variants(&mut variants, session).await;
             annotate_hls_audio(&mut variants).await;
             if let Some(reason) = unsupported_hls_master_reason(&body) {
                 for variant in &mut variants {
@@ -133,7 +132,7 @@ pub async fn inspect_video(url: &str, referer: Option<&str>) -> Result<Vec<Video
         }]);
     }
     if content_type.contains("dash+xml") {
-        let body = fetch_text(url, referer).await?;
+        let body = fetch_text(url, session).await?;
         let mut variants = parse_dash_representations(&body, url);
         annotate_dash_variants(&mut variants).await;
         return Ok(variants);
@@ -149,8 +148,8 @@ pub async fn inspect_video(url: &str, referer: Option<&str>) -> Result<Vec<Video
     ))
 }
 
-async fn fetch_text(url: &str, referer: Option<&str>) -> Result<String> {
-    fetch_text_with(&client()?, url, referer).await
+async fn fetch_text(url: &str, session: Option<&SessionHeaders>) -> Result<String> {
+    fetch_text_with(&client()?, url, session).await
 }
 
 /// A variant with a separate audio rendition is downloadable only when
@@ -195,9 +194,9 @@ fn unsupported_hls_reason(body: &str) -> Option<String> {
     None
 }
 
-async fn annotate_hls_variants(variants: &mut [VideoVariant], referer: Option<&str>) {
+async fn annotate_hls_variants(variants: &mut [VideoVariant], session: Option<&SessionHeaders>) {
     for variant in variants.iter_mut().filter(|item| item.kind == "hls") {
-        match fetch_text(&variant.url, referer).await {
+        match fetch_text(&variant.url, session).await {
             Ok(body) => {
                 if let Some(reason) = unsupported_hls_reason(&body) {
                     variant.downloadable = false;
@@ -1498,7 +1497,8 @@ struct HlsJobState {
     playlist_url: String,
     media_url: String,
     audio_playlist_url: Option<String>,
-    referer: Option<String>,
+    #[serde(default)]
+    session: Option<SessionHeaders>,
     extension: String,
     video_init: Option<HlsSegmentRef>,
     video_segments: Vec<HlsSegmentRef>,
@@ -1530,7 +1530,8 @@ impl HlsJobState {
             && self.playlist_url == plan.playlist_url
             && self.media_url == plan.media_url
             && self.audio_playlist_url == plan.audio_playlist_url
-            && self.referer == plan.referer
+            && self.session.as_ref().map(|session| session.credential_identity())
+                == plan.session.as_ref().map(|session| session.credential_identity())
             && self.extension == plan.extension
             && self.video_init == plan.video_init
             && self.video_segments == plan.video_segments
@@ -1607,9 +1608,8 @@ fn parse_hls_media_playlist(body: &str, base: &Url) -> Result<HlsMediaPlaylist> 
     Ok(HlsMediaPlaylist { init, segments })
 }
 
-async fn fetch_text_with(client: &Client, url: &str, referer: Option<&str>) -> Result<String> {
-    let mut request = client.get(url);
-    if let Some(referrer) = referer { request = request.header(reqwest::header::REFERER, referrer); }
+async fn fetch_text_with(client: &Client, url: &str, session: Option<&SessionHeaders>) -> Result<String> {
+    let request = apply_session(session, client.get(url), url);
     Ok(request.send().await?.error_for_status()?.text().await?)
 }
 
@@ -1619,10 +1619,10 @@ async fn fetch_text_with(client: &Client, url: &str, referer: Option<&str>) -> R
 /// the audio rendition is the one whose GROUP-ID matches that variant's
 /// `AUDIO` attribute. Live playlists and encrypted streams are rejected
 /// here, before any segment is fetched.
-async fn resolve_hls_plan(playlist_url: &str, referer: Option<&str>) -> Result<HlsJobState> {
+async fn resolve_hls_plan(playlist_url: &str, session: Option<&SessionHeaders>) -> Result<HlsJobState> {
     let base = Url::parse(playlist_url)?;
     let client = client()?;
-    let body = fetch_text_with(&client, playlist_url, referer).await?;
+    let body = fetch_text_with(&client, playlist_url, session).await?;
     let variants = parse_hls_master(&body, &base)?;
     let (media_url, audio_playlist_url) = if !variants.is_empty() {
         if let Some(reason) = unsupported_hls_master_reason(&body) {
@@ -1648,7 +1648,7 @@ async fn resolve_hls_plan(playlist_url: &str, referer: Option<&str>) -> Result<H
     let media_body = if media_url == playlist_url {
         body
     } else {
-        fetch_text_with(&client, &media_url, referer).await?
+        fetch_text_with(&client, &media_url, session).await?
     };
     let media = parse_hls_media_playlist(&media_body, &media_base)?;
     if media.segments.is_empty() {
@@ -1657,7 +1657,7 @@ async fn resolve_hls_plan(playlist_url: &str, referer: Option<&str>) -> Result<H
     let (audio_init, audio_segments) = match &audio_playlist_url {
         Some(url) => {
             let audio_base = Url::parse(url)?;
-            let audio_body = fetch_text_with(&client, url, referer).await?;
+            let audio_body = fetch_text_with(&client, url, session).await?;
             let parsed = parse_hls_media_playlist(&audio_body, &audio_base)?;
             if parsed.segments.is_empty() {
                 return Err(anyhow!("No media segments were found in this HLS audio playlist"));
@@ -1671,7 +1671,7 @@ async fn resolve_hls_plan(playlist_url: &str, referer: Option<&str>) -> Result<H
         playlist_url: playlist_url.to_string(),
         media_url,
         audio_playlist_url,
-        referer: referer.map(str::to_string),
+        session: session.cloned(),
         extension: if media.init.is_some() { "mp4".into() } else { "ts".into() },
         video_init: media.init,
         video_segments: media.segments,
@@ -1743,12 +1743,11 @@ fn validate_hls_content_range(actual: &str, start: u64, end: u64) -> Result<()> 
 async fn fetch_hls_segment(
     client: &Client,
     segment: &HlsSegmentRef,
-    referer: Option<&str>,
+    session: Option<&SessionHeaders>,
     path: &Path,
     rate_limiter: &Arc<GlobalRateLimiter>,
 ) -> Result<u64> {
-    let mut request = client.get(&segment.url);
-    if let Some(referrer) = referer { request = request.header(reqwest::header::REFERER, referrer); }
+    let mut request = apply_session(session, client.get(&segment.url), &segment.url);
     if let Some((start, length)) = segment.range {
         request = request.header(
             reqwest::header::RANGE,
@@ -1905,7 +1904,7 @@ fn hls_segment_path(work_dir: &Path, mark: HlsSegmentMark) -> PathBuf {
 pub async fn download_hls_resumable(
     playlist_url: &str,
     target: &Path,
-    referer: Option<&str>,
+    session: Option<&SessionHeaders>,
     control: watch::Receiver<DownloadControl>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
     rate_limiter: Arc<GlobalRateLimiter>,
@@ -1924,11 +1923,22 @@ pub async fn download_hls_resumable(
     }
     let work_dir = hls_work_dir(target);
     let meta_path = hls_metadata_path(target);
-    let mut state = resolve_hls_plan(playlist_url, referer).await?;
+    // A resume reuses the handoff stored with the checkpoint when the
+    // caller has none (F2): a desktop resume of a browser-started job
+    // mints a fresh job id, so the stored JobRecord session is
+    // unreachable — the checkpoint is the only copy left. Read it before
+    // resolving the plan so the playlist fetch itself is authenticated.
+    // An explicit caller session always wins.
+    let saved = read_hls_checkpoint(&meta_path).await;
+    let owned_session = session.is_none()
+        .then(|| saved.as_ref().and_then(|saved| saved.session.clone()))
+        .flatten();
+    let session = session.or(owned_session.as_ref());
+    let mut state = resolve_hls_plan(playlist_url, session).await?;
     // Reuse a checkpoint only when it describes exactly this job; a
     // playlist whose segment list changed restarts from scratch.
     let mut reused_checkpoint = false;
-    if let Some(saved) = read_hls_checkpoint(&meta_path).await {
+    if let Some(saved) = saved {
         if saved.matches_plan(&state) {
             // A segment counts as done only when its file is actually on
             // disk; a checkpoint entry without a file is re-downloaded.
@@ -2022,11 +2032,11 @@ pub async fn download_hls_resumable(
         while tasks.len() < 6 {
             let Some((mark, segment)) = work.pop_front() else { break; };
             let client = client.clone();
-            let referrer = referer.map(str::to_string);
+            let session = session.cloned();
             let path = hls_segment_path(&work_dir, mark);
             let rate_limiter = rate_limiter.clone();
             tasks.spawn(async move {
-                let bytes = fetch_hls_segment(&client, &segment, referrer.as_deref(), &path, &rate_limiter).await?;
+                let bytes = fetch_hls_segment(&client, &segment, session.as_ref(), &path, &rate_limiter).await?;
                 Ok::<(HlsSegmentMark, u64), anyhow::Error>((mark, bytes))
             });
         }
@@ -2131,30 +2141,30 @@ pub async fn download_hls_resumable(
 /// alone would misname a TS stream as .mp4.
 pub async fn hls_output_extension(
     playlist_url: &str,
-    referer: Option<&str>,
+    session: Option<&SessionHeaders>,
 ) -> Result<String> {
-    let plan = resolve_hls_plan(playlist_url, referer).await?;
+    let plan = resolve_hls_plan(playlist_url, session).await?;
     Ok(plan.extension)
 }
 
 pub async fn download_hls(
     playlist_url: &str,
     filename: &str,
-    referer: Option<&str>,
+    session: Option<&SessionHeaders>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
     rate_limiter: Arc<GlobalRateLimiter>,
 ) -> Result<PathBuf> {
     // Resolve the plan first so the reserved target gets the right
     // extension (mp4 when an EXT-X-MAP init segment is present, ts
     // otherwise); the resumable call re-resolves the same small playlist.
-    let plan = resolve_hls_plan(playlist_url, referer).await?;
+    let plan = resolve_hls_plan(playlist_url, session).await?;
     let out_dir = default_download_dir();
     fs::create_dir_all(&out_dir).await?;
     let safe = safe_filename(filename, "video");
     let stem = Path::new(&safe).file_stem().and_then(|s| s.to_str()).unwrap_or("video");
     let target = unique_video_path(&out_dir, stem, &plan.extension).await?;
     let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
-    let outcome = download_hls_resumable(playlist_url, &target, referer, control_rx, progress_tx, rate_limiter).await;
+    let outcome = download_hls_resumable(playlist_url, &target, session, control_rx, progress_tx, rate_limiter).await;
     drop(control_tx);
     match outcome? {
         DownloadOutcome::Completed => Ok(target),
@@ -2259,14 +2269,11 @@ async fn fetch_dash_range_bytes(
     client: &Client,
     url: &str,
     range: (u64, u64),
-    referer: Option<&str>,
+    session: Option<&SessionHeaders>,
 ) -> Result<Vec<u8>> {
     let (start, end) = range;
     let expected = end - start + 1;
-    let mut request = client.get(url);
-    if let Some(referrer) = referer {
-        request = request.header(reqwest::header::REFERER, referrer);
-    }
+    let request = apply_session(session, client.get(url), url);
     let response = request
         .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
         .send().await?;
@@ -2316,9 +2323,9 @@ async fn fetch_dash_range_bytes(
 async fn expand_dash_segment_base(
     client: &Client,
     plan: &DashSegmentBasePlan,
-    referer: Option<&str>,
+    session: Option<&SessionHeaders>,
 ) -> Result<(Option<String>, Option<(u64, u64)>, Vec<String>, Vec<Option<(u64, u64)>>)> {
-    let index_bytes = fetch_dash_range_bytes(client, &plan.base_url, plan.index_range, referer).await
+    let index_bytes = fetch_dash_range_bytes(client, &plan.base_url, plan.index_range, session).await
         .with_context(|| format!(
             "Could not fetch the DASH segment index (bytes {}-{}) from {}",
             plan.index_range.0, plan.index_range.1, plan.base_url
@@ -2342,7 +2349,7 @@ async fn download_dash_track(
     track: &DashResolvedTrack,
     work_dir: &Path,
     prefix: &str,
-    referer: Option<&str>,
+    session: Option<&SessionHeaders>,
     progress_tx: &mpsc::UnboundedSender<DownloadProgress>,
     completed: Arc<AtomicUsize>,
     downloaded_bytes: Arc<AtomicU64>,
@@ -2379,7 +2386,7 @@ async fn download_dash_track(
             break;
         }
         let client = client.clone();
-        let referrer = referer.map(str::to_string);
+        let session = session.cloned();
         let path = work_dir.join(format!("{prefix}-{index:06}.segment"));
         // A segment is written to a temporary file and renamed into place
         // only after its bytes are fully written and validated, so a
@@ -2391,10 +2398,7 @@ async fn download_dash_track(
         let downloaded_bytes = downloaded_bytes.clone();
         let rate_limiter = rate_limiter.clone();
         tasks.spawn(async move {
-            let mut request = client.get(segment_url);
-            if let Some(referrer) = referrer {
-                request = request.header(reqwest::header::REFERER, referrer);
-            }
+            let mut request = apply_session(session.as_ref(), client.get(segment_url.as_str()), &segment_url);
             if let Some((start, end)) = range {
                 request = request.header(reqwest::header::RANGE, format!("bytes={start}-{end}"));
             }
@@ -2592,9 +2596,9 @@ async fn resolve_dash_plan(
     manifest_url: &str,
     representation_id: &str,
     audio_representation_id: Option<&str>,
-    referer: Option<&str>,
+    session: Option<&SessionHeaders>,
 ) -> Result<DashPlan> {
-    let body = fetch_text(manifest_url, referer).await?;
+    let body = fetch_text(manifest_url, session).await?;
     let document = parse_dash_document(&body)?;
     if !document.is_static { return Err(anyhow!("Dynamic/live DASH MPDs are not supported")); }
     if document.protected { return Err(anyhow!("DASH ContentProtection/DRM is not supported")); }
@@ -2609,7 +2613,7 @@ async fn resolve_dash_plan(
             .ok_or_else(|| anyhow!("Period {} has no DASH video representation '{representation_id}'", period_index + 1))?;
         let mut video = resolve_dash_track(&document, period, video_adaptation, video_representation, manifest_url, false)?;
         if let Some(plan) = video.segment_base.clone() {
-            let (init_url, init_range, urls, ranges) = expand_dash_segment_base(&client, &plan, referer).await?;
+            let (init_url, init_range, urls, ranges) = expand_dash_segment_base(&client, &plan, session).await?;
             video.initialization_url = init_url;
             video.initialization_range = init_range;
             video.segment_urls = urls;
@@ -2622,7 +2626,7 @@ async fn resolve_dash_plan(
                 .ok_or_else(|| anyhow!("Period {} has no DASH audio representation '{audio_id}'", period_index + 1))?;
             let mut audio = resolve_dash_track(&document, period, audio_adaptation, audio_representation, manifest_url, true)?;
             if let Some(plan) = audio.segment_base.clone() {
-                let (init_url, init_range, urls, ranges) = expand_dash_segment_base(&client, &plan, referer).await?;
+                let (init_url, init_range, urls, ranges) = expand_dash_segment_base(&client, &plan, session).await?;
                 audio.initialization_url = init_url;
                 audio.initialization_range = init_range;
                 audio.segment_urls = urls;
@@ -2645,9 +2649,9 @@ pub async fn dash_output_extension(
     manifest_url: &str,
     representation_id: &str,
     audio_representation_id: Option<&str>,
-    referer: Option<&str>,
+    session: Option<&SessionHeaders>,
 ) -> Result<String> {
-    let plan = resolve_dash_plan(manifest_url, representation_id, audio_representation_id, referer).await?;
+    let plan = resolve_dash_plan(manifest_url, representation_id, audio_representation_id, session).await?;
     let extension = if audio_representation_id.is_some() {
         "mp4"
     } else if plan.video_tracks.first().map(|track| track.mime_type.to_ascii_lowercase().contains("webm")).unwrap_or(false) {
@@ -2669,7 +2673,7 @@ pub async fn download_dash(
     representation_id: &str,
     audio_representation_id: Option<&str>,
     filename: &str,
-    referer: Option<&str>,
+    session: Option<&SessionHeaders>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
     rate_limiter: Arc<GlobalRateLimiter>,
 ) -> Result<PathBuf> {
@@ -2677,7 +2681,7 @@ pub async fn download_dash(
     fs::create_dir_all(&out_dir).await?;
     download_dash_into(
         manifest_url, representation_id, audio_representation_id, filename,
-        referer, progress_tx, rate_limiter, &out_dir,
+        session, progress_tx, rate_limiter, &out_dir,
     ).await
 }
 
@@ -2686,7 +2690,7 @@ async fn download_dash_into(
     representation_id: &str,
     audio_representation_id: Option<&str>,
     filename: &str,
-    referer: Option<&str>,
+    session: Option<&SessionHeaders>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
     rate_limiter: Arc<GlobalRateLimiter>,
     out_dir: &Path,
@@ -2696,7 +2700,7 @@ async fn download_dash_into(
     // work directory and the reserved target are removed, so a failed call
     // leaves nothing behind. The resumable engine does the work; a caller
     // that wants pause/resume uses `download_dash_resumable` directly.
-    let plan = resolve_dash_plan(manifest_url, representation_id, audio_representation_id, referer).await?;
+    let plan = resolve_dash_plan(manifest_url, representation_id, audio_representation_id, session).await?;
     let track_extension = |mime_type: &str| if mime_type.to_ascii_lowercase().contains("webm") { "webm" } else { "mp4" };
     let extension = if audio_representation_id.is_some() { "mp4" } else { track_extension(&plan.video_tracks[0].mime_type) };
     let safe = safe_filename(filename, "video");
@@ -2704,7 +2708,7 @@ async fn download_dash_into(
     let target = unique_video_path(out_dir, stem, extension).await?;
     let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
     let outcome = download_dash_resumable_with_plan(
-        manifest_url, representation_id, audio_representation_id, &target, referer,
+        manifest_url, representation_id, audio_representation_id, &target, session,
         control_rx, progress_tx, rate_limiter, plan,
     ).await;
     drop(control_tx);
@@ -2754,6 +2758,9 @@ pub(crate) struct MediaCheckpointInfo {
     pub url: String,
     pub representation_id: Option<String>,
     pub audio_representation_id: Option<String>,
+    /// Browser session handed off with the job, if any — carried so an
+    /// orphaned browser-started job keeps its handoff for a desktop resume.
+    pub session: Option<SessionHeaders>,
     segments_done: Option<u64>,
     segments_total: Option<u64>,
 }
@@ -2785,6 +2792,7 @@ pub(crate) fn media_checkpoint_info(meta_path: &Path, target: &Path) -> Option<M
             url: state.playlist_url,
             representation_id: None,
             audio_representation_id: None,
+            session: state.session,
             segments_done: Some(done as u64),
             segments_total: Some(total as u64),
         });
@@ -2817,6 +2825,7 @@ pub(crate) fn media_checkpoint_info(meta_path: &Path, target: &Path) -> Option<M
             url: state.manifest_url,
             representation_id: Some(state.representation_id),
             audio_representation_id: state.audio_representation_id,
+            session: state.session,
             segments_done: Some(done as u64),
             segments_total: Some(total as u64),
         });
@@ -2860,7 +2869,8 @@ struct DashJobState {
     manifest_url: String,
     representation_id: String,
     audio_representation_id: Option<String>,
-    referer: Option<String>,
+    #[serde(default)]
+    session: Option<SessionHeaders>,
     video_tracks: Vec<DashCheckpointTrack>,
     audio_tracks: Vec<DashCheckpointTrack>,
     multi_period: bool,
@@ -2871,7 +2881,7 @@ impl DashJobState {
         manifest_url: &str,
         representation_id: &str,
         audio_representation_id: Option<&str>,
-        referer: Option<&str>,
+        session: Option<&SessionHeaders>,
         plan: &DashPlan,
     ) -> Self {
         Self {
@@ -2879,7 +2889,7 @@ impl DashJobState {
             manifest_url: manifest_url.to_string(),
             representation_id: representation_id.to_string(),
             audio_representation_id: audio_representation_id.map(str::to_string),
-            referer: referer.map(str::to_string),
+            session: session.cloned(),
             video_tracks: plan.video_tracks.iter().map(DashCheckpointTrack::from).collect(),
             audio_tracks: plan.audio_tracks.iter().map(DashCheckpointTrack::from).collect(),
             multi_period: plan.multi_period,
@@ -2904,7 +2914,8 @@ impl DashJobState {
             && self.manifest_url == plan.manifest_url
             && self.representation_id == plan.representation_id
             && self.audio_representation_id == plan.audio_representation_id
-            && self.referer == plan.referer
+            && self.session.as_ref().map(|session| session.credential_identity())
+                == plan.session.as_ref().map(|session| session.credential_identity())
             && self.video_tracks == plan.video_tracks
             && self.audio_tracks == plan.audio_tracks
             && self.multi_period == plan.multi_period
@@ -2960,14 +2971,24 @@ pub async fn download_dash_resumable(
     representation_id: &str,
     audio_representation_id: Option<&str>,
     target: &Path,
-    referer: Option<&str>,
+    session: Option<&SessionHeaders>,
     control: watch::Receiver<DownloadControl>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
     rate_limiter: Arc<GlobalRateLimiter>,
 ) -> Result<DownloadOutcome> {
-    let plan = resolve_dash_plan(manifest_url, representation_id, audio_representation_id, referer).await?;
+    // A resume reuses the handoff stored with the checkpoint when the
+    // caller has none (F2) — read it before resolving the plan so the
+    // manifest fetch itself is authenticated. An explicit caller
+    // session always wins.
+    let meta_path = partial_download_metadata_path(target);
+    let saved = read_dash_checkpoint(&meta_path).await;
+    let owned_session = session.is_none()
+        .then(|| saved.as_ref().and_then(|saved| saved.session.clone()))
+        .flatten();
+    let session = session.or(owned_session.as_ref());
+    let plan = resolve_dash_plan(manifest_url, representation_id, audio_representation_id, session).await?;
     download_dash_resumable_with_plan(
-        manifest_url, representation_id, audio_representation_id, target, referer,
+        manifest_url, representation_id, audio_representation_id, target, session,
         control, progress_tx, rate_limiter, plan,
     ).await
 }
@@ -2977,7 +2998,7 @@ async fn download_dash_resumable_with_plan(
     representation_id: &str,
     audio_representation_id: Option<&str>,
     target: &Path,
-    referer: Option<&str>,
+    session: Option<&SessionHeaders>,
     control: watch::Receiver<DownloadControl>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
     rate_limiter: Arc<GlobalRateLimiter>,
@@ -2997,7 +3018,7 @@ async fn download_dash_resumable_with_plan(
     }
     let work_dir = dash_work_dir(target);
     let meta_path = partial_download_metadata_path(target);
-    let state = DashJobState::from_plan(manifest_url, representation_id, audio_representation_id, referer, &plan);
+    let state = DashJobState::from_plan(manifest_url, representation_id, audio_representation_id, session, &plan);
     // Reuse a checkpoint only when it describes exactly this job; a
     // manifest whose segment plan changed restarts from scratch.
     let reused = matches!(read_dash_checkpoint(&meta_path).await, Some(saved) if saved.matches_plan(&state));
@@ -3043,7 +3064,7 @@ async fn download_dash_resumable_with_plan(
         let prefix = format!("video-p{period_index}");
         let done = dash_done_refs(&work_dir, &prefix, track).await;
         match download_dash_track(
-            &client, track, &work_dir, &prefix, referer, &progress_tx,
+            &client, track, &work_dir, &prefix, session, &progress_tx,
             completed.clone(), downloaded_bytes.clone(), total_segments, rate_limiter.clone(),
             &done, &control,
         ).await? {
@@ -3056,7 +3077,7 @@ async fn download_dash_resumable_with_plan(
         let prefix = format!("audio-p{period_index}");
         let done = dash_done_refs(&work_dir, &prefix, track).await;
         match download_dash_track(
-            &client, track, &work_dir, &prefix, referer, &progress_tx,
+            &client, track, &work_dir, &prefix, session, &progress_tx,
             completed.clone(), downloaded_bytes.clone(), total_segments, rate_limiter.clone(),
             &done, &control,
         ).await? {
@@ -3148,7 +3169,7 @@ mod tests {
         expand_dash_template, is_complete_vod_playlist, parse_dash_document,
         parse_dash_representations, parse_dash_sidx, parse_hls_master, resolve_dash_track,
         unsupported_hls_master_reason, unsupported_hls_reason, DashCheckpointTrack, DashJobState,
-        DownloadControl, DownloadOutcome, partial_download_metadata_path,
+        DownloadControl, DownloadOutcome, partial_download_metadata_path, SessionHeaders,
     };
     use crate::download::{reserve_download_path, GlobalRateLimiter};
     use std::collections::{HashMap, HashSet};
@@ -4569,7 +4590,7 @@ mod tests {
             manifest_url: "https://cdn.example.test/video.mpd".into(),
             representation_id: "v1".into(),
             audio_representation_id: None,
-            referer: None,
+            session: None,
             video_tracks: vec![track.clone()],
             audio_tracks: vec![],
             multi_period: false,
@@ -4583,6 +4604,51 @@ mod tests {
         assert!(!state.matches_plan(&changed));
         let mut changed = state.clone();
         changed.manifest_url = "https://cdn.example.test/other.mpd".into();
+        assert!(!state.matches_plan(&changed));
+    }
+
+    #[test]
+    fn dash_checkpoint_matches_ignores_referer_and_user_agent_changes() {
+        let track = DashCheckpointTrack {
+            mime_type: "video/mp4".into(),
+            initialization_url: Some("https://cdn.example.test/init.mp4".into()),
+            initialization_range: None,
+            segment_urls: vec!["https://cdn.example.test/seg-1.m4s".into()],
+            segment_ranges: vec![None],
+        };
+        let state = DashJobState {
+            version: 1,
+            manifest_url: "https://cdn.example.test/video.mpd".into(),
+            representation_id: "v1".into(),
+            audio_representation_id: None,
+            session: Some(SessionHeaders {
+                cookies: Some("sessionid=abc123".to_string()),
+                referer: Some("https://cdn.example.test/watch".to_string()),
+                user_agent: Some("TestAgent/1.0".to_string()),
+                origin: Some("https://cdn.example.test".to_string()),
+            }),
+            video_tracks: vec![track],
+            audio_tracks: vec![],
+            multi_period: false,
+        };
+        assert!(state.matches_plan(&state));
+        // A referer/UA-only change still matches (F4): the checkpoint is
+        // reused instead of restarting and deleting finished segments.
+        let mut changed = state.clone();
+        let session = changed.session.as_mut().unwrap();
+        session.referer = Some("https://cdn.example.test/other-page".to_string());
+        session.user_agent = Some("OtherAgent/2.0".to_string());
+        assert!(state.matches_plan(&changed));
+        // A credential change does not match: the job restarts.
+        let mut changed = state.clone();
+        changed.session.as_mut().unwrap().cookies = Some("sessionid=zzz".to_string());
+        assert!(!state.matches_plan(&changed));
+        let mut changed = state.clone();
+        changed.session.as_mut().unwrap().origin = Some("https://other.example.test".to_string());
+        assert!(!state.matches_plan(&changed));
+        // A session appearing or disappearing does not match either.
+        let mut changed = state.clone();
+        changed.session = None;
         assert!(!state.matches_plan(&changed));
     }
 
@@ -4660,7 +4726,7 @@ mod hls_download_tests {
     use super::{
         download_hls_resumable, ffmpeg_available, hls_output_extension, hls_work_dir,
         partial_download_metadata_path, validate_hls_content_range,
-        DownloadControl, DownloadOutcome, GlobalRateLimiter,
+        DownloadControl, DownloadOutcome, GlobalRateLimiter, SessionHeaders,
     };
     use crate::download::reserve_download_path;
     use std::{
@@ -4688,6 +4754,10 @@ mod hls_download_tests {
         /// Paths for which the server answers with this Content-Range
         /// header value instead of the correct one.
         content_range_overrides: Arc<Mutex<HashMap<String, String>>>,
+        /// When set, every request must carry exactly this Cookie
+        /// header value or the server answers 403 (exercises the
+        /// session handoff: playlist + segment fetches all need it).
+        require_cookie: Option<String>,
     }
 
     /// Static-route HTTP/1.1 fixture mirroring the keep-alive style of the
@@ -4707,7 +4777,7 @@ mod hls_download_tests {
         let range_206 = Arc::new(AtomicUsize::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
         let routes = Arc::new(routes);
-        let HlsServerOptions { fail_from_index, ignore_range_paths, content_range_overrides } = options;
+        let HlsServerOptions { fail_from_index, ignore_range_paths, content_range_overrides, require_cookie } = options;
         let routes = Arc::new(routes);
         let thread_counts = counts.clone();
         let thread_range = range_206.clone();
@@ -4729,6 +4799,7 @@ mod hls_download_tests {
                 let fail_from_index = fail_from_index.clone();
                 let ignore_range_paths = ignore_range_paths.clone();
                 let content_range_overrides = content_range_overrides.clone();
+                let require_cookie = require_cookie.clone();
                 thread::spawn(move || loop {
                     let mut raw = Vec::new();
                     let mut buffer = [0_u8; 1024];
@@ -4758,6 +4829,16 @@ mod hls_download_tests {
                     {
                         let mut counts = counts.lock().unwrap();
                         *counts.entry(path_only.clone()).or_insert(0) += 1;
+                    }
+                    if let Some(required) = &require_cookie {
+                        let cookie = request.lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("cookie").then(|| value.trim().to_string())
+                        }).unwrap_or_default();
+                        if cookie != *required {
+                            let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                            return;
+                        }
                     }
                     if let Some(from) = &fail_from_index {
                         let segment_index = path_only.strip_prefix("/seg")
@@ -4820,8 +4901,17 @@ mod hls_download_tests {
         target: &std::path::Path,
         control_rx: watch::Receiver<DownloadControl>,
     ) -> anyhow::Result<DownloadOutcome> {
+        run_resumable_with_session(url, target, control_rx, None).await
+    }
+
+    async fn run_resumable_with_session(
+        url: &str,
+        target: &std::path::Path,
+        control_rx: watch::Receiver<DownloadControl>,
+        session: Option<SessionHeaders>,
+    ) -> anyhow::Result<DownloadOutcome> {
         let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
-        download_hls_resumable(url, target, None, control_rx, progress_tx, Arc::new(GlobalRateLimiter::new())).await
+        download_hls_resumable(url, target, session.as_ref(), control_rx, progress_tx, Arc::new(GlobalRateLimiter::new())).await
     }
 
     fn fresh_control() -> (watch::Sender<DownloadControl>, watch::Receiver<DownloadControl>) {
@@ -4999,6 +5089,64 @@ mod hls_download_tests {
         let counts_after_pause = counts.lock().unwrap().clone();
         drop(control_tx);
 
+        let (_control_tx, control_rx) = fresh_control();
+        let outcome = run_resumable(&url, &target, control_rx).await.unwrap();
+        assert_eq!(outcome, DownloadOutcome::Completed);
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(bytes, bodies.concat());
+        // Segments finished before the pause were not requested again.
+        let counts_after_resume = counts.lock().unwrap().clone();
+        for index in done_before_pause {
+            let key = format!("/seg{index}.ts");
+            assert_eq!(counts_after_resume.get(&key), counts_after_pause.get(&key),
+                "segment {index} was re-requested after resume");
+        }
+        stop_server(shutdown, server);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hls_resume_reuses_checkpoint_session_when_caller_has_none() {
+        let (mut routes, bodies) = segment_routes(24, 8192);
+        routes.insert("/media.m3u8".into(), media_playlist(24).into_bytes());
+        let options = HlsServerOptions {
+            require_cookie: Some("sessionid=abc123".to_string()),
+            ..Default::default()
+        };
+        let (base, counts, _range_206, shutdown, server) =
+            spawn_hls_server(routes, Duration::from_millis(8), options);
+        let directory = std::env::temp_dir().join(format!("thunderload-hls-session-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("movie.ts")).await.unwrap();
+        let url = format!("{base}/media.m3u8");
+        let session = SessionHeaders {
+            cookies: Some("sessionid=abc123".to_string()),
+            referer: None,
+            user_agent: None,
+            origin: SessionHeaders::origin_of(&url),
+        };
+        assert!(session.validate(&url).is_ok(), "test session must validate");
+
+        // Phase 1: start with the session, pause mid-flight — the
+        // checkpoint now holds the handoff.
+        let (control_tx, control_rx) = fresh_control();
+        let task_target = target.clone();
+        let task_url = url.clone();
+        let task = tokio::spawn(async move { run_resumable_with_session(&task_url, &task_target, control_rx, Some(session)).await });
+        let done_before_pause = wait_for_checkpoint_progress(&target, 1).await;
+        assert!(!done_before_pause.is_empty() && done_before_pause.len() < 24);
+        control_tx.send(DownloadControl::Paused).unwrap();
+        let outcome = task.await.unwrap().unwrap();
+        assert_eq!(outcome, DownloadOutcome::Paused);
+        assert!(tokio::fs::try_exists(partial_download_metadata_path(&target)).await.unwrap());
+        let counts_after_pause = counts.lock().unwrap().clone();
+        drop(control_tx);
+
+        // Phase 2: resume with NO session — a desktop resume of a
+        // browser-started job mints a fresh job id, so no stored session
+        // is available. The checkpoint must supply it (F2): without the
+        // fix the playlist fetch goes out without cookies and the server
+        // answers 403.
         let (_control_tx, control_rx) = fresh_control();
         let outcome = run_resumable(&url, &target, control_rx).await.unwrap();
         assert_eq!(outcome, DownloadOutcome::Completed);

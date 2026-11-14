@@ -41,7 +41,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     download::direct_checkpoint_info, partial_download_metadata_path, partial_download_path,
-    video::media_checkpoint_info,
+    session::SessionHeaders, video::media_checkpoint_info,
 };
 
 /// Milliseconds since the Unix epoch.
@@ -125,6 +125,13 @@ pub struct JobRecord {
     /// Scheduled start (ms since epoch) for a queued job, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scheduled_at_ms: Option<u64>,
+    /// Browser session handed off with this job (cookies + referer +
+    /// user-agent), if it was started from the browser. Stored only in
+    /// this file on the user's own machine; never returned to the
+    /// frontend (`get_jobs` strips it) and never logged. See
+    /// `session.rs` for the threat model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionHeaders>,
     /// Human-readable status line shown in the queue.
     pub detail: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -152,6 +159,7 @@ impl Default for JobRecord {
             representation_id: None,
             audio_representation_id: None,
             scheduled_at_ms: None,
+            session: None,
             detail: String::new(),
             error: None,
             created_at_ms: 0,
@@ -345,6 +353,13 @@ impl JobStore {
             record.percent = existing.percent;
             record.segments_done = existing.segments_done;
             record.segments_total = existing.segments_total;
+            // A fresh record never carries a session (desktop-started
+            // jobs have none; the stored one is loaded after start_job),
+            // so a resume must not wipe the session a browser-started
+            // job handed off earlier.
+            if record.session.is_none() {
+                record.session = existing.session.clone();
+            }
         }
         self.upsert(record)
     }
@@ -382,9 +397,11 @@ impl JobStore {
         if state == JobState::Cancelled {
             // Cancel deletes the files; the row stays (so the user still
             // sees the cancelled job until they clear it) but must not
-            // point at a target that no longer exists.
+            // point at a target that no longer exists — and a job that
+            // can never resume must not keep its bearer credential.
             job.target_path = None;
             job.checkpoint_path = None;
+            job.session = None;
         }
         self.save()?;
         Ok(true)
@@ -561,6 +578,7 @@ impl JobStore {
                 representation_id: None,
                 audio_representation_id: None,
                 scheduled_at_ms: None,
+                session: None,
                 detail: "Found a partial file without a checkpoint · resume restarts the download".to_string(),
                 error: None,
                 created_at_ms: created,
@@ -631,13 +649,14 @@ impl JobStore {
                 representation_id: info.representation_id,
                 audio_representation_id: info.audio_representation_id,
                 scheduled_at_ms: None,
+                session: info.session,
                 detail,
                 error: None,
                 created_at_ms: created,
                 updated_at_ms: now,
             });
         }
-        if let Some((url, total)) = direct_checkpoint_info(meta_path) {
+        if let Some((url, total, session)) = direct_checkpoint_info(meta_path) {
             let downloaded = fs::metadata(partial_download_path(target))
                 .map(|meta| meta.len())
                 .unwrap_or(0);
@@ -658,6 +677,7 @@ impl JobStore {
                 representation_id: None,
                 audio_representation_id: None,
                 scheduled_at_ms: None,
+                session,
                 detail: "Found a saved direct-download checkpoint · resume continues from the partial file".to_string(),
                 error: None,
                 created_at_ms: created,
@@ -712,6 +732,7 @@ mod tests {
             representation_id: None,
             audio_representation_id: None,
             scheduled_at_ms: None,
+            session: None,
             detail: "Downloading".to_string(),
             error: None,
             created_at_ms: 1_700_000_000_000,
@@ -766,6 +787,62 @@ mod tests {
         assert_eq!(row.scheduled_at_ms, Some(1_700_000_100_000));
         assert_eq!(row.error.as_deref(), Some("boom"));
         assert_eq!(row.total, None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn sample_session() -> SessionHeaders {
+        SessionHeaders {
+            cookies: Some("sessionid=abc123; token=xyz".to_string()),
+            referer: Some("https://example.com/watch".to_string()),
+            user_agent: Some("TestAgent/1.0".to_string()),
+            origin: Some("https://example.com".to_string()),
+        }
+    }
+
+    #[test]
+    fn session_round_trips_through_save_and_load() {
+        let dir = test_dir("session-round-trip");
+        let (mut store, path) = store_in(&dir);
+        let mut record = sample_record("job-native");
+        record.origin = JobOrigin::Native;
+        record.session = Some(sample_session());
+        store.upsert(record).unwrap();
+        let (reloaded, _) = JobStore::load(&path, Duration::from_secs(0));
+        let row = &reloaded.all()[0];
+        let session = row.session.as_ref().expect("session must survive save/load");
+        assert_eq!(session.cookies.as_deref(), Some("sessionid=abc123; token=xyz"));
+        assert_eq!(session.referer.as_deref(), Some("https://example.com/watch"));
+        assert_eq!(session.user_agent.as_deref(), Some("TestAgent/1.0"));
+        assert_eq!(session.origin.as_deref(), Some("https://example.com"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn start_job_carries_session_over_on_resume() {
+        let dir = test_dir("session-carry-over");
+        let (mut store, _) = store_in(&dir);
+        let mut record = sample_record("job-native");
+        record.origin = JobOrigin::Native;
+        record.session = Some(sample_session());
+        store.upsert(record).unwrap();
+        // A fresh (re)start record never carries a session; the stored
+        // one must survive so a desktop resume reuses the handoff.
+        let fresh = sample_record("job-native");
+        assert!(fresh.session.is_none());
+        store.start_job(fresh).unwrap();
+        let row = store.get("job-native").expect("row must exist");
+        assert_eq!(row.session.as_ref().map(|session| session.cookies.as_deref()), Some(Some("sessionid=abc123; token=xyz")));
+        // A fresh record that DOES carry a session replaces the stored one.
+        let mut replacement = sample_record("job-native");
+        replacement.session = Some(SessionHeaders {
+            cookies: Some("sessionid=new".to_string()),
+            referer: None,
+            user_agent: None,
+            origin: Some("https://example.com".to_string()),
+        });
+        store.start_job(replacement).unwrap();
+        let row = store.get("job-native").expect("row must exist");
+        assert_eq!(row.session.as_ref().map(|session| session.cookies.as_deref()), Some(Some("sessionid=new")));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -935,7 +1012,9 @@ mod tests {
     fn update_state_and_remove_behave() {
         let dir = test_dir("update-remove");
         let (mut store, path) = store_in(&dir);
-        store.upsert(sample_record("u")).unwrap();
+        let mut record = sample_record("u");
+        record.session = Some(sample_session());
+        store.upsert(record).unwrap();
         assert!(store
             .update_state("u", JobState::Paused, Some("Paused by user"), None)
             .unwrap());
@@ -954,11 +1033,13 @@ mod tests {
         let row = store.get("u").unwrap();
         assert_eq!(row.downloaded, 10_000);
         assert_eq!(row.percent, Some(100.0));
-        // Cancelled clears the target/checkpoint links.
+        // Cancelled clears the target/checkpoint links and the session:
+        // a job that can never resume must not keep its bearer credential.
         assert!(store.update_state("u", JobState::Cancelled, None, None).unwrap());
         let row = store.get("u").unwrap();
         assert_eq!(row.target_path, None);
         assert_eq!(row.checkpoint_path, None);
+        assert_eq!(row.session, None);
         assert!(store.remove("u").unwrap());
         assert!(!store.remove("u").unwrap());
         let (reloaded, _) = JobStore::load(&path, Duration::from_secs(0));

@@ -50,6 +50,17 @@ function ensureNativePort() {
 }
 async function requestNative(action, payload = {}) {
   if (!(await hasNativePermission())) return { ok: false, error: "Optional desktop-engine permission has not been granted" };
+  // Cookie/header handoff (Slice 6): a browser-started download carries
+  // the session its own URL needs — the browser's cookies for that URL
+  // only, plus the browser user-agent. The referer stays a top-level
+  // payload field (the native host merges it into the bundle). The host
+  // validates the bundle against the download URL and the engine
+  // re-checks the origin on every request, so the session never leaves
+  // the user's machine and is never sent to any other origin. Only the
+  // four download/inspect actions get a session.
+  if (["download.start", "video.download", "dash.download", "video.inspect"].includes(action) && payload?.url) {
+    payload = { ...payload, session: await sessionForUrl(payload.url) };
+  }
   return new Promise((resolve) => {
     const id = "ext-" + Date.now() + "-" + nextRequestId++;
     try {
@@ -63,6 +74,33 @@ async function requestNative(action, payload = {}) {
       resolve({ id, ok: false, error: error?.message || String(error) });
     }
   });
+}
+// Builds the session handoff for one download URL: the browser's
+// cookies for that URL only — `cookies.getAll({ url })` is URL-scoped,
+// never a broad cookie read — plus the browser user-agent. A cookie
+// whose name or value cannot appear in a Cookie header (control chars,
+// `; , " \` or whitespace, per RFC 6265) is skipped, matching the
+// engine's validation: a malformed cookie is dropped, never sent.
+// Returns null when there is nothing to hand off (or the cookies
+// permission is unavailable), so the download proceeds without a session.
+async function sessionForUrl(url) {
+  try {
+    const cookies = await api.cookies.getAll({ url });
+    const parts = [];
+    for (const cookie of cookies || []) {
+      if (!cookie?.name || !cookie.value) continue;
+      if (/[\x00-\x1f\x7f;,\"\\\s]/.test(cookie.name) || /[\x00-\x1f\x7f;,\"\\\s]/.test(cookie.value)) continue;
+      parts.push(cookie.name + "=" + cookie.value);
+    }
+    const userAgent = typeof navigator !== "undefined" && navigator.userAgent ? navigator.userAgent : null;
+    if (!parts.length && !userAgent) return null;
+    // The origin the cookies were captured for — the engine refuses
+    // cookies without it (fail-closed), and only ever sends them to
+    // requests on this exact origin.
+    return { cookies: parts.length ? parts.join("; ") : null, userAgent, origin: new URL(url).origin };
+  } catch (_) {
+    return null;
+  }
 }
 function safeFilenameFromUrl(url, fallback = "download.bin") {
   try {

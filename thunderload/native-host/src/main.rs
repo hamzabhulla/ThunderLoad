@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use std::{collections::HashMap, sync::{Arc, Mutex, OnceLock}};
 use serde_json::{json, Value};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::{mpsc, watch}};
-use thunderload_engine::{dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_resumable, download_url_resumable, hls_output_extension, hls_work_dir, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, DownloadControl, DownloadOutcome, GlobalRateLimiter};
+use thunderload_engine::{dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_resumable, download_url_resumable, hls_output_extension, hls_work_dir, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, DownloadControl, DownloadOutcome, GlobalRateLimiter, SessionHeaders};
 
 const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 
@@ -36,6 +36,39 @@ fn output_name(value: Option<&Value>, fallback: &str) -> String {
 fn timestamp_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default().as_millis() as u64
+}
+
+/// Builds the browser session for one native job from the message's
+/// `session` object plus the top-level `referer` field.
+///
+/// SECURITY — the handoff is a bearer credential (the browser's cookies
+/// for the download URL). It is validated against the download URL here
+/// (cookies only ever go to their own origin; see `SessionHeaders` in
+/// the engine) and the engine re-checks the origin on every request.
+/// An invalid bundle is dropped and the download proceeds without it,
+/// so an authenticated server fails visibly instead of silently
+/// fetching the wrong thing. The session is never logged and never
+/// leaves this machine: it is stored only in the job's own state file
+/// (`.native-jobs/<id>.json`, read back by the desktop handover) and
+/// in the job's checkpoint / jobs.json row.
+fn message_session(message: &Value, url: &str, referer: Option<String>) -> Option<SessionHeaders> {
+    let mut session: SessionHeaders = message.get("session")
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .unwrap_or_default();
+    // The top-level referer is authoritative: it overwrites any referer
+    // already in the bundle, and a non-http(s) value is ignored.
+    if let Some(referer) = referer {
+        if let Some(with) = SessionHeaders::with_referer(Some(referer.as_str())) {
+            session.referer = with.referer;
+        }
+    }
+    if session.validate(url).is_err() {
+        return None;
+    }
+    if session.is_empty() {
+        return None;
+    }
+    Some(session)
 }
 
 async fn wait_native_job_control(
@@ -263,9 +296,11 @@ async fn main() -> Result<()> {
             "video.inspect" => {
                 let url = message.get("url").and_then(Value::as_str).unwrap_or("").to_string();
                 let referer = message.get("referer").and_then(Value::as_str).map(str::to_string);
+                // In-memory only: inspect never writes a state file.
+                let session = message_session(&message, &url, referer);
                 let tx = outgoing_tx.clone();
                 tokio::spawn(async move {
-                    match inspect_video(&url, referer.as_deref()).await {
+                    match inspect_video(&url, session.as_ref()).await {
                         Ok(variants) => { let _ = tx.send(json!({"id": id, "ok": true, "data": {"variants": variants}})); }
                         Err(error) => { let _ = tx.send(json!({"id": id, "ok": false, "error": error.to_string()})); }
                     }
@@ -275,6 +310,7 @@ async fn main() -> Result<()> {
                 let url = message.get("url").and_then(Value::as_str).unwrap_or("").to_string();
                 let filename = output_name(message.get("filename"), "download.bin");
                 let referer = message.get("referer").and_then(Value::as_str).map(str::to_string);
+                let session = message_session(&message, &url, referer);
                 if !(url.starts_with("http://") || url.starts_with("https://")) {
                     let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": "Only HTTP and HTTPS download URLs are supported"}));
                     continue;
@@ -299,6 +335,9 @@ async fn main() -> Result<()> {
                 let tx = outgoing_tx.clone();
                 let mut state = native_job_state(&job_id, &filename, &url, "direct");
                 state["targetPath"] = json!(target.to_string_lossy().to_string());
+                if let Some(session) = &session {
+                    state["session"] = serde_json::to_value(session).unwrap_or(Value::Null);
+                }
                 let _ = save_native_job_state(&state).await;
                 let _ = outgoing_tx.send(json!({"id": id, "ok": true, "data": {"accepted": true, "jobId": job_id}}));
                 tokio::spawn(async move {
@@ -328,7 +367,7 @@ async fn main() -> Result<()> {
                         });
 
                         let result = download_url_resumable(
-                            &url, &target, referer.as_deref(), control_rx.clone(),
+                            &url, &target, session.as_ref(), control_rx.clone(),
                             rate_limiter(), progress_tx
                         ).await;
                         let _ = progress_handle.await;
@@ -441,6 +480,7 @@ async fn main() -> Result<()> {
             "video.download" => {
                 let url = message.get("url").and_then(Value::as_str).unwrap_or("").to_string();
                 let referer = message.get("referer").and_then(Value::as_str).map(str::to_string);
+                let session = message_session(&message, &url, referer);
                 let filename = output_name(message.get("filename"), "video");
                 if !(url.starts_with("http://") || url.starts_with("https://")) {
                     let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": "Only HTTP and HTTPS playlist URLs are supported"}));
@@ -451,7 +491,7 @@ async fn main() -> Result<()> {
                 // fMP4) — the one-shot download did this, and reserving
                 // from the caller's filename alone would misname a TS
                 // stream as .mp4.
-                let extension = match hls_output_extension(&url, referer.as_deref()).await {
+                let extension = match hls_output_extension(&url, session.as_ref()).await {
                     Ok(extension) => extension,
                     Err(error) => {
                         let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": error.to_string()}));
@@ -479,6 +519,9 @@ async fn main() -> Result<()> {
                 let tx = outgoing_tx.clone();
                 let mut state = native_job_state(&job_id, &filename, &url, "hls");
                 state["targetPath"] = json!(target.to_string_lossy().to_string());
+                if let Some(session) = &session {
+                    state["session"] = serde_json::to_value(session).unwrap_or(Value::Null);
+                }
                 let _ = save_native_job_state(&state).await;
                 let _ = outgoing_tx.send(json!({"id": id, "ok": true, "data": {"accepted": true, "jobId": job_id}}));
                 tokio::spawn(async move {
@@ -508,7 +551,7 @@ async fn main() -> Result<()> {
                         });
 
                         let result = download_hls_resumable(
-                            &url, &target, referer.as_deref(), control_rx.clone(),
+                            &url, &target, session.as_ref(), control_rx.clone(),
                             progress_tx, rate_limiter()
                         ).await;
                         let _ = progress_handle.await;
@@ -621,6 +664,7 @@ async fn main() -> Result<()> {
             "dash.download" => {
                 let url = message.get("url").and_then(Value::as_str).unwrap_or("").to_string();
                 let referer = message.get("referer").and_then(Value::as_str).map(str::to_string);
+                let session = message_session(&message, &url, referer);
                 let filename = output_name(message.get("filename"), "video.mp4");
                 let representation_id = message.get("representationId").and_then(Value::as_str).unwrap_or("").to_string();
                 // The extension sends "" when there is no separate audio
@@ -638,7 +682,7 @@ async fn main() -> Result<()> {
                     let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": "Only HTTP and HTTPS DASH manifests are supported"}));
                     continue;
                 }
-                let extension = match dash_output_extension(&url, &representation_id, audio_representation_id.as_deref(), referer.as_deref()).await {
+                let extension = match dash_output_extension(&url, &representation_id, audio_representation_id.as_deref(), session.as_ref()).await {
                     Ok(extension) => extension,
                     Err(error) => {
                         let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": error.to_string()}));
@@ -666,6 +710,9 @@ async fn main() -> Result<()> {
                 let tx = outgoing_tx.clone();
                 let mut state = native_job_state(&job_id, &filename, &url, "dash");
                 state["targetPath"] = json!(target.to_string_lossy().to_string());
+                if let Some(session) = &session {
+                    state["session"] = serde_json::to_value(session).unwrap_or(Value::Null);
+                }
                 state["representationId"] = json!(representation_id);
                 state["audioRepresentationId"] = audio_representation_id.clone().map(Value::from).unwrap_or(Value::Null);
                 let _ = save_native_job_state(&state).await;
@@ -698,7 +745,7 @@ async fn main() -> Result<()> {
 
                         let result = download_dash_resumable(
                             &url, &representation_id, audio_representation_id.as_deref(), &target,
-                            referer.as_deref(), control_rx.clone(), progress_tx, rate_limiter()
+                            session.as_ref(), control_rx.clone(), progress_tx, rate_limiter()
                         ).await;
                         let _ = progress_handle.await;
 

@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context, Result};
+use crate::session::{apply_session, SessionHeaders};
 use futures_util::StreamExt;
 use reqwest::{header, Client, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -75,11 +76,8 @@ struct RangeProbe {
 
 /// Some servers support byte ranges but omit Accept-Ranges on HEAD. Probe a
 /// single byte before falling back to one connection; only trust a strict 206.
-async fn probe_range_support(client: &Client, url: &str, referer: Option<&str>) -> Option<RangeProbe> {
-    let mut request = client.get(url).header(header::RANGE, "bytes=0-0");
-    if let Some(referrer) = referer {
-        request = request.header(header::REFERER, referrer);
-    }
+async fn probe_range_support(client: &Client, url: &str, session: Option<&SessionHeaders>) -> Option<RangeProbe> {
+    let request = apply_session(session, client.get(url).header(header::RANGE, "bytes=0-0"), url);
     let response = request.send().await.ok()?;
     if response.status() != StatusCode::PARTIAL_CONTENT {
         return None;
@@ -122,7 +120,7 @@ pub async fn download_url(
     url: &str,
     target: &Path,
     connections: usize,
-    referer: Option<&str>,
+    session: Option<&SessionHeaders>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
     rate_limiter: Arc<GlobalRateLimiter>,
 ) -> Result<PathBuf> {
@@ -130,8 +128,8 @@ pub async fn download_url(
     let result = async {
         let connections = connections.clamp(1, 16);
         let client = client()?;
-        let mut head_request = client.head(url);
-        if let Some(referrer) = referer { head_request = head_request.header(header::REFERER, referrer); }
+        let head_request = client.head(url);
+        let head_request = apply_session(session, head_request, url);
         let head = head_request.send().await.ok();
         // Read the total from the Content-Length header, NOT from
         // response.content_length(): for a HEAD response hyper reports the
@@ -160,7 +158,7 @@ pub async fn download_url(
         // Probe when HEAD omits Accept-Ranges (common on CDN/object-storage
         // endpoints). A valid one-byte 206 is stronger evidence than the hint.
         if connections > 1 && (!supports_ranges || total.is_none()) {
-            if let Some(probe) = probe_range_support(&client, url, referer).await {
+            if let Some(probe) = probe_range_support(&client, url, session).await {
                 total = Some(probe.total);
                 if if_range.is_none() { if_range = probe.if_range; }
                 supports_ranges = true;
@@ -168,7 +166,7 @@ pub async fn download_url(
         }
 
         if supports_ranges && total.unwrap_or(0) >= 2 * 1024 * 1024 && connections > 1 {
-            match download_segmented(&client, url, &target, total.unwrap(), connections.min(16), referer, if_range.as_deref(), progress_tx.clone(), rate_limiter.clone()).await {
+            match download_segmented(&client, url, &target, total.unwrap(), connections.min(16), session, if_range.as_deref(), progress_tx.clone(), rate_limiter.clone()).await {
                 Ok(path) => return Ok(path),
                 Err(_) => {
                     // Some servers advertise byte ranges but return invalid ranges.
@@ -179,7 +177,7 @@ pub async fn download_url(
                 }
             }
         }
-        download_sequential(&client, url, &target, total, referer, progress_tx, rate_limiter).await
+        download_sequential(&client, url, &target, total, session, progress_tx, rate_limiter).await
     }.await;
 
     if result.is_err() {
@@ -199,14 +197,13 @@ async fn download_sequential(
     url: &str,
     target: &Path,
     total: Option<u64>,
-    referer: Option<&str>,
+    session: Option<&SessionHeaders>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
     rate_limiter: Arc<GlobalRateLimiter>,
 ) -> Result<PathBuf> {
     prepare_parent(target).await?;
     let temp = target.with_extension(format!("{}{}.part", target.extension().and_then(|x| x.to_str()).unwrap_or("file"), Uuid::new_v4()));
-    let mut request = client.get(url);
-    if let Some(referrer) = referer { request = request.header(header::REFERER, referrer); }
+    let request = apply_session(session, client.get(url), url);
     let response = request.send().await?.error_for_status()?;
     let actual_total = response.content_length().or(total);
 
@@ -256,7 +253,7 @@ async fn download_segmented(
     target: &Path,
     total: u64,
     connections: usize,
-    referer: Option<&str>,
+    session: Option<&SessionHeaders>,
     if_range: Option<&str>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
     rate_limiter: Arc<GlobalRateLimiter>,
@@ -279,13 +276,13 @@ async fn download_segmented(
         let url = url.to_owned();
         let received = received.clone();
         let last_report = last_report.clone();
-        let referrer = referer.map(str::to_string);
+        let session = session.cloned();
         let validator = if_range.map(str::to_string);
         let progress_tx = progress_tx.clone();
         let rate_limiter = rate_limiter.clone();
         tasks.spawn(async move {
             let mut request = client.get(&url).header(header::RANGE, format!("bytes={start}-{end}"));
-            if let Some(referrer) = referrer { request = request.header(header::REFERER, referrer); }
+            request = apply_session(session.as_ref(), request, &url);
             if let Some(validator_value) = validator.as_deref() {
                 request = request.header(header::IF_RANGE, validator_value);
             }
@@ -584,6 +581,13 @@ struct ResumeMetadata {
     connections: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     segments: Option<Vec<SegmentState>>,
+    /// Browser session handed off with this job, if any — stored here
+    /// so a resume reuses it even when the caller has none. A desktop
+    /// resume of a browser-started job mints a fresh job id, so the
+    /// stored JobRecord session is unreachable; the checkpoint is the
+    /// only copy left (F2). An explicit caller session always wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session: Option<SessionHeaders>,
 }
 
 /// One byte range of a segmented checkpoint. A segment is only ever written
@@ -628,13 +632,10 @@ struct ServerInfo {
 async fn fetch_server_info(
     client: &Client,
     url: &str,
-    referer: Option<&str>,
+    session: Option<&SessionHeaders>,
     probe: bool,
 ) -> ServerInfo {
-    let mut head_request = client.head(url);
-    if let Some(referrer) = referer {
-        head_request = head_request.header(header::REFERER, referrer);
-    }
+    let head_request = apply_session(session, client.head(url), url);
     let head = head_request.send().await.ok();
     // Read the total from the Content-Length header, NOT from
     // response.content_length(): for a HEAD response hyper reports the body
@@ -676,7 +677,7 @@ async fn fetch_server_info(
     // classified by shape (quoted = ETag, otherwise Last-Modified) so the
     // fresh checkpoint still carries it for If-Range.
     if probe && (!supports_ranges || total.is_none()) {
-        if let Some(found) = probe_range_support(client, url, referer).await {
+        if let Some(found) = probe_range_support(client, url, session).await {
             total = Some(found.total);
             if etag.is_none() && last_modified.is_none() {
                 if let Some(value) = found.if_range {
@@ -722,10 +723,13 @@ async fn read_resume_metadata(path: &Path) -> Option<ResumeMetadata> {
 /// Synchronous read of a direct-download checkpoint sidecar (Slice 5:
 /// the job store imports orphaned checkpoints without a Tokio runtime).
 /// Returns the download URL and the advertised total, if any.
-pub(crate) fn direct_checkpoint_info(path: &Path) -> Option<(String, Option<u64>)> {
+/// Reads a direct-download checkpoint sidecar: the URL, the total,
+/// and the browser session stored with it, if any (F3: a direct orphan
+/// keeps its handoff so a desktop resume reuses it).
+pub(crate) fn direct_checkpoint_info(path: &Path) -> Option<(String, Option<u64>, Option<SessionHeaders>)> {
     let bytes = std::fs::read(path).ok()?;
     let metadata: ResumeMetadata = serde_json::from_slice(&bytes).ok()?;
-    Some((metadata.url, metadata.total))
+    Some((metadata.url, metadata.total, metadata.session))
 }
 
 async fn write_resume_metadata(path: &Path, metadata: &ResumeMetadata) -> Result<()> {
@@ -824,19 +828,18 @@ async fn download_segment_range(
     end: u64,
     total: u64,
     validator: Option<&str>,
-    referer: Option<&str>,
+    session: Option<&SessionHeaders>,
     mut control: tokio::sync::watch::Receiver<DownloadControl>,
     rate_limiter: Arc<GlobalRateLimiter>,
     received: Arc<AtomicU64>,
     last_report: Arc<Mutex<Instant>>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
 ) -> Result<SegmentOutcome> {
-    let mut request = client
-        .get(url)
-        .header(header::RANGE, format!("bytes={start}-{end}"));
-    if let Some(referrer) = referer {
-        request = request.header(header::REFERER, referrer);
-    }
+    let mut request = apply_session(
+        session,
+        client.get(url).header(header::RANGE, format!("bytes={start}-{end}")),
+        url,
+    );
     if let Some(validator_value) = validator {
         request = request.header(header::IF_RANGE, validator_value);
     }
@@ -930,7 +933,7 @@ async fn run_segmented_download(
     checkpoint: &Arc<AsyncMutex<SegmentCheckpoint>>,
     total: u64,
     validator: Option<String>,
-    referer: Option<&str>,
+    session: Option<&SessionHeaders>,
     control: tokio::sync::watch::Receiver<DownloadControl>,
     rate_limiter: Arc<GlobalRateLimiter>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
@@ -961,7 +964,7 @@ async fn run_segmented_download(
         let client = client.clone();
         let url = url.to_owned();
         let part = part.to_path_buf();
-        let referrer = referer.map(str::to_string);
+        let session = session.cloned();
         let validator = validator.clone();
         let task_control = control.clone();
         let rate_limiter = rate_limiter.clone();
@@ -978,7 +981,7 @@ async fn run_segmented_download(
                 end,
                 total,
                 validator.as_deref(),
-                referrer.as_deref(),
+                session.as_ref(),
                 task_control,
                 rate_limiter,
                 received,
@@ -1078,6 +1081,7 @@ fn fresh_segmented_metadata(
     total: u64,
     connections: usize,
     server: &ServerInfo,
+    session: Option<&SessionHeaders>,
 ) -> ResumeMetadata {
     let segments = segment_ranges(total, connections)
         .into_iter()
@@ -1090,6 +1094,7 @@ fn fresh_segmented_metadata(
         total: Some(total),
         connections: Some(connections),
         segments: Some(segments),
+        session: session.cloned(),
     }
 }
 
@@ -1115,7 +1120,7 @@ async fn run_segmented_with_restart(
     metadata_path: &Path,
     mut metadata: ResumeMetadata,
     server: &ServerInfo,
-    referer: Option<&str>,
+    session: Option<&SessionHeaders>,
     control: tokio::sync::watch::Receiver<DownloadControl>,
     rate_limiter: Arc<GlobalRateLimiter>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
@@ -1141,7 +1146,7 @@ async fn run_segmented_with_restart(
             &checkpoint,
             total,
             validator,
-            referer,
+            session,
             control.clone(),
             rate_limiter.clone(),
             progress_tx.clone(),
@@ -1151,7 +1156,7 @@ async fn run_segmented_with_restart(
             SegmentedRun::Finished(outcome) => return Ok(outcome),
             SegmentedRun::ValidatorChanged if attempt == 0 => {
                 remove_resume_files(part, metadata_path, target).await;
-                metadata = fresh_segmented_metadata(url, total, connections, server);
+                metadata = fresh_segmented_metadata(url, total, connections, server, session);
                 ensure_segmented_part(part, total).await?;
                 write_resume_metadata(metadata_path, &metadata).await?;
             }
@@ -1179,7 +1184,7 @@ async fn download_segmented_resumable(
     metadata_path: &Path,
     saved: ResumeMetadata,
     server: &ServerInfo,
-    referer: Option<&str>,
+    session: Option<&SessionHeaders>,
     control: tokio::sync::watch::Receiver<DownloadControl>,
     rate_limiter: Arc<GlobalRateLimiter>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
@@ -1198,7 +1203,7 @@ async fn download_segmented_resumable(
         metadata_path,
         saved,
         server,
-        referer,
+        session,
         control,
         rate_limiter,
         progress_tx,
@@ -1217,12 +1222,12 @@ async fn download_segmented_resumable_fresh(
     total: u64,
     connections: usize,
     server: &ServerInfo,
-    referer: Option<&str>,
+    session: Option<&SessionHeaders>,
     control: tokio::sync::watch::Receiver<DownloadControl>,
     rate_limiter: Arc<GlobalRateLimiter>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
 ) -> Result<DownloadOutcome> {
-    let metadata = fresh_segmented_metadata(url, total, connections, server);
+    let metadata = fresh_segmented_metadata(url, total, connections, server, session);
     ensure_segmented_part(part, total).await?;
     write_resume_metadata(metadata_path, &metadata).await?;
     run_segmented_with_restart(
@@ -1233,7 +1238,7 @@ async fn download_segmented_resumable_fresh(
         metadata_path,
         metadata,
         server,
-        referer,
+        session,
         control,
         rate_limiter,
         progress_tx,
@@ -1253,7 +1258,7 @@ async fn download_segmented_resumable_fresh(
 pub async fn download_url_resumable(
     url: &str,
     target: &Path,
-    referer: Option<&str>,
+    session: Option<&SessionHeaders>,
     control: tokio::sync::watch::Receiver<DownloadControl>,
     rate_limiter: Arc<GlobalRateLimiter>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
@@ -1261,7 +1266,7 @@ pub async fn download_url_resumable(
     download_url_resumable_with_connections(
         url,
         target,
-        referer,
+        session,
         DEFAULT_RESUMABLE_CONNECTIONS,
         control,
         rate_limiter,
@@ -1286,7 +1291,7 @@ const MIN_SEGMENTED_TOTAL: u64 = 2 * 1024 * 1024;
 pub async fn download_url_resumable_with_connections(
     url: &str,
     target: &Path,
-    referer: Option<&str>,
+    session: Option<&SessionHeaders>,
     connections: usize,
     control: tokio::sync::watch::Receiver<DownloadControl>,
     rate_limiter: Arc<GlobalRateLimiter>,
@@ -1327,6 +1332,13 @@ pub async fn download_url_resumable_with_connections(
         }
     }
 
+    // A resume reuses the handoff stored with the checkpoint when the
+    // caller has none (F2). An explicit caller session always wins.
+    let owned_session = session.is_none()
+        .then(|| saved_metadata.as_ref().and_then(|saved| saved.session.clone()))
+        .flatten();
+    let session = session.or(owned_session.as_ref());
+
     let client = client()?;
     // One HEAD (+ a one-byte probe when HEAD is silent) for the whole call:
     // the segmented decision, the identity check and the sequential path all
@@ -1336,7 +1348,7 @@ pub async fn download_url_resumable_with_connections(
         .as_ref()
         .map(|saved| saved.segments.is_some())
         .unwrap_or(true);
-    let server = fetch_server_info(&client, url, referer, probe).await;
+    let server = fetch_server_info(&client, url, session, probe).await;
 
     // A segmented checkpoint resumes in parallel — but only when the server
     // still reports the same object, still supports ranges, and the stored
@@ -1361,7 +1373,7 @@ pub async fn download_url_resumable_with_connections(
                     &metadata_path,
                     saved,
                     &server,
-                    referer,
+                    session,
                     control,
                     rate_limiter,
                     progress_tx,
@@ -1389,7 +1401,7 @@ pub async fn download_url_resumable_with_connections(
                     total,
                     connections,
                     &server,
-                    referer,
+                    session,
                     control,
                     rate_limiter,
                     progress_tx,
@@ -1402,7 +1414,7 @@ pub async fn download_url_resumable_with_connections(
     download_sequential_resumable(
         url,
         target,
-        referer,
+        session,
         control,
         rate_limiter,
         progress_tx,
@@ -1423,7 +1435,7 @@ pub async fn download_url_resumable_with_connections(
 async fn download_sequential_resumable(
     url: &str,
     target: &Path,
-    referer: Option<&str>,
+    session: Option<&SessionHeaders>,
     mut control: tokio::sync::watch::Receiver<DownloadControl>,
     rate_limiter: Arc<GlobalRateLimiter>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
@@ -1453,7 +1465,7 @@ async fn download_sequential_resumable(
             }
         }
     }
-    if let Some(referrer) = referer { request = request.header(header::REFERER, referrer); }
+    request = apply_session(session, request, url);
     let mut response = request.send().await.context("Could not connect to the download server")?;
     if !response.status().is_success() && response.status() != StatusCode::PARTIAL_CONTENT {
         return Err(anyhow!("Download server returned HTTP {}", response.status()));
@@ -1479,8 +1491,7 @@ async fn download_sequential_resumable(
             // If-Range should make a changed resource return 200. Be defensive:
             // if a server nevertheless returns a mismatched 206, discard the
             // old prefix and issue a fresh full GET instead of joining versions.
-            let mut restart = client.get(url);
-            if let Some(referrer) = referer { restart = restart.header(header::REFERER, referrer); }
+            let restart = apply_session(session, client.get(url), url);
             response = restart.send().await.context("Could not restart a changed download")?.error_for_status()?;
             append = false;
             let _ = fs::remove_file(&part).await;
@@ -1515,6 +1526,7 @@ async fn download_sequential_resumable(
         // Sequential checkpoint: no segment layout.
         connections: None,
         segments: None,
+        session: session.cloned(),
     };
     write_resume_metadata(&metadata_path, &current_metadata).await?;
     saved_metadata = Some(current_metadata);
@@ -1623,11 +1635,12 @@ mod resumable_http_tests {
     use super::{
         download_url_resumable, partial_download_metadata_path, partial_download_path,
         reserve_download_path, DownloadControl, DownloadOutcome, GlobalRateLimiter,
+        SessionHeaders,
     };
     use std::{
         io::{Read, Write},
         net::TcpListener,
-        sync::{atomic::{AtomicBool, AtomicUsize, Ordering}, Arc},
+        sync::{atomic::{AtomicBool, AtomicUsize, Ordering}, Arc, Mutex},
         thread,
         time::Duration,
     };
@@ -1715,6 +1728,10 @@ mod resumable_http_tests {
     }
 
     async fn run_until_pause(url: &str, target: &std::path::Path) -> (DownloadOutcome, watch::Sender<DownloadControl>) {
+        run_until_pause_with_session(url, target, None).await
+    }
+
+    async fn run_until_pause_with_session(url: &str, target: &std::path::Path, session: Option<SessionHeaders>) -> (DownloadOutcome, watch::Sender<DownloadControl>) {
         let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
         let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
         let limiter = Arc::new(GlobalRateLimiter::new());
@@ -1722,7 +1739,7 @@ mod resumable_http_tests {
         let target = target.to_path_buf();
         let task_target = target.clone();
         let task = tokio::spawn(async move {
-            download_url_resumable(&url, &task_target, None, control_rx, limiter, progress_tx).await
+            download_url_resumable(&url, &task_target, session.as_ref(), control_rx, limiter, progress_tx).await
         });
         let part = partial_download_path(&target);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
@@ -1791,6 +1808,334 @@ mod resumable_http_tests {
         server.join().unwrap();
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
+
+    /// A server that only serves its file to a request carrying the exact
+    /// session cookie. Records every request's Cookie / Referer /
+    /// User-Agent headers so the test can prove what the engine sent.
+    fn spawn_cookie_gated_server() -> (String, Arc<Mutex<Vec<String>>>, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_seen = seen.clone();
+        let thread_shutdown = shutdown.clone();
+        let handle = thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(3));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => {
+                            request.extend_from_slice(&buffer[..count]);
+                            if request.windows(4).any(|window| window == b"\r\n\r\n") { break; }
+                        }
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let header = |name: &str| request.lines().find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case(name).then(|| value.trim().to_string())
+                }).unwrap_or_default();
+                let cookie = header("cookie");
+                let referer = header("referer");
+                let user_agent = header("user-agent");
+                thread_seen.lock().unwrap().push(format!("cookie={cookie}|referer={referer}|user-agent={user_agent}"));
+                if cookie != "sessionid=abc123" {
+                    let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    continue;
+                }
+                let body = vec![b'C'; BODY_SIZE];
+                let first = request.lines().next().unwrap_or_default();
+                if first.starts_with("HEAD ") {
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"gated-v1\"\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                        BODY_SIZE
+                    );
+                    let _ = stream.write_all(headers.as_bytes());
+                    continue;
+                }
+                // Honor byte ranges (with If-Range) so a resume is a real
+                // resume from the saved offset, not a restart.
+                let range = header("range");
+                let if_range = header("if-range");
+                let requested_start = range
+                    .strip_prefix("bytes=")
+                    .and_then(|value| value.strip_suffix('-'))
+                    .and_then(|value| value.parse::<usize>().ok());
+                let can_resume = requested_start.is_some() && if_range.as_str() == "\"gated-v1\"";
+                let start = if can_resume { requested_start.unwrap() } else { 0 };
+                let payload = &body[start..];
+                let (status, extra) = if can_resume {
+                    ("206 Partial Content", format!("Content-Range: bytes {}-{}/{BODY_SIZE}\r\n", start, BODY_SIZE - 1))
+                } else {
+                    ("200 OK", String::new())
+                };
+                let headers = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nETag: \"gated-v1\"\r\nAccept-Ranges: bytes\r\n{extra}Connection: close\r\n\r\n",
+                    payload.len()
+                );
+                if stream.write_all(headers.as_bytes()).is_err() { continue; }
+                for chunk in payload.chunks(1024) {
+                    if stream.write_all(chunk).is_err() { break; }
+                    thread::sleep(Duration::from_millis(3));
+                }
+            }
+        });
+        (format!("http://{address}/file.bin"), seen, shutdown, handle)
+    }
+
+    fn gated_session_for(url: &str) -> SessionHeaders {
+        let session = SessionHeaders {
+            cookies: Some("sessionid=abc123".to_string()),
+            referer: Some("http://127.0.0.1/page".to_string()),
+            user_agent: Some("ThunderLoad-Test/1.0".to_string()),
+            origin: SessionHeaders::origin_of(url),
+        };
+        assert!(session.validate(url).is_ok(), "test session must validate for {url}");
+        session
+    }
+
+    #[tokio::test]
+    async fn session_cookies_and_headers_are_sent_for_a_gated_download() {
+        let (url, seen, shutdown, server) = spawn_cookie_gated_server();
+        let directory = std::env::temp_dir().join(format!("thunderload-session-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("file.bin")).await.unwrap();
+        let session = gated_session_for(&url);
+        let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        let outcome = download_url_resumable(
+            &url, &target, Some(&session), control_rx, Arc::new(GlobalRateLimiter::new()), progress_tx,
+        ).await.unwrap();
+        assert_eq!(outcome, DownloadOutcome::Completed);
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(bytes, vec![b'C'; BODY_SIZE]);
+        // Every request the server saw carried the cookie, the referer
+        // and the browser user-agent (HEAD probe + GET).
+        let seen = seen.lock().unwrap();
+        assert!(!seen.is_empty(), "server must have seen at least one request");
+        for entry in seen.iter() {
+            assert!(entry.contains("cookie=sessionid=abc123"), "request without the session cookie: {entry}");
+            assert!(entry.contains("referer=http://127.0.0.1/page"), "request without the referer: {entry}");
+            assert!(entry.contains("user-agent=ThunderLoad-Test/1.0"), "request without the browser UA: {entry}");
+        }
+        drop(control_tx);
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn gated_download_fails_without_a_session() {
+        let (url, _seen, shutdown, server) = spawn_cookie_gated_server();
+        let directory = std::env::temp_dir().join(format!("thunderload-session-noauth-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("file.bin")).await.unwrap();
+        let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        let result = download_url_resumable(
+            &url, &target, None, control_rx, Arc::new(GlobalRateLimiter::new()), progress_tx,
+        ).await;
+        assert!(result.is_err(), "a cookie-gated download without a session must fail, got {result:?}");
+        drop(control_tx);
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resume_reuses_checkpoint_session_when_caller_has_none() {
+        let (url, seen, shutdown, server) = spawn_cookie_gated_server();
+        let directory = std::env::temp_dir().join(format!("thunderload-session-resume-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("file.bin")).await.unwrap();
+        let session = gated_session_for(&url);
+        // Phase 1: start with the session, pause mid-flight — the
+        // checkpoint on disk now holds the handoff.
+        let (outcome, _control) = run_until_pause_with_session(&url, &target, Some(session)).await;
+        assert_eq!(outcome, DownloadOutcome::Paused);
+        let part = partial_download_path(&target);
+        let saved = tokio::fs::metadata(&part).await.unwrap().len();
+        assert!(saved > 0 && saved < BODY_SIZE as u64);
+        assert!(tokio::fs::try_exists(partial_download_metadata_path(&target)).await.unwrap());
+        let requests_before_resume = seen.lock().unwrap().len();
+        // Phase 2: resume with NO session — a desktop resume of a
+        // browser-started job mints a fresh job id, so no stored session
+        // is available. The checkpoint must supply it (F2): without the
+        // fix the playlist/HEAD request goes out without cookies and the
+        // server answers 403.
+        let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        let outcome = download_url_resumable(
+            &url, &target, None, control_rx, Arc::new(GlobalRateLimiter::new()), progress_tx,
+        ).await.unwrap();
+        assert_eq!(outcome, DownloadOutcome::Completed);
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(bytes, vec![b'C'; BODY_SIZE]);
+        // The resume requests carried the cookie too.
+        let seen = seen.lock().unwrap();
+        assert!(seen.len() > requests_before_resume, "resume must have issued requests");
+        for entry in seen.iter().skip(requests_before_resume) {
+            assert!(entry.contains("cookie=sessionid=abc123"), "resume request without the session cookie: {entry}");
+        }
+        drop(control_tx);
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    /// Serves a 302 to `target` for any GET (HEAD is answered directly),
+    /// and records whether a Cookie header arrived. The target is a
+    /// different origin (different port), so the Cookie header must not
+    /// follow the redirect.
+    fn spawn_redirect_server(target: String) -> (String, Arc<AtomicBool>, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let saw_cookie = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_saw_cookie = saw_cookie.clone();
+        let thread_shutdown = shutdown.clone();
+        let handle = thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(3));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => {
+                            request.extend_from_slice(&buffer[..count]);
+                            if request.windows(4).any(|window| window == b"\r\n\r\n") { break; }
+                        }
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let has_cookie = request.lines().any(|line| {
+                    line.split_once(':').is_some_and(|(key, _)| key.eq_ignore_ascii_case("cookie"))
+                });
+                if has_cookie {
+                    thread_saw_cookie.store(true, Ordering::Relaxed);
+                }
+                let first = request.lines().next().unwrap_or_default();
+                if first.starts_with("HEAD ") {
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                        BODY_SIZE
+                    );
+                    let _ = stream.write_all(headers.as_bytes());
+                    continue;
+                }
+                let headers = format!("HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                let _ = stream.write_all(headers.as_bytes());
+            }
+        });
+        (format!("http://{address}/file.bin"), saw_cookie, shutdown, handle)
+    }
+
+    /// Serves its file to any GET (HEAD answered directly) and records
+    /// whether a Cookie header arrived.
+    fn spawn_plain_file_server() -> (String, Arc<AtomicBool>, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let saw_cookie = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_saw_cookie = saw_cookie.clone();
+        let thread_shutdown = shutdown.clone();
+        let handle = thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(3));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => {
+                            request.extend_from_slice(&buffer[..count]);
+                            if request.windows(4).any(|window| window == b"\r\n\r\n") { break; }
+                        }
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let has_cookie = request.lines().any(|line| {
+                    line.split_once(':').is_some_and(|(key, _)| key.eq_ignore_ascii_case("cookie"))
+                });
+                if has_cookie {
+                    thread_saw_cookie.store(true, Ordering::Relaxed);
+                }
+                let first = request.lines().next().unwrap_or_default();
+                if first.starts_with("HEAD ") {
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                        BODY_SIZE
+                    );
+                    let _ = stream.write_all(headers.as_bytes());
+                    continue;
+                }
+                let body = vec![b'R'; BODY_SIZE];
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                    BODY_SIZE
+                );
+                if stream.write_all(headers.as_bytes()).is_err() { continue; }
+                for chunk in body.chunks(1024) {
+                    if stream.write_all(chunk).is_err() { break; }
+                }
+            }
+        });
+        (format!("http://{address}/file.bin"), saw_cookie, shutdown, handle)
+    }
+
+    #[tokio::test]
+    async fn session_cookies_are_not_sent_on_cross_origin_redirect() {
+        let (file_url, file_saw_cookie, file_shutdown, file_server) = spawn_plain_file_server();
+        let (url, origin_saw_cookie, redirect_shutdown, redirect_server) = spawn_redirect_server(file_url);
+        let directory = std::env::temp_dir().join(format!("thunderload-session-redirect-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("file.bin")).await.unwrap();
+        let session = gated_session_for(&url);
+        let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        let outcome = download_url_resumable(
+            &url, &target, Some(&session), control_rx, Arc::new(GlobalRateLimiter::new()), progress_tx,
+        ).await.unwrap();
+        assert_eq!(outcome, DownloadOutcome::Completed);
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(bytes, vec![b'R'; BODY_SIZE]);
+        assert!(origin_saw_cookie.load(Ordering::Relaxed), "origin server must have seen the session cookie");
+        assert!(!file_saw_cookie.load(Ordering::Relaxed), "redirect target (different origin) must NOT see the session cookie");
+        drop(control_tx);
+        redirect_shutdown.store(true, Ordering::Relaxed);
+        file_shutdown.store(true, Ordering::Relaxed);
+        redirect_server.join().unwrap();
+        file_server.join().unwrap();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -1825,6 +2170,7 @@ mod resume_metadata_tests {
             total: Some(1000),
             connections: None,
             segments: None,
+            session: None,
         };
         assert!(resume_identity_matches(&saved, "https://example.test/file.bin", Some("\"v1\""), None, Some(1000)));
         assert!(!resume_identity_matches(&saved, "https://example.test/other.bin", Some("\"v1\""), None, Some(1000)));
@@ -1841,6 +2187,7 @@ mod resume_metadata_tests {
             total: None,
             connections: None,
             segments: None,
+            session: None,
         };
         assert!(resume_identity_matches(&saved, "https://example.test/file.bin", None, Some("Wed, 21 Oct 2015 07:28:00 GMT"), None));
         assert!(!resume_identity_matches(&saved, "https://example.test/file.bin", None, Some("Thu, 22 Oct 2015 07:28:00 GMT"), None));
@@ -2471,6 +2818,7 @@ mod segmented_resumable_tests {
                     })
                     .collect(),
             ),
+            session: None,
         };
         let metadata_path = partial_download_metadata_path(&target);
         write_resume_metadata(&metadata_path, &metadata).await.unwrap();
@@ -2542,6 +2890,7 @@ mod segmented_resumable_tests {
                     })
                     .collect(),
             ),
+            session: None,
         };
         let metadata_path = partial_download_metadata_path(&target);
         write_resume_metadata(&metadata_path, &metadata).await.unwrap();
