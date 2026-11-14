@@ -200,23 +200,71 @@ fn rate_limiter() -> Arc<GlobalRateLimiter> {
     RATE_LIMITER.get_or_init(|| Arc::new(GlobalRateLimiter::new())).clone()
 }
 
-fn load_desktop_settings() -> bool {
-    let mut has_saved_ffmpeg = false;
+/// Where the desktop app keeps its configuration (ffmpeg.path,
+/// speed-limit.bytes), in Tauri's `app_config_dir` layout, so the host
+/// reads exactly the files the desktop writes. The pure `_from` form is
+/// what the tests pin; this wrapper reads the live environment.
+fn desktop_config_dir_from(
+    appdata: Option<&std::path::Path>,
+    xdg_config_home: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
     #[cfg(target_os = "windows")]
     {
-        if let Some(app_data) = std::env::var_os("APPDATA") {
-            let config_dir = std::path::PathBuf::from(app_data).join("com.thunderload.desktop");
-            if let Ok(value) = std::fs::read_to_string(config_dir.join("ffmpeg.path")) {
-                let value = value.trim();
-                if !value.is_empty() {
-                    std::env::set_var("THUNDERLOAD_FFMPEG", value);
-                    has_saved_ffmpeg = true;
-                }
+        let _ = (xdg_config_home, home);
+        appdata.map(|dir| dir.join("com.thunderload.desktop"))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = appdata;
+        xdg_config_home
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(|dir| dir.join("com.thunderload.desktop"))
+            .or_else(|| home.map(|dir| dir.join(".config").join("com.thunderload.desktop")))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (appdata, xdg_config_home);
+        home.map(|dir| {
+            dir.join("Library")
+                .join("Application Support")
+                .join("com.thunderload.desktop")
+        })
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (appdata, xdg_config_home, home);
+        None
+    }
+}
+
+fn desktop_config_dir() -> Option<std::path::PathBuf> {
+    desktop_config_dir_from(
+        std::env::var_os("APPDATA")
+            .as_deref()
+            .map(std::path::Path::new),
+        std::env::var_os("XDG_CONFIG_HOME")
+            .as_deref()
+            .map(std::path::Path::new),
+        std::env::var_os("HOME")
+            .as_deref()
+            .map(std::path::Path::new),
+    )
+}
+
+fn load_desktop_settings() -> bool {
+    let mut has_saved_ffmpeg = false;
+    if let Some(config_dir) = desktop_config_dir() {
+        if let Ok(value) = std::fs::read_to_string(config_dir.join("ffmpeg.path")) {
+            let value = value.trim();
+            if !value.is_empty() {
+                std::env::set_var("THUNDERLOAD_FFMPEG", value);
+                has_saved_ffmpeg = true;
             }
-            if let Ok(value) = std::fs::read_to_string(config_dir.join("speed-limit.bytes")) {
-                if let Ok(limit) = value.trim().parse::<u64>() {
-                    rate_limiter().set_limit(limit);
-                }
+        }
+        if let Ok(value) = std::fs::read_to_string(config_dir.join("speed-limit.bytes")) {
+            if let Ok(limit) = value.trim().parse::<u64>() {
+                rate_limiter().set_limit(limit);
             }
         }
     }
@@ -224,41 +272,37 @@ fn load_desktop_settings() -> bool {
 }
 
 fn start_desktop_settings_watcher(mut has_saved_ffmpeg: bool) {
-    #[cfg(target_os = "windows")]
-    {
-        let limiter = rate_limiter();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
-            loop {
-                interval.tick().await;
-                let Some(app_data) = std::env::var_os("APPDATA") else { continue; };
-                let config_dir = std::path::PathBuf::from(app_data).join("com.thunderload.desktop");
-                if let Ok(value) = std::fs::read_to_string(config_dir.join("speed-limit.bytes")) {
-                    if let Ok(limit) = value.trim().parse::<u64>() {
-                        limiter.set_limit(limit);
-                    }
-                }
-                match std::fs::read_to_string(config_dir.join("ffmpeg.path")) {
-                    Ok(value) if !value.trim().is_empty() => {
-                        std::env::set_var("THUNDERLOAD_FFMPEG", value.trim());
-                        has_saved_ffmpeg = true;
-                    }
-                    Ok(_) => {
-                        std::env::remove_var("THUNDERLOAD_FFMPEG");
-                        has_saved_ffmpeg = false;
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound && has_saved_ffmpeg => {
-                        // The user cleared the saved setting while this companion was running.
-                        std::env::remove_var("THUNDERLOAD_FFMPEG");
-                        has_saved_ffmpeg = false;
-                    }
-                    Err(_) => {}
+    let limiter = rate_limiter();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+        loop {
+            interval.tick().await;
+            let Some(config_dir) = desktop_config_dir() else {
+                continue;
+            };
+            if let Ok(value) = std::fs::read_to_string(config_dir.join("speed-limit.bytes")) {
+                if let Ok(limit) = value.trim().parse::<u64>() {
+                    limiter.set_limit(limit);
                 }
             }
-        });
-    }
-    #[cfg(not(target_os = "windows"))]
-    let _ = has_saved_ffmpeg;
+            match std::fs::read_to_string(config_dir.join("ffmpeg.path")) {
+                Ok(value) if !value.trim().is_empty() => {
+                    std::env::set_var("THUNDERLOAD_FFMPEG", value.trim());
+                    has_saved_ffmpeg = true;
+                }
+                Ok(_) => {
+                    std::env::remove_var("THUNDERLOAD_FFMPEG");
+                    has_saved_ffmpeg = false;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound && has_saved_ffmpeg => {
+                    // The user cleared the saved setting while this companion was running.
+                    std::env::remove_var("THUNDERLOAD_FFMPEG");
+                    has_saved_ffmpeg = false;
+                }
+                Err(_) => {}
+            }
+        }
+    });
 }
 
 #[tokio::main]
@@ -860,4 +904,54 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod config_dir_tests {
+    use super::desktop_config_dir_from;
+    use std::path::{Path, PathBuf};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_config_dir_prefers_xdg_config_home() {
+        assert_eq!(
+            desktop_config_dir_from(None, Some(Path::new("/xdg")), Some(Path::new("/home/u"))),
+            Some(PathBuf::from("/xdg/com.thunderload.desktop"))
+        );
+        assert_eq!(
+            desktop_config_dir_from(None, None, Some(Path::new("/home/u"))),
+            Some(PathBuf::from("/home/u/.config/com.thunderload.desktop"))
+        );
+        // An empty XDG_CONFIG_HOME falls back to ~/.config (the dirs
+        // crate treats it as unset).
+        assert_eq!(
+            desktop_config_dir_from(None, Some(Path::new("")), Some(Path::new("/home/u"))),
+            Some(PathBuf::from("/home/u/.config/com.thunderload.desktop"))
+        );
+        assert_eq!(desktop_config_dir_from(None, None, None), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_config_dir_is_library_application_support() {
+        assert_eq!(
+            desktop_config_dir_from(None, None, Some(Path::new("/Users/u"))),
+            Some(PathBuf::from(
+                "/Users/u/Library/Application Support/com.thunderload.desktop"
+            ))
+        );
+        assert_eq!(desktop_config_dir_from(None, None, None), None);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_config_dir_is_appdata() {
+        assert_eq!(
+            desktop_config_dir_from(Some(Path::new("C:/Users/u/AppData/Roaming")), None, None),
+            Some(PathBuf::from(
+                "C:/Users/u/AppData/Roaming/com.thunderload.desktop"
+            ))
+        );
+        assert_eq!(desktop_config_dir_from(None, None, None), None);
+    }
 }
