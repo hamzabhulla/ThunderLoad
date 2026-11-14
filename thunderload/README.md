@@ -81,6 +81,10 @@ The extension ID is required because the browser native-messaging allowlist must
 ## Video limits
 HLS qualities are listed only when exposed by the site. Completed unencrypted HLS VOD playlists can be downloaded, including EXT-X-BYTERANGE slices, fMP4 (EXT-X-MAP init + fragments) and separate audio groups muxed into MP4 with FFmpeg; encrypted/DRM streams and live playlists are not supported. Static DASH VOD with SegmentTemplate/SegmentTimeline, SegmentList, SegmentBase and multi-period MPDs can be downloaded, with Pause/Resume/Cancel. Separate audio/video tracks need an external FFmpeg executable for stream-copy muxing. Dynamic/live MPDs and ContentProtection/DRM are not supported. Blob/MSE-only URLs may not be exposed or may fail; cookie-bound and signed URLs work when the download is started from the browser (the session handoff above). Parallel connections cannot guarantee a fixed speed multiplier; results depend on server support and bandwidth.
 
+## Benchmarks
+
+Engine throughput is measured by a built-in bench binary against localhost fixture servers — see [`BENCHMARKS.md`](BENCHMARKS.md) for methodology and full results. Headline numbers (Linux VM, 4 CPUs, 2026-11-14): a 64 MiB direct download scales from 70 MiB/s at 1 connection to 311 MiB/s at 8 and 615 MiB/s at 16; the checkpointed 8-connection path is ~5.5x the one-shot sequential path (56.7 MiB/s); HLS/DASH media run ~170–180 MiB/s. These are engine-parallelism numbers under a per-chunk server-latency model, not real-internet throughput, and no ThunderLoad-vs-IDM comparison is claimed — that needs a real Windows machine and an IDM install.
+
 ## Production work still required
 - HLS live playlists are still not supported.
 - Dynamic/live DASH MPDs are still not supported; DRM remains unsupported by design.
