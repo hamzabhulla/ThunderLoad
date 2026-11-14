@@ -2206,7 +2206,10 @@ mod resumable_http_tests {
         let handle = thread::spawn(move || {
             while !thread_shutdown.load(Ordering::Relaxed) {
                 let (mut stream, _) = match listener.accept() {
-                    Ok(connection) => connection,
+                    Ok(connection) => {
+                        let _ = connection.0.set_nonblocking(false);
+                        connection
+                    },
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(3));
                         continue;
@@ -2370,7 +2373,10 @@ mod resumable_http_tests {
         let handle = thread::spawn(move || {
             while !thread_shutdown.load(Ordering::Relaxed) {
                 let (mut stream, _) = match listener.accept() {
-                    Ok(connection) => connection,
+                    Ok(connection) => {
+                        let _ = connection.0.set_nonblocking(false);
+                        connection
+                    },
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(3));
                         continue;
@@ -2556,7 +2562,10 @@ mod resumable_http_tests {
         let handle = thread::spawn(move || {
             while !thread_shutdown.load(Ordering::Relaxed) {
                 let (mut stream, _) = match listener.accept() {
-                    Ok(connection) => connection,
+                    Ok(connection) => {
+                        let _ = connection.0.set_nonblocking(false);
+                        connection
+                    },
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(3));
                         continue;
@@ -2610,7 +2619,10 @@ mod resumable_http_tests {
         let handle = thread::spawn(move || {
             while !thread_shutdown.load(Ordering::Relaxed) {
                 let (mut stream, _) = match listener.accept() {
-                    Ok(connection) => connection,
+                    Ok(connection) => {
+                        let _ = connection.0.set_nonblocking(false);
+                        connection
+                    },
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(3));
                         continue;
@@ -2773,7 +2785,10 @@ mod segmented_http_tests {
         let handle = thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 let (mut stream, _) = match listener.accept() {
-                    Ok(connection) => connection,
+                    Ok(connection) => {
+                        let _ = connection.0.set_nonblocking(false);
+                        connection
+                    },
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(2));
                         continue;
@@ -2784,7 +2799,6 @@ mod segmented_http_tests {
                 // on Windows: serve this connection blocking, so a request
                 // that has not arrived yet is waited for, not misread as
                 // an empty request.
-                let _ = stream.set_nonblocking(false);
                 let request_body = body.clone();
                 let request_counter = requests.clone();
                 thread::spawn(move || {
@@ -3056,7 +3070,10 @@ mod segmented_resumable_tests {
         let handle = thread::spawn(move || {
             while !thread_shutdown.load(Ordering::Relaxed) {
                 let (mut stream, _) = match listener.accept() {
-                    Ok(connection) => connection,
+                    Ok(connection) => {
+                        let _ = connection.0.set_nonblocking(false);
+                        connection
+                    },
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(2));
                         continue;
@@ -3065,7 +3082,6 @@ mod segmented_resumable_tests {
                 };
                 // Accepted sockets inherit the listener's non-blocking mode
                 // on Windows: serve this connection blocking.
-                let _ = stream.set_nonblocking(false);
                 let body_v1 = body_v1.clone();
                 let body_v2 = body_v2.clone();
                 let version = thread_version.clone();
@@ -3723,14 +3739,16 @@ mod dynamic_segmentation_tests {
         let handle = thread::spawn(move || {
             while !thread_shutdown.load(Ordering::Relaxed) {
                 let (mut stream, _) = match listener.accept() {
-                    Ok(connection) => connection,
+                    Ok(connection) => {
+                        let _ = connection.0.set_nonblocking(false);
+                        connection
+                    },
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(2));
                         continue;
                     }
                     Err(_) => break,
                 };
-                let _ = stream.set_nonblocking(false);
                 let body = body.clone();
                 let slow_taken = slow_taken.clone();
                 let stalled_once = stalled_once.clone();

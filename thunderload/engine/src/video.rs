@@ -3681,14 +3681,16 @@ mod tests {
         let handle = std::thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 let (mut stream, _) = match listener.accept() {
-                    Ok(connection) => connection,
+                    Ok(connection) => {
+                        let _ = connection.0.set_nonblocking(false);
+                        connection
+                    },
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(2));
                         continue;
                     }
                     Err(_) => break,
                 };
-                let _ = stream.set_nonblocking(false);
                 let routes = routes.clone();
                 let no_range = no_range.clone();
                 let counts = counts.clone();
@@ -4793,14 +4795,16 @@ mod hls_download_tests {
         let handle = thread::spawn(move || {
             while !thread_shutdown.load(Ordering::Relaxed) {
                 let (mut stream, _) = match listener.accept() {
-                    Ok(connection) => connection,
+                    Ok(connection) => {
+                        let _ = connection.0.set_nonblocking(false);
+                        connection
+                    },
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(2));
                         continue;
                     }
                     Err(_) => break,
                 };
-                let _ = stream.set_nonblocking(false);
                 let routes = routes.clone();
                 let counts = thread_counts.clone();
                 let range_206 = thread_range.clone();
