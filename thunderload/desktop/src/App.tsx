@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
@@ -9,6 +9,7 @@ type Status = "Queued" | "Downloading" | "Pausing" | "Paused" | "Cancelling" | "
 type Variant = { kind: string; quality: string; width?: number; height?: number; bandwidth?: number; url: string; downloadable: boolean; note?: string; representationId?: string; audioRepresentationId?: string; audioOnly?: boolean };
 type Progress = { downloaded: number; total?: number; percent?: number; phase: string };
 type Item = { id: string; name: string; url: string; kind: Kind; status: Status; percent: number; downloaded: number; total?: number; detail: string; error?: string; createdAt: number; targetPath?: string; scheduledAt?: number; source?: "native"; representationId?: string; audioRepresentationId?: string };
+type StoredJob = { id: string; name: string; url: string; kind: string; origin: string; state: string; downloaded: number; total?: number; percent?: number; segmentsDone?: number; segmentsTotal?: number; targetPath?: string; checkpointPath?: string; representationId?: string; audioRepresentationId?: string; scheduledAtMs?: number; detail: string; error?: string; createdAtMs: number; updatedAtMs: number };
 
 const HISTORY_KEY = "thunderload.history.v2";
 const CONNECTIONS_KEY = "thunderload.connections.v1";
@@ -45,6 +46,30 @@ function nameFromUrl(value: string): string {
     const raw = new URL(value).pathname.split("/").filter(Boolean).pop();
     return raw ? decodeURIComponent(raw) : "download.bin";
   } catch { return "download.bin"; }
+}
+function storedJobToItem(row: StoredJob): Item {
+  const kind: Kind = row.kind === "hls" ? "hls" : row.kind === "dash" ? "dash" : "direct";
+  const status: Status = (["Queued", "Downloading", "Paused", "Completed", "Failed", "Interrupted", "Cancelled"].includes(row.state) ? row.state : "Failed") as Status;
+  const percent = row.percent !== undefined
+    ? Math.max(0, Math.min(100, row.percent))
+    : row.total ? Math.max(0, Math.min(100, Math.round(row.downloaded / row.total * 100))) : 0;
+  return {
+    id: row.id, name: row.name || nameFromUrl(row.url), url: row.url, kind, status, percent,
+    downloaded: row.downloaded, total: row.total, detail: row.detail || "",
+    error: row.error, createdAt: row.createdAtMs, targetPath: row.targetPath,
+    scheduledAt: row.scheduledAtMs, representationId: row.representationId,
+    audioRepresentationId: row.audioRepresentationId
+  };
+}
+function itemToSyncJob(item: Item) {
+  return {
+    id: item.id, name: item.name, url: item.url, kind: item.kind, status: item.status,
+    downloaded: item.downloaded, total: item.total ?? null, percent: item.percent,
+    targetPath: item.targetPath ?? null, createdAt: item.createdAt,
+    scheduledAt: item.scheduledAt ?? null, representationId: item.representationId ?? null,
+    audioRepresentationId: item.audioRepresentationId ?? null, detail: item.detail,
+    error: item.error ?? null
+  };
 }
 function pageInfo(page: Page) {
   const values = {
@@ -83,6 +108,10 @@ export default function App() {
   const [ffmpegPath, setFfmpegPath] = useState("ffmpeg");
   const [ffmpegStatus, setFfmpegStatus] = useState("");
   const [ffmpegSaving, setFfmpegSaving] = useState(false);
+  // Mirror of the job list for one-shot startup effects (the durable
+  // store seed below needs the current list without re-running).
+  const itemsRef = useRef(items);
+  useEffect(() => { itemsRef.current = items; }, [items]);
 
   const active = items.filter((item) => item.status === "Downloading" || item.status === "Pausing" || item.status === "Cancelling").length;
   const queued = items.filter((item) => item.status === "Queued").length;
@@ -101,6 +130,26 @@ export default function App() {
   useEffect(() => {
     const timer = window.setInterval(() => setClock(Date.now()), 1000);
     return () => window.clearInterval(timer);
+  }, []);
+
+  // Slice 5: seed the queue from the durable job database on startup,
+  // then send the merged desktop list back so jobs the store does not
+  // know yet (pre-Slice-5 history, queued jobs that never started)
+  // enter the database. Stored rows win by id; local history fills the
+  // rest. Browser-started rows keep coming through the native poll.
+  const seededRef = useRef(false);
+  useEffect(() => {
+    if (seededRef.current) return;
+    seededRef.current = true;
+    void invoke<Array<StoredJob>>("get_jobs").then((rows) => {
+      const stored = rows.filter((row) => row.origin !== "native").map(storedJobToItem);
+      const byId = new Map(itemsRef.current.map((item) => [item.id, item]));
+      for (const item of stored) byId.set(item.id, item);
+      const merged = Array.from(byId.values()).sort((a, b) => b.createdAt - a.createdAt);
+      setItems(merged);
+      const desktop = merged.filter((item) => item.source !== "native");
+      if (desktop.length) void invoke("sync_jobs", { jobs: desktop.map(itemToSyncJob) }).catch(() => {});
+    }).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -217,7 +266,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           // reuses its on-disk checkpoint instead of reserving a fresh
           // target and restarting from scratch. The returned path is
           // stored so Cancel works while the job is running.
-          const targetPath = await invoke<string>("start_hls_download", { jobId: item.id, url: item.url, filename: item.name, targetPath: item.targetPath || null });
+          const targetPath = await invoke<string>("start_hls_download", { jobId: item.id, url: item.url, filename: item.name, targetPath: item.targetPath || null, scheduledAt: item.scheduledAt || null });
           setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, targetPath } : entry));
         } else if (item.kind === "dash") {
           // Pass the paused/failed job's target back so the backend
@@ -227,12 +276,12 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           const targetPath = await invoke<string>("start_dash_download", {
             jobId: item.id, url: item.url, representationId: item.representationId,
             audioRepresentationId: item.audioRepresentationId || null, filename: item.name,
-            targetPath: item.targetPath || null
+            targetPath: item.targetPath || null, scheduledAt: item.scheduledAt || null
           });
           setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, targetPath } : entry));
         } else {
           const targetPath = await invoke<string>("start_download", {
-            jobId: item.id, url: item.url, filename: item.name, targetPath: item.targetPath || null, connections
+            jobId: item.id, url: item.url, filename: item.name, targetPath: item.targetPath || null, connections, scheduledAt: item.scheduledAt || null
           });
           setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, targetPath } : entry));
         }
@@ -272,6 +321,10 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     const updated = [item, ...items];
     try { localStorage.setItem(HISTORY_KEY, JSON.stringify(updated)); } catch { /* Queue effect retries persistence. */ }
     setItems(updated);
+    // Slice 5: record the queued job in the durable store immediately,
+    // so it survives a restart even if it never gets a download slot
+    // before the app closes.
+    void invoke("sync_jobs", { jobs: [itemToSyncJob(item)] }).catch(() => {});
     setNotice(scheduledAt ? "Added to queue. Registering Windows wake task…" : "Added to queue.");
     if (scheduledAt) {
       void invoke<string>("schedule_app_wake", { jobId: item.id, localDateTime: scheduleAt })
@@ -359,6 +412,9 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     if (!item.targetPath) {
       // Queued jobs never started and have nothing on disk: local flip only.
       setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, status: "Cancelled", detail: "Cancelled" } : entry));
+      // Slice 5: the durable row must flip too, or the job would come
+      // back as Queued on the next startup.
+      void invoke("cancel_queued_job", { jobId: item.id }).catch(() => {});
       return;
     }
     try {
@@ -393,6 +449,11 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     } else if (item?.targetPath && item.status !== "Completed") {
       await invoke("cancel_download", { jobId: item.id, targetPath: item.targetPath }).catch(() => {});
     }
+    // Slice 5: drop the durable row too, or a removed job would be
+    // re-seeded from the database on the next startup.
+    if (item?.source !== "native") {
+      void invoke("remove_job", { jobId: id }).catch(() => {});
+    }
     setItems((current) => current.filter((entry) => entry.id !== id || entry.status === "Downloading" || entry.status === "Pausing"));
   }
   function retry(item: Item) {
@@ -409,6 +470,10 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       .map((item) => invoke("cancel_app_wake", { jobId: item.id }).catch(() => {})));
     await Promise.all(finished.filter((item) => item.source === "native")
       .map((item) => invoke("dismiss_native_download", { jobId: item.id.replace(/^native-/, "") }).catch(() => {})));
+    // Slice 5: drop the durable rows too, or cleared jobs would be
+    // re-seeded from the database on the next startup.
+    await Promise.all(finished.filter((item) => item.source !== "native")
+      .map((item) => invoke("remove_job", { jobId: item.id }).catch(() => {})));
     setItems((current) => current.filter((item) => item.status !== "Completed" && item.status !== "Cancelled"));
   }
   async function inspect() {
@@ -539,7 +604,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           <div className="summary queue-summary"><div><strong>{active}</strong><span>Active</span></div><div><strong>{queued}</strong><span>Waiting</span></div><div><strong>{done}</strong><span>Completed</span></div><div><strong>{attention}</strong><span>Failed</span></div></div>
           <div className="panel-heading"><div><h2>All transfers</h2><p>Jobs start automatically, up to your active transfer limit.</p></div><button className="quiet-button" onClick={clearFinished}>Clear finished</button></div>
           {transferList(ordered)}
-          <p className="footnote">Direct HTTP, HLS and DASH downloads keep partial files on disk. Pause saves a checkpoint, Resume continues from it, and startup automatically recovers saved checkpoints. Scheduled jobs start at their selected local time.</p>
+          <p className="footnote">Direct HTTP, HLS and DASH downloads keep partial files on disk. Pause saves a checkpoint, Resume continues from it, and startup automatically recovers saved checkpoints. Jobs are also recorded in a durable job database, so the queue — including queued and scheduled entries — survives an app restart.</p>
         </section>}
 
         {page === "video" && <section className="panel video-panel">

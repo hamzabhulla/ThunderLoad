@@ -719,6 +719,15 @@ async fn read_resume_metadata(path: &Path) -> Option<ResumeMetadata> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Synchronous read of a direct-download checkpoint sidecar (Slice 5:
+/// the job store imports orphaned checkpoints without a Tokio runtime).
+/// Returns the download URL and the advertised total, if any.
+pub(crate) fn direct_checkpoint_info(path: &Path) -> Option<(String, Option<u64>)> {
+    let bytes = std::fs::read(path).ok()?;
+    let metadata: ResumeMetadata = serde_json::from_slice(&bytes).ok()?;
+    Some((metadata.url, metadata.total))
+}
+
 async fn write_resume_metadata(path: &Path, metadata: &ResumeMetadata) -> Result<()> {
     let temporary = path.with_extension("meta.tmp");
     let bytes = serde_json::to_vec(metadata)?;

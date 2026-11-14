@@ -1,7 +1,7 @@
 use std::{collections::HashMap, path::{Path, PathBuf}, process::Command, sync::{Arc, Mutex, OnceLock}, time::{Duration, Instant}};
 use serde_json::{json, Value};
 use tauri::{Emitter, Manager};
-use thunderload_engine::{dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_resumable, download_url_resumable, hls_work_dir, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, DownloadControl, DownloadOutcome, GlobalRateLimiter};
+use thunderload_engine::{dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_resumable, download_url_resumable, hls_work_dir, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, store_file_name, DownloadControl, DownloadOutcome, GlobalRateLimiter, JobKind, JobOrigin, JobRecord, JobState, JobStore};
 use tokio::{process::Command as TokioCommand, sync::{mpsc, watch}};
 
 #[tauri::command]
@@ -45,6 +45,26 @@ fn job_completed(job_id: &str) -> bool {
     completed_jobs().lock().map(|jobs| jobs.contains_key(job_id)).unwrap_or(false)
 }
 
+/// Durable job database (Slice 5): one `jobs.json` in the app-data
+/// directory, holding every desktop job (and a mirror of browser-started
+/// jobs). Initialized in `setup`; if the app-data directory is
+/// unavailable the store stays unset and every helper below becomes a
+/// no-op — downloads still work in memory and the frontend's local
+/// history still covers the UI, just without backend durability.
+static JOB_STORE: OnceLock<Mutex<JobStore>> = OnceLock::new();
+
+/// Runs `f` with the job store when it exists. Store errors are
+/// swallowed here on purpose: a failed write must never break a
+/// download, and the checkpoint files on disk remain the resume
+/// mechanism either way.
+fn with_job_store<F: FnOnce(&mut JobStore)>(f: F) {
+    if let Some(store) = JOB_STORE.get() {
+        if let Ok(mut store) = store.lock() {
+            f(&mut store);
+        }
+    }
+}
+
 /// Deletes every resume file a desktop download can leave behind: the
 /// partial file, the checkpoint sidecar, the HLS/DASH segment work
 /// directories, and the target itself. Paths that do not exist are
@@ -74,27 +94,58 @@ async fn finish_desktop_download(
     match result {
         Ok(DownloadOutcome::Completed) => {
             mark_job_completed(job_id, target);
+            with_job_store(|store| {
+                let _ = store.update_state(
+                    job_id,
+                    JobState::Completed,
+                    Some(&format!("Saved · {}", target.to_string_lossy())),
+                    None,
+                );
+            });
             let _ = app.emit("download-complete", json!({ "jobId": job_id, "path": target.to_string_lossy() }));
             if let Ok(mut controls) = job_controls().lock() { controls.remove(job_id); }
         }
         Ok(DownloadOutcome::Paused) if cancelled_while_finishing => {
             delete_desktop_resume_files(target).await;
+            with_job_store(|store| {
+                let _ = store.update_state(job_id, JobState::Cancelled, Some("Cancelled"), None);
+            });
             let _ = app.emit("download-cancelled", json!({ "jobId": job_id }));
             if let Ok(mut controls) = job_controls().lock() { controls.remove(job_id); }
         }
         Ok(DownloadOutcome::Paused) => {
+            with_job_store(|store| {
+                let _ = store.update_state(job_id, JobState::Paused, Some("Paused · partial file saved"), None);
+                let _ = store.refresh_segments(job_id);
+            });
             let _ = app.emit("download-paused", json!({ "jobId": job_id, "targetPath": target.to_string_lossy() }));
         }
         Ok(DownloadOutcome::Cancelled) => {
+            with_job_store(|store| {
+                let _ = store.update_state(job_id, JobState::Cancelled, Some("Cancelled"), None);
+            });
             let _ = app.emit("download-cancelled", json!({ "jobId": job_id }));
             if let Ok(mut controls) = job_controls().lock() { controls.remove(job_id); }
         }
         Err(error) if cancelled_while_finishing => {
             delete_desktop_resume_files(target).await;
+            with_job_store(|store| {
+                let _ = store.update_state(job_id, JobState::Cancelled, Some("Cancelled"), None);
+            });
             let _ = app.emit("download-cancelled", json!({ "jobId": job_id }));
             if let Ok(mut controls) = job_controls().lock() { controls.remove(job_id); }
         }
         Err(error) => {
+            let error_text = error.clone();
+            with_job_store(|store| {
+                let _ = store.update_state(
+                    job_id,
+                    JobState::Failed,
+                    Some("Transfer interrupted · partial data kept"),
+                    Some(&error_text),
+                );
+                let _ = store.refresh_segments(job_id);
+            });
             let _ = app.emit("download-error", json!({ "jobId": job_id, "error": error, "targetPath": target.to_string_lossy() }));
             if let Ok(mut controls) = job_controls().lock() { controls.remove(job_id); }
         }
@@ -237,6 +288,9 @@ async fn cancel_download(job_id: String, target_path: String, app: tauri::AppHan
         }
         let target = PathBuf::from(target_path);
         delete_desktop_resume_files(&target).await;
+        with_job_store(|store| {
+            let _ = store.update_state(&job_id, JobState::Cancelled, Some("Cancelled"), None);
+        });
         // No task is alive to report the cancellation (e.g. the job was
         // already Paused, so its task ended), so emit it here — otherwise
         // the UI would stay on "Cancelling" forever. When the task is
@@ -253,6 +307,7 @@ async fn start_download(
     filename: String,
     target_path: Option<String>,
     connections: usize,
+    scheduled_at: Option<u64>,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
@@ -269,6 +324,14 @@ async fn start_download(
         let mut controls = job_controls().lock().map_err(|_| "Download control lock is unavailable")?;
         controls.insert(job_id.clone(), control_tx);
     }
+    // Record the job in the durable store (Slice 5) so a restart
+    // restores it — Downloading rows are flipped to Interrupted on the
+    // next startup and resumed from the checkpoint.
+    let mut record = JobRecord::new_desktop(&job_id, &name, &url, JobKind::Direct, Some(&target));
+    record.scheduled_at_ms = scheduled_at;
+    with_job_store(|store| {
+        let _ = store.start_job(record);
+    });
     // Keep a second receiver alive in the task until the outcome is
     // reported: a cancel that arrives while the download is finishing
     // still reaches a live receiver, so `cancel_download` never falls into
@@ -285,6 +348,13 @@ async fn start_download(
         let progress_id = job_for_task.clone();
         tauri::async_runtime::spawn(async move {
             while let Some(progress) = progress_rx.recv().await {
+                // Persist progress (throttled inside the store) so a
+                // crash keeps the last reported position; the checkpoint
+                // on disk stays authoritative for resume.
+                let (downloaded, total, percent) = (progress.downloaded, progress.total, progress.percent);
+                with_job_store(|store| {
+                    let _ = store.note_progress(&progress_id, downloaded, total, percent);
+                });
                 let _ = progress_app.emit("download-progress", json!({ "jobId": progress_id, "progress": progress }));
             }
         });
@@ -301,6 +371,7 @@ async fn start_hls_download(
     url: String,
     filename: String,
     target_path: Option<String>,
+    scheduled_at: Option<u64>,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
@@ -321,6 +392,12 @@ async fn start_hls_download(
         let mut controls = job_controls().lock().map_err(|_| "Download control lock is unavailable")?;
         controls.insert(job_id.clone(), control_tx);
     }
+    // Durable job record (Slice 5) — see start_download.
+    let mut record = JobRecord::new_desktop(&job_id, &name, &url, JobKind::Hls, Some(&target));
+    record.scheduled_at_ms = scheduled_at;
+    with_job_store(|store| {
+        let _ = store.start_job(record);
+    });
     // Keep a second receiver alive in the task until the outcome is
     // reported: a cancel that arrives while the download is finishing
     // still reaches a live receiver, so `cancel_download` never falls into
@@ -335,6 +412,13 @@ async fn start_hls_download(
         let progress_id = job_for_task.clone();
         tauri::async_runtime::spawn(async move {
             while let Some(progress) = progress_rx.recv().await {
+                // Persist progress (throttled inside the store) so a
+                // crash keeps the last reported position; the checkpoint
+                // on disk stays authoritative for resume.
+                let (downloaded, total, percent) = (progress.downloaded, progress.total, progress.percent);
+                with_job_store(|store| {
+                    let _ = store.note_progress(&progress_id, downloaded, total, percent);
+                });
                 let _ = progress_app.emit("download-progress", json!({ "jobId": progress_id, "progress": progress }));
             }
         });
@@ -447,6 +531,7 @@ async fn start_dash_download(
     audio_representation_id: Option<String>,
     filename: String,
     target_path: Option<String>,
+    scheduled_at: Option<u64>,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
@@ -477,6 +562,14 @@ async fn start_dash_download(
         let mut controls = job_controls().lock().map_err(|_| "Download control lock is unavailable")?;
         controls.insert(job_id.clone(), control_tx);
     }
+    // Durable job record (Slice 5) — see start_download.
+    let mut record = JobRecord::new_desktop(&job_id, &name, &url, JobKind::Dash, Some(&target));
+    record.scheduled_at_ms = scheduled_at;
+    record.representation_id = Some(representation_id.clone());
+    record.audio_representation_id = audio_representation_id.clone();
+    with_job_store(|store| {
+        let _ = store.start_job(record);
+    });
     // Keep a second receiver alive in the task until the outcome is
     // reported: a cancel that arrives while the download is finishing
     // still reaches a live receiver, so `cancel_download` never falls into
@@ -491,6 +584,13 @@ async fn start_dash_download(
         let progress_id = job_for_task.clone();
         tauri::async_runtime::spawn(async move {
             while let Some(progress) = progress_rx.recv().await {
+                // Persist progress (throttled inside the store) so a
+                // crash keeps the last reported position; the checkpoint
+                // on disk stays authoritative for resume.
+                let (downloaded, total, percent) = (progress.downloaded, progress.total, progress.percent);
+                with_job_store(|store| {
+                    let _ = store.note_progress(&progress_id, downloaded, total, percent);
+                });
                 let _ = progress_app.emit("download-progress", json!({ "jobId": progress_id, "progress": progress }));
             }
         });
@@ -583,7 +683,234 @@ async fn get_native_downloads() -> Result<Vec<Value>, String> {
         }
     }
     jobs.sort_by_key(|job| std::cmp::Reverse(job.get("createdAt").and_then(Value::as_u64).unwrap_or(0)));
+    // Slice 5: mirror browser-started jobs into the durable store, so
+    // the database records every job, not just desktop ones. The native
+    // host owns the state files — the store only mirrors them. Rows whose
+    // state file was dismissed are pruned below (only when the file is
+    // really gone; a corrupt-but-present file keeps its row).
+    let native_ids: Vec<String> = jobs
+        .iter()
+        .filter_map(|job| job.get("id").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    with_job_store(|store| {
+        for job in &jobs {
+            if let Some(record) = native_value_to_record(job) {
+                let _ = store.upsert(record);
+            }
+        }
+    });
+    let mut stale: Vec<String> = Vec::new();
+    if let Some(store) = JOB_STORE.get() {
+        if let Ok(store) = store.lock() {
+            for row in store.all() {
+                if row.origin == JobOrigin::Native && !native_ids.contains(&row.id) {
+                    stale.push(row.id.clone());
+                }
+            }
+        }
+    }
+    for id in stale {
+        if !tokio::fs::try_exists(directory.join(format!("{id}.json"))).await.unwrap_or(true) {
+            with_job_store(|store| {
+                let _ = store.remove(&id);
+            });
+        }
+    }
     Ok(jobs)
+}
+
+/// Converts one native-host state file (a JSON `Value`) into a job-store
+/// row. The native host is the owner of these files; the store only
+/// mirrors them, so unknown/missing fields fall back to safe defaults
+/// instead of dropping the job.
+fn native_value_to_record(job: &Value) -> Option<JobRecord> {
+    let id = job.get("id")?.as_str()?.to_string();
+    let kind = match job.get("kind").and_then(Value::as_str) {
+        Some("hls") => JobKind::Hls,
+        Some("dash") => JobKind::Dash,
+        _ => JobKind::Direct,
+    };
+    let state = match job.get("status").and_then(Value::as_str) {
+        Some("Downloading") => JobState::Downloading,
+        Some("Paused") => JobState::Paused,
+        Some("Completed") => JobState::Completed,
+        Some("Failed") => JobState::Failed,
+        Some("Interrupted") => JobState::Interrupted,
+        Some("Cancelled") => JobState::Cancelled,
+        _ => JobState::Failed,
+    };
+    let target_path = job.get("targetPath").and_then(Value::as_str).map(str::to_string);
+    let now = thunderload_engine::now_ms();
+    Some(JobRecord {
+        id,
+        name: job.get("name").and_then(Value::as_str).unwrap_or("Browser download").to_string(),
+        url: job.get("url").and_then(Value::as_str).unwrap_or("").to_string(),
+        kind,
+        origin: JobOrigin::Native,
+        state,
+        downloaded: job.get("downloaded").and_then(Value::as_u64).unwrap_or(0),
+        total: job.get("total").and_then(Value::as_u64),
+        percent: job.get("percent").and_then(Value::as_f64),
+        segments_done: None,
+        segments_total: None,
+        checkpoint_path: target_path
+            .as_ref()
+            .map(|target| partial_download_metadata_path(Path::new(target)).to_string_lossy().to_string()),
+        target_path,
+        representation_id: job.get("representationId").and_then(Value::as_str).map(str::to_string),
+        audio_representation_id: job.get("audioRepresentationId").and_then(Value::as_str).map(str::to_string),
+        scheduled_at_ms: None,
+        detail: job.get("detail").and_then(Value::as_str).unwrap_or("Started from browser extension").to_string(),
+        error: job.get("error").and_then(Value::as_str).map(str::to_string),
+        created_at_ms: job.get("createdAt").and_then(Value::as_u64).unwrap_or(now),
+        updated_at_ms: job.get("updatedAt").and_then(Value::as_u64).unwrap_or(now),
+    })
+}
+
+/// All durable jobs (desktop + browser-started mirror), newest first.
+/// The frontend seeds its queue from this on startup; browser-started
+/// rows keep flowing through the `get_native_downloads` poll as well.
+#[tauri::command]
+async fn get_jobs() -> Vec<JobRecord> {
+    match JOB_STORE.get() {
+        Some(store) => store.lock().map(|store| store.all().to_vec()).unwrap_or_default(),
+        None => Vec::new(),
+    }
+}
+
+/// One frontend queue item as sent by `sync_jobs` — the shape the
+/// frontend already keeps in local storage. Only rows the store does
+/// not know yet are inserted (migration for pre-Slice-5 history and for
+/// queued jobs that never started); existing rows are never overwritten.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncJob {
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    downloaded: u64,
+    #[serde(default)]
+    total: Option<u64>,
+    #[serde(default)]
+    percent: Option<f64>,
+    #[serde(default)]
+    target_path: Option<String>,
+    #[serde(default)]
+    created_at: u64,
+    #[serde(default)]
+    scheduled_at: Option<u64>,
+    #[serde(default)]
+    representation_id: Option<String>,
+    #[serde(default)]
+    audio_representation_id: Option<String>,
+    #[serde(default)]
+    detail: String,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+fn sync_job_to_record(job: SyncJob) -> JobRecord {
+    let kind = match job.kind.as_str() {
+        "hls" => JobKind::Hls,
+        "dash" => JobKind::Dash,
+        _ => JobKind::Direct,
+    };
+    // Transient UI states never persist: a job that was mid-flight when
+    // the app closed goes back to the queue (if it has a target to
+    // resume from) or to Interrupted, mirroring the frontend's own
+    // startup recovery.
+    let state = match job.status.as_str() {
+        "Downloading" | "Pausing" => {
+            if job.target_path.is_some() { JobState::Queued } else { JobState::Interrupted }
+        }
+        "Cancelling" => JobState::Cancelled,
+        "Paused" => JobState::Paused,
+        "Completed" => JobState::Completed,
+        "Failed" => JobState::Failed,
+        "Interrupted" => JobState::Interrupted,
+        "Cancelled" => JobState::Cancelled,
+        _ => JobState::Queued,
+    };
+    let now = thunderload_engine::now_ms();
+    JobRecord {
+        id: job.id,
+        name: job.name,
+        url: job.url,
+        kind,
+        origin: JobOrigin::Desktop,
+        state,
+        downloaded: job.downloaded,
+        total: job.total,
+        percent: job.percent,
+        segments_done: None,
+        segments_total: None,
+        checkpoint_path: job
+            .target_path
+            .as_ref()
+            .map(|target| partial_download_metadata_path(Path::new(target)).to_string_lossy().to_string()),
+        target_path: job.target_path,
+        representation_id: job.representation_id,
+        audio_representation_id: job.audio_representation_id,
+        scheduled_at_ms: job.scheduled_at,
+        detail: job.detail,
+        error: job.error,
+        created_at_ms: if job.created_at == 0 { now } else { job.created_at },
+        updated_at_ms: now,
+    }
+}
+
+#[tauri::command]
+async fn sync_jobs(jobs: Vec<SyncJob>) -> Result<usize, String> {
+    let mut added = 0;
+    with_job_store(|store| {
+        for job in jobs {
+            if store.get(&job.id).is_some() {
+                continue;
+            }
+            let record = sync_job_to_record(job);
+            if store.upsert(record).is_ok() {
+                added += 1;
+            }
+        }
+    });
+    Ok(added)
+}
+
+/// Deletes one durable row (used when the user removes a job from the
+/// queue). This never touches files on disk — the caller already
+/// removed the checkpoint when one had to go.
+#[tauri::command]
+async fn remove_job(job_id: String) -> Result<(), String> {
+    if !valid_scheduler_job_id(&job_id) {
+        return Err("Invalid job identifier.".into());
+    }
+    with_job_store(|store| {
+        let _ = store.remove(&job_id);
+    });
+    Ok(())
+}
+
+/// Marks a queued job Cancelled in the store. Only queued rows change:
+/// a job that already started is cancelled through `cancel_download`
+/// instead, so its files and control channel are handled there.
+#[tauri::command]
+async fn cancel_queued_job(job_id: String) -> Result<(), String> {
+    if !valid_scheduler_job_id(&job_id) {
+        return Err("Invalid job identifier.".into());
+    }
+    with_job_store(|store| {
+        if store.get(&job_id).map(|job| job.state) == Some(JobState::Queued) {
+            let _ = store.update_state(&job_id, JobState::Cancelled, Some("Cancelled"), None);
+        }
+    });
+    Ok(())
 }
 
 /// Writes one control word (`pause`, `resume` or `cancel`) for a
@@ -712,9 +1039,35 @@ fn main() {
                     if let Ok(limit) = value.trim().parse::<u64>() { rate_limiter().set_limit(limit); }
                 }
             }
+            // Slice 5: open the durable job database in the app-data
+            // directory (never next to the downloads). Jobs that were
+            // Downloading when the app last exited become Interrupted and
+            // resumable; checkpoint files with no row are imported as
+            // Interrupted jobs. A failure here only loses durability for
+            // this run — the frontend's local history still covers the UI.
+            if let Ok(data_dir) = app.path().app_data_dir() {
+                let _ = std::fs::create_dir_all(&data_dir);
+                let (mut store, note) = JobStore::load(&data_dir.join(store_file_name()), Duration::from_secs(5));
+                if let Some(note) = note {
+                    eprintln!("ThunderLoad job store: {note}");
+                }
+                match store.mark_interrupted_on_startup() {
+                    Ok(0) => {}
+                    Ok(count) => eprintln!("ThunderLoad job store: {count} interrupted download(s) recovered"),
+                    Err(error) => eprintln!("ThunderLoad job store: could not mark interrupted jobs: {error}"),
+                }
+                match store.import_orphans(&default_download_dir()) {
+                    Ok(imported) if !imported.is_empty() => {
+                        eprintln!("ThunderLoad job store: imported {} orphaned checkpoint(s)", imported.len())
+                    }
+                    Ok(_) => {}
+                    Err(error) => eprintln!("ThunderLoad job store: orphan import failed: {error}"),
+                }
+                let _ = JOB_STORE.set(Mutex::new(store));
+            }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![inspect_video_url, start_download, pause_download, cancel_download, set_speed_limit, schedule_app_wake, cancel_app_wake, start_hls_download, start_dash_download, get_ffmpeg_path, set_ffmpeg_path, get_native_downloads, control_native_download, dismiss_native_download, register_native_host, open_download_folder, save_extension_file])
+        .invoke_handler(tauri::generate_handler![inspect_video_url, start_download, pause_download, cancel_download, set_speed_limit, schedule_app_wake, cancel_app_wake, start_hls_download, start_dash_download, get_ffmpeg_path, set_ffmpeg_path, get_native_downloads, control_native_download, dismiss_native_download, register_native_host, open_download_folder, save_extension_file, get_jobs, sync_jobs, remove_job, cancel_queued_job])
         .run(tauri::generate_context!())
         .expect("error while running ThunderLoad desktop app");
 }

@@ -2735,6 +2735,95 @@ async fn remove_dash_resume_files(target: &Path) {
     let _ = fs::remove_file(target).await;
 }
 
+/// Which kind of media checkpoint a sidecar describes (Slice 5: the job
+/// store reads checkpoints to import orphaned jobs and to report segment
+/// progress, without re-running the downloaders).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MediaKind {
+    Hls,
+    Dash,
+}
+
+/// The resumable identity of one HLS/DASH checkpoint sidecar, read
+/// synchronously from the JSON file on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MediaCheckpointInfo {
+    pub kind: MediaKind,
+    /// Playlist URL (HLS) or manifest URL (DASH) — the URL a resume call
+    /// needs.
+    pub url: String,
+    pub representation_id: Option<String>,
+    pub audio_representation_id: Option<String>,
+    segments_done: Option<u64>,
+    segments_total: Option<u64>,
+}
+
+impl MediaCheckpointInfo {
+    /// (finished segments, planned segments) when the checkpoint carries
+    /// a segment plan. None for a checkpoint with no segments.
+    pub(crate) fn segments(&self) -> Option<(u64, u64)> {
+        match (self.segments_done, self.segments_total) {
+            (Some(done), Some(total)) => Some((done, total)),
+            _ => None,
+        }
+    }
+}
+
+/// Reads one HLS/DASH checkpoint sidecar (`<target>.thunderload.part.
+/// meta.json`) and returns what the job store needs: the kind, the URL to
+/// resume from, the chosen representations, and the segment progress.
+/// Returns None when the file is missing, unreadable, or not a media
+/// checkpoint of a known kind. Never touches the files on disk.
+pub(crate) fn media_checkpoint_info(meta_path: &Path, target: &Path) -> Option<MediaCheckpointInfo> {
+    let bytes = std::fs::read(meta_path).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    if value.get("playlist_url").is_some() {
+        let state: HlsJobState = serde_json::from_value(value).ok()?;
+        let (done, total) = (state.done_segments(), state.total_segments());
+        return Some(MediaCheckpointInfo {
+            kind: MediaKind::Hls,
+            url: state.playlist_url,
+            representation_id: None,
+            audio_representation_id: None,
+            segments_done: Some(done as u64),
+            segments_total: Some(total as u64),
+        });
+    }
+    if value.get("manifest_url").is_some() {
+        let state: DashJobState = serde_json::from_value(value).ok()?;
+        let total: usize = state
+            .video_tracks
+            .iter()
+            .chain(state.audio_tracks.iter())
+            .map(|track| track.segment_urls.len() + usize::from(track.initialization_url.is_some()))
+            .sum();
+        // Done = finished `.segment` files on disk (in-progress downloads
+        // live in `.tmp` files until renamed into place, exactly like the
+        // downloader's own done-set derivation).
+        let work_dir = dash_work_dir(target);
+        let done = std::fs::read_dir(&work_dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| {
+                        entry.file_name().to_string_lossy().ends_with(".segment")
+                            && entry.file_type().map(|kind| kind.is_file()).unwrap_or(false)
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        return Some(MediaCheckpointInfo {
+            kind: MediaKind::Dash,
+            url: state.manifest_url,
+            representation_id: Some(state.representation_id),
+            audio_representation_id: state.audio_representation_id,
+            segments_done: Some(done as u64),
+            segments_total: Some(total as u64),
+        });
+    }
+    None
+}
+
 /// One resolved DASH track as persisted in the checkpoint: the concrete
 /// segment plan (initialization + media URLs with their byte ranges).
 /// The done-set is NOT stored — a segment counts as done only when its
