@@ -7,6 +7,8 @@ type Page = "downloads" | "queue" | "video" | "settings";
 type Kind = "direct" | "hls" | "dash";
 type Status = "Queued" | "Downloading" | "Pausing" | "Paused" | "Cancelling" | "Completed" | "Failed" | "Interrupted" | "Cancelled";
 type Variant = { kind: string; quality: string; width?: number; height?: number; bandwidth?: number; url: string; downloadable: boolean; note?: string; representationId?: string; audioRepresentationId?: string; audioOnly?: boolean };
+type GrabItem = { url: string; kind: string; name: string };
+type GrabResult = { items: GrabItem[]; truncated: boolean };
 type Progress = { downloaded: number; total?: number; percent?: number; phase: string };
 type Item = { id: string; name: string; url: string; kind: Kind; status: Status; percent: number; downloaded: number; total?: number; detail: string; error?: string; createdAt: number; targetPath?: string; scheduledAt?: number; source?: "native"; representationId?: string; audioRepresentationId?: string };
 type StoredJob = { id: string; name: string; url: string; kind: string; origin: string; state: string; downloaded: number; total?: number; percent?: number; segmentsDone?: number; segmentsTotal?: number; targetPath?: string; checkpointPath?: string; representationId?: string; audioRepresentationId?: string; scheduledAtMs?: number; detail: string; error?: string; createdAtMs: number; updatedAtMs: number };
@@ -75,7 +77,7 @@ function pageInfo(page: Page) {
   const values = {
     downloads: ["Downloads", "A clear view of what is moving and what is finished."],
     queue: ["Queue", "Transfers waiting, running, or needing attention."],
-    video: ["Video grabber", "Find exposed media streams and choose an available quality."],
+    video: ["Video grabber", "Inspect one media URL, or grab every media file from one page."],
     settings: ["Settings", "A few useful controls. No decorative switches."]
   };
   return values[page];
@@ -95,6 +97,15 @@ export default function App() {
   const [inspecting, setInspecting] = useState(false);
   const [notice, setNotice] = useState("Ready.");
   const [videoNotice, setVideoNotice] = useState("");
+  // Site grabber (Slice 7): paste-a-page-URL path. The desktop reads
+  // the page's static HTML only, so `grabbed` may miss media that a
+  // login or JavaScript would reveal; the extension sees the live page.
+  const [grabUrl, setGrabUrl] = useState("");
+  const [grabbed, setGrabbed] = useState<GrabItem[]>([]);
+  const [grabChecked, setGrabChecked] = useState<Record<string, boolean>>({});
+  const [grabTruncated, setGrabTruncated] = useState(false);
+  const [grabbing, setGrabbing] = useState(false);
+  const [grabNotice, setGrabNotice] = useState("");
   const [connections, setConnections] = useState(() => readSetting(CONNECTIONS_KEY, 1, [1]));
   const [parallel, setParallel] = useState(() => readSetting(PARALLEL_KEY, 2, [1, 2, 3, 4]));
   const [speedLimit, setSpeedLimit] = useState(() => readSetting(SPEED_LIMIT_KEY, 0, [0, 262144, 524288, 1048576, 2097152, 5242880, 10485760]));
@@ -487,6 +498,62 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     } catch (error) { setVideoNotice(String(error)); }
     finally { setInspecting(false); }
   }
+  function hostOf(value: string) {
+    try { return new URL(value).hostname; } catch { return value; }
+  }
+  async function grabPage() {
+    const clean = grabUrl.trim();
+    if (!/^https?:\/\//i.test(clean)) { setGrabNotice("Paste a valid HTTP or HTTPS page URL."); return; }
+    setGrabbing(true);
+    setGrabNotice("");
+    try {
+      const result = await invoke<GrabResult>("grab_page_media", { pageUrl: clean });
+      setGrabbed(result.items);
+      setGrabTruncated(result.truncated);
+      setGrabChecked(Object.fromEntries(result.items.map((item) => [item.url, true])));
+      setGrabNotice(result.items.length
+        ? ""
+        : "No media links were found in this page's HTML. Pages that need a login or load media with JavaScript need the browser extension instead.");
+    } catch (error) {
+      setGrabbed([]);
+      setGrabTruncated(false);
+      setGrabChecked({});
+      setGrabNotice(String(error));
+    } finally {
+      setGrabbing(false);
+    }
+  }
+  async function downloadGrabbed() {
+    const chosen = grabbed.filter((item) => grabChecked[item.url]);
+    if (!chosen.length) return;
+    setGrabNotice("Queueing " + chosen.length + " item(s)…");
+    let queued = 0;
+    let failed = 0;
+    // Sequential on purpose: each item goes through the same path a
+    // one-off add would take — DASH inspects first and takes the best
+    // quality, HLS and direct files queue directly — so every item
+    // lands in the job store as its own job with its own checkpoint.
+    for (const item of chosen) {
+      try {
+        if (item.kind === "dash") {
+          const result = await invoke<Variant[]>("inspect_video_url", { url: item.url, referer: null });
+          const variants = result.filter((variant) => variant.downloadable && variant.url);
+          variants.sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bandwidth || 0) - (a.bandwidth || 0));
+          const best = variants[0];
+          if (!best) { failed += 1; continue; }
+          add(item.url, item.name, "dash", best.representationId, best.audioRepresentationId);
+        } else if (item.kind === "hls") {
+          add(item.url, item.name, "hls");
+        } else {
+          add(item.url, item.name, "direct");
+        }
+        queued += 1;
+      } catch { failed += 1; }
+    }
+    setGrabNotice(failed
+      ? "Queued " + queued + " of " + chosen.length + " grabbed items (" + failed + " could not be started)."
+      : "Queued " + queued + " grabbed item" + (queued === 1 ? "" : "s") + ".");
+  }
   async function saveFfmpegPath() {
     setFfmpegSaving(true);
     setFfmpegStatus("Verifying FFmpeg…");
@@ -621,7 +688,28 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
               <button className="secondary-button" disabled={!variant.downloadable} onClick={() => add(variant.kind === "dash" ? videoUrl : variant.url, "video.mp4", variant.kind === "hls" ? "hls" : variant.kind === "dash" ? "dash" : "direct", variant.representationId, variant.audioRepresentationId)}>{variant.downloadable ? "Download" : "Unavailable"}</button>
             </div>)}
           </div>}
-          <div className="support-note"><strong>Format support</strong><p>Direct HTTP/HTTPS files use resumable transfers. HLS supports completed unencrypted VOD, with Pause/Resume/Cancel. DASH supports static MPDs with SegmentTemplate/SegmentTimeline, SegmentList, SegmentBase and multi-period, with Pause/Resume/Cancel; separate audio/video requires FFmpeg. Live/dynamic MPDs and DRM are not supported. A YouTube watch page is not a direct media URL; page extraction is not available in this build.</p></div>
+          <div className="rule" />
+          <div className="variants-heading"><h3>Grab a page</h3><span>SAME-PAGE ONLY · MAX 100</span></div>
+          <p className="footnote">Collect every media file linked from one page — video, audio, playlists, documents and archives. This reads the page's static HTML only, so pages that need a login or load media with JavaScript may show nothing; the browser extension scans the live page instead.</p>
+          <form onSubmit={(event) => { event.preventDefault(); void grabPage(); }}>
+            <label htmlFor="grab-url">Page URL</label>
+            <input id="grab-url" className="field" value={grabUrl} onChange={(event) => setGrabUrl(event.target.value)} placeholder="https://example.com/gallery" />
+            <div className="video-submit"><button className="primary-button" type="submit" disabled={grabbing}>{grabbing ? "Grabbing…" : "Grab page"}</button></div>
+          </form>
+          {grabNotice && <div className="notice">{grabNotice}</div>}
+          {grabbed.length > 0 && <div className="variants">
+            <div className="variants-heading"><h3>Found on this page</h3><span>{grabbed.length} ITEMS</span></div>
+            <div className="grab-actions">
+              <button className="quiet-button" onClick={() => setGrabChecked(Object.fromEntries(grabbed.map((item) => [item.url, true])))}>Select all</button>
+              <button className="quiet-button" onClick={() => setGrabChecked({})}>Select none</button>
+              <button className="primary-button" onClick={() => void downloadGrabbed()} disabled={!grabbed.some((item) => grabChecked[item.url])}>Download selected ({grabbed.filter((item) => grabChecked[item.url]).length})</button>
+            </div>
+            {grabTruncated && <div className="notice">Showing the first 100 items — download in batches, or narrow the page.</div>}
+            {grabbed.map((item) => <div className="variant" key={item.url}>
+              <label className="grab-item"><input type="checkbox" checked={!!grabChecked[item.url]} onChange={(event) => setGrabChecked((current) => ({ ...current, [item.url]: event.target.checked }))} /><span><strong>{item.name}</strong><small>{item.kind.toUpperCase()} · {hostOf(item.url)}</small></span></label>
+            </div>)}
+          </div>}
+          <div className="support-note"><strong>Format support</strong><p>Direct HTTP/HTTPS files use resumable transfers. HLS supports completed unencrypted VOD, with Pause/Resume/Cancel. DASH supports static MPDs with SegmentTemplate/SegmentTimeline, SegmentList, SegmentBase and multi-period, with Pause/Resume/Cancel; separate audio/video requires FFmpeg. Live/dynamic MPDs and DRM are not supported. A YouTube watch page is not a direct media URL; page extraction of its streams is not supported, but "Grab a page" above lists media files a page links to directly.</p></div>
         </section>}
 
         {page === "settings" && <section className="panel settings-panel">

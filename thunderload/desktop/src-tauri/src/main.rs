@@ -1,13 +1,25 @@
 use std::{collections::HashMap, path::{Path, PathBuf}, process::Command, sync::{Arc, Mutex, OnceLock}, time::{Duration, Instant}};
 use serde_json::{json, Value};
 use tauri::{Emitter, Manager};
-use thunderload_engine::{dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_resumable, download_url_resumable, hls_work_dir, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, store_file_name, DownloadControl, DownloadOutcome, GlobalRateLimiter, JobKind, JobOrigin, JobRecord, JobState, JobStore, SessionHeaders};
+use thunderload_engine::{dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_resumable, download_url_resumable, grab_page_media as engine_grab_page_media, hls_work_dir, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, store_file_name, DownloadControl, DownloadOutcome, GlobalRateLimiter, JobKind, JobOrigin, JobRecord, JobState, JobStore, PageMediaList, SessionHeaders};
 use tokio::{process::Command as TokioCommand, sync::{mpsc, watch}};
 
 #[tauri::command]
 async fn inspect_video_url(url: String, referer: Option<String>) -> Result<Vec<thunderload_engine::VideoVariant>, String> {
     let session = SessionHeaders::with_referer(referer.as_deref());
     inspect_video(&url, session.as_ref()).await.map_err(|error| error.to_string())
+}
+
+/// Site grabber (Slice 7): fetch one page and list its media links.
+/// Best effort only — the desktop has no browser session, so pages that
+/// need a login or load media with JavaScript may come back empty. The
+/// extension's live-DOM scan is the full path for those pages.
+#[tauri::command]
+async fn grab_page_media(page_url: String) -> Result<PageMediaList, String> {
+    if !(page_url.starts_with("http://") || page_url.starts_with("https://")) {
+        return Err("Only HTTP and HTTPS page URLs are supported".into());
+    }
+    engine_grab_page_media(&page_url).await.map_err(|error| error.to_string())
 }
 
 
@@ -1116,7 +1128,7 @@ fn main() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![inspect_video_url, start_download, pause_download, cancel_download, set_speed_limit, schedule_app_wake, cancel_app_wake, start_hls_download, start_dash_download, get_ffmpeg_path, set_ffmpeg_path, get_native_downloads, control_native_download, dismiss_native_download, register_native_host, open_download_folder, save_extension_file, get_jobs, sync_jobs, remove_job, cancel_queued_job])
+        .invoke_handler(tauri::generate_handler![inspect_video_url, grab_page_media, start_download, pause_download, cancel_download, set_speed_limit, schedule_app_wake, cancel_app_wake, start_hls_download, start_dash_download, get_ffmpeg_path, set_ffmpeg_path, get_native_downloads, control_native_download, dismiss_native_download, register_native_host, open_download_folder, save_extension_file, get_jobs, sync_jobs, remove_job, cancel_queued_job])
         .run(tauri::generate_context!())
         .expect("error while running ThunderLoad desktop app");
 }

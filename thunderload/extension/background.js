@@ -4,6 +4,8 @@ let nativePort = null;
 let nextRequestId = 1;
 const pendingRequests = new Map();
 const sourcesByTab = new Map();
+const truncatedByTab = new Map();
+const MAX_SOURCES_PER_TAB = 100;
 
 async function browserDownload(url, filename) {
   const options = { url, filename: filename || undefined, saveAs: false, conflictAction: "uniquify" };
@@ -171,7 +173,9 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (typeof tabId === "number") {
       const map = new Map((sourcesByTab.get(tabId) || []).map((item) => [item.url, item]));
       for (const item of (message.sources || [])) if (item?.url && /^https?:\/\//i.test(item.url)) map.set(item.url, item);
-      sourcesByTab.set(tabId, Array.from(map.values()).slice(0, 80));
+      const all = Array.from(map.values());
+      if (all.length > MAX_SOURCES_PER_TAB || message.truncated) truncatedByTab.set(tabId, true);
+      sourcesByTab.set(tabId, all.slice(0, MAX_SOURCES_PER_TAB));
     }
     sendResponse({ ok: true });
     return false;
@@ -181,10 +185,24 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
       try {
         const [tab] = await api.tabs.query({ active: true, currentWindow: true });
         if (!tab?.id) return sendResponse({ ok: false, error: "No active tab" });
+        // Recompute truncation from this scan (R1): clear the flag
+        // before the fresh scan, so a page that shrank below the caps
+        // stops reporting truncated. It is set again below from the
+        // SCAN_NOW response and from any VIDEO_SOURCES_FOUND messages
+        // that arrive during the settle wait.
+        truncatedByTab.delete(tab.id);
         await api.scripting.executeScript({ target: { tabId: tab.id }, files: ["content.js"] });
-        await api.tabs.sendMessage(tab.id, { type: "SCAN_NOW" }).catch(() => {});
+        const scanResult = await api.tabs.sendMessage(tab.id, { type: "SCAN_NOW" }).catch(() => null);
         await new Promise((resolve) => setTimeout(resolve, 250));
-        sendResponse({ ok: true, tabId: tab.id, sources: sourcesByTab.get(tab.id) || [], pageUrl: tab.url || "" });
+        // The SCAN_NOW result is authoritative for this scan (R1
+        // follow-up): it overwrites the flag after the settle wait,
+        // so a mid-scan notify from add() that disagreed with the
+        // scan's own recompute cannot leave a stale true behind.
+        // Messages from the same scan agree with it; a null result
+        // (content script blocked) clears the flag as well.
+        if (scanResult?.truncated) truncatedByTab.set(tab.id, true);
+        else truncatedByTab.delete(tab.id);
+        sendResponse({ ok: true, tabId: tab.id, sources: sourcesByTab.get(tab.id) || [], pageUrl: tab.url || "", truncated: !!truncatedByTab.get(tab.id) });
       } catch (error) {
         sendResponse({ ok: false, error: error?.message || "This page does not allow extension scanning" });
       }
@@ -214,13 +232,13 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return false;
 });
 
-api.tabs.onRemoved.addListener((tabId) => sourcesByTab.delete(tabId));
+api.tabs.onRemoved.addListener((tabId) => { sourcesByTab.delete(tabId); truncatedByTab.delete(tabId); });
 
 // IDM-style network backstop: catch media the DOM scan cannot see
 // (fetch/XHR-loaded streams, cross-origin iframes). Observation only —
 // nothing is blocked, modified or redirected. The classifier mirrors the
 // extension used by content.js so both paths report the same kinds.
-const NETWORK_MEDIA_EXT = /\.(?:m3u8|mpd|mp4|m4v|mov|webm|mkv|avi|mp3|m4a|aac|wav)(?:$|[?#])/i;
+const NETWORK_MEDIA_EXT = /\.(?:m3u8|mpd|mp4|m4v|mov|webm|mkv|avi|mp3|m4a|aac|wav|ogg|opus|flac|pdf|zip)(?:$|[?#])/i;
 const NETWORK_SEGMENT_EXT = /\.(?:ts|m4s|cmfv|cmfa)(?:$|[?#])/i;
 function classifyNetworkResponse(url, headers) {
   if (!url || !/^https?:\/\//i.test(url)) return null;
@@ -236,7 +254,9 @@ function recordNetworkSource(tabId, url, kind) {
   if (typeof tabId !== "number" || tabId < 0) return;
   const map = new Map((sourcesByTab.get(tabId) || []).map((item) => [item.url, item]));
   if (!map.has(url)) map.set(url, { url, kind, label: kind, discoveredAt: Date.now() });
-  sourcesByTab.set(tabId, Array.from(map.values()).slice(0, 80));
+  const all = Array.from(map.values());
+  if (all.length > MAX_SOURCES_PER_TAB) truncatedByTab.set(tabId, true);
+  sourcesByTab.set(tabId, all.slice(0, MAX_SOURCES_PER_TAB));
 }
 if (api.webRequest?.onHeadersReceived) {
   api.webRequest.onHeadersReceived.addListener((details) => {
@@ -244,7 +264,7 @@ if (api.webRequest?.onHeadersReceived) {
     if (kind) recordNetworkSource(details.tabId, details.url, kind);
   }, { urls: ["<all_urls>"], types: ["xmlhttprequest", "media", "other"] }, ["responseHeaders"]);
 }
-api.tabs.onUpdated.addListener((tabId, changeInfo) => { if (changeInfo.status === "loading") sourcesByTab.delete(tabId); });
+api.tabs.onUpdated.addListener((tabId, changeInfo) => { if (changeInfo.status === "loading") { sourcesByTab.delete(tabId); truncatedByTab.delete(tabId); } });
 api.commands?.onCommand.addListener(async (command) => {
   if (command !== "scan-media") return;
   const [tab] = await api.tabs.query({ active: true, currentWindow: true });
