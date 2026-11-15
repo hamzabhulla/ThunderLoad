@@ -171,12 +171,68 @@ async function quickDownloadMedia({ url, kind, pageUrl, filename, selectedVarian
   return { ok: false, error: nativeErrorMessage(result?.error || "ThunderLoad could not start this download.") };
 }
 
+// Download interception: every browser download goes through
+// ThunderLoad instead of the browser. onCreated fires when the
+// download starts, before any bytes land, so cancel + erase + a
+// native start swaps the engine in with no partial file left behind.
+// Fail-open: if the engine cannot start it, the browser download is
+// restarted so the user still gets the file. Own downloads (started
+// by this extension, e.g. the context-menu fallback) are never
+// intercepted — that would loop forever. Incognito and non-http(s)
+// downloads stay with the browser.
+const INTERCEPT_SETTING_KEY = "interceptBrowserDownloads";
+let interceptEnabled = true;
+api.storage?.local?.get({ [INTERCEPT_SETTING_KEY]: true })
+  .then((stored) => { interceptEnabled = stored?.[INTERCEPT_SETTING_KEY] !== false; })
+  .catch(() => {});
+api.storage?.onChanged?.addListener((changes, area) => {
+  if (area === "local" && changes && Object.prototype.hasOwnProperty.call(changes, INTERCEPT_SETTING_KEY)) {
+    interceptEnabled = changes[INTERCEPT_SETTING_KEY].newValue !== false;
+  }
+});
+function downloadsCancel(id) {
+  if (globalThis.browser && typeof globalThis.browser.downloads?.cancel === "function") return globalThis.browser.downloads.cancel(id);
+  return new Promise((resolve) => { api.downloads.cancel(id, () => resolve()); });
+}
+function downloadsErase(id) {
+  if (globalThis.browser && typeof globalThis.browser.downloads?.erase === "function") return globalThis.browser.downloads.erase(id);
+  return new Promise((resolve) => { api.downloads.erase(id, () => resolve()); });
+}
+function cleanDownloadFilename(name, fallback) {
+  const cleaned = String(name || "").replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_").slice(0, 180);
+  return cleaned || fallback;
+}
+async function interceptDownload(downloadItem) {
+  if (!interceptEnabled) return;
+  if (!downloadItem || typeof downloadItem.id !== "number") return;
+  if (downloadItem.byExtensionId && downloadItem.byExtensionId === api.runtime.id) return;
+  if (!/^https?:\/\//i.test(downloadItem.url || "")) return;
+  if (downloadItem.state === "complete") return;
+  if (downloadItem.incognito) return;
+  const fromItem = String(downloadItem.filename || "").split(/[\\/]/).pop() || "";
+  const filename = cleanDownloadFilename(fromItem, safeFilenameFromUrl(downloadItem.url, "download.bin"));
+  try { await downloadsCancel(downloadItem.id); } catch (_) { /* Already finished or gone. */ }
+  try { await downloadsErase(downloadItem.id); } catch (_) { /* History entry already gone. */ }
+  const native = await requestNative("download.start", { url: downloadItem.url, filename, referer: downloadItem.referrer || "" });
+  if (!native?.ok) await browserDownload(downloadItem.url, filename);
+}
+if (api.downloads?.onCreated) {
+  api.downloads.onCreated.addListener((downloadItem) => { interceptDownload(downloadItem).catch(() => {}); });
+}
+
 api.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "VIDEO_SOURCES_FOUND") {
     const tabId = sender.tab?.id;
     if (typeof tabId === "number") {
       const map = new Map((sourcesByTab.get(tabId) || []).map((item) => [item.url, item]));
-      for (const item of (message.sources || [])) if (item?.url && /^https?:\/\//i.test(item.url)) map.set(item.url, enrichSource(item));
+      for (const item of (message.sources || [])) {
+        if (!item?.url || !/^https?:\/\//i.test(item.url)) continue;
+        // Defense in depth: the content script filters service URLs
+        // too, but DOM-sourced junk must never reach the popup even
+        // if content.js is bypassed or stale.
+        if (isYouTubeServiceUrl(item.url)) continue;
+        map.set(item.url, enrichSource(item));
+      }
       const all = sortSources(Array.from(map.values()));
       if (all.length > MAX_SOURCES_PER_TAB || message.truncated) truncatedByTab.set(tabId, true);
       sourcesByTab.set(tabId, all.slice(0, MAX_SOURCES_PER_TAB));
@@ -250,7 +306,6 @@ const NETWORK_SEGMENT_EXT = /\.(?:ts|m4s|cmfv|cmfa)(?:$|[?#])/i;
 // so the popup can tell an audio chunk from a video chunk instead
 // of listing every segment as a blind "Direct media" card.
 const YOUTUBE_DASH_MANIFEST = /(?:^|[\/.])youtube\.com\/api\/manifest\/dash(?:[\/?#]|$)/i;
-const DASH_NOTE = "Downloads the full video with audio via the ThunderLoad app.";
 function parseGoogleVideoSegment(url) {
   try {
     const parsed = new URL(url);
@@ -267,10 +322,10 @@ function enrichSource(item) {
   if (!item?.url) return item;
   const url = item.url;
   if (YOUTUBE_DASH_MANIFEST.test(url)) {
-    return { ...item, kind: "DASH manifest", label: "YouTube video (DASH)", note: DASH_NOTE, isYouTubeDash: true };
+    return { ...item, kind: "DASH manifest", label: "YouTube video (DASH)", isYouTubeDash: true };
   }
   if (item.kind === "DASH manifest") {
-    return { ...item, label: "DASH manifest", note: DASH_NOTE };
+    return { ...item, label: "DASH manifest" };
   }
   if (item.kind === "Direct media") {
     const segment = parseGoogleVideoSegment(url);
@@ -290,6 +345,20 @@ function sourceRank(item) {
 function sortSources(list) {
   return [...list].sort((a, b) => sourceRank(a) - sourceRank(b) || (a.discoveredAt || 0) - (b.discoveredAt || 0));
 }
+// YouTube service endpoints serve JSON/search data with an audio/video
+// Content-Type (e.g. www.youtube.com/s/search/audio) — not media.
+// They are not downloadable files, so they must never appear as
+// "Direct media". The DASH-manifest check above runs first, so
+// /api/manifest/dash is unaffected by this exclusion.
+const YOUTUBE_SERVICE_PATH = /^\/(?:s|api|youtubei)\//i;
+function isYouTubeServiceUrl(url) {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    return (host === "youtube.com" || host.endsWith(".youtube.com") || host === "youtubei.googleapis.com")
+      && YOUTUBE_SERVICE_PATH.test(parsed.pathname);
+  } catch (_) { return false; }
+}
 function classifyNetworkResponse(url, headers) {
   if (!url || !/^https?:\/\//i.test(url)) return null;
   const contentType = (headers || []).find((header) => header.name?.toLowerCase() === "content-type")?.value?.toLowerCase() || "";
@@ -304,6 +373,7 @@ function classifyNetworkResponse(url, headers) {
   if (YOUTUBE_DASH_MANIFEST.test(url)) return "DASH manifest";
   if (/\.mpd(?:$|[?#])/i.test(url) || contentType.includes("application/dash+xml")) return "DASH manifest";
   if (NETWORK_SEGMENT_EXT.test(url)) return null;
+  if (isYouTubeServiceUrl(url)) return null;
   if (contentType.startsWith("video/") || contentType.startsWith("audio/")) return "Direct media";
   if (NETWORK_MEDIA_EXT.test(url)) return "Direct media";
   return null;
