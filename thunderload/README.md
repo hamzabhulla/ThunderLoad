@@ -1,4 +1,4 @@
-# ThunderLoad 0.3.1 — Cross-platform desktop + browser extension
+# ThunderLoad 0.3.2 — Cross-platform desktop + browser extension
 
 **Status: release candidate / not production-ready yet.** This repository contains packaging pipelines, but the tagged builds must pass CI on Windows, Linux and macOS and be tested on real machines/browsers before general release. Store approval is decided by each browser vendor.
 
