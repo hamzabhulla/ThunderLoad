@@ -11,8 +11,20 @@ $InstallDir = Join-Path $env:LOCALAPPDATA "ThunderLoad\native-host"
 $HostSource = Join-Path $PSScriptRoot "thunderload-host.exe"
 if (!(Test-Path $HostSource)) { throw "thunderload-host.exe was not found beside this script. Use the native-host setup package." }
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-$HostExe = Join-Path $InstallDir "thunderload-host.exe"
-Copy-Item -LiteralPath $HostSource -Destination $HostExe -Force
+# Content-addressed install (same reason as the desktop app): Windows locks
+# a running executable's file, so copying over a fixed thunderload-host.exe
+# fails with a sharing violation while Chrome has the host running. The
+# installed copy is named after its content hash; identical bytes already
+# installed are never rewritten, and a new binary never overwrites the file
+# a running host executes from. The manifests below point at $HostExe, so
+# they follow the versioned file automatically. Stale installs are left in
+# place: another browser's manifest may still point at one.
+$SourceHash = (Get-FileHash -LiteralPath $HostSource -Algorithm SHA256).Hash
+$HostExe = Join-Path $InstallDir ("thunderload-host-" + $SourceHash.Substring(0, 16).ToLowerInvariant() + ".exe")
+$InstalledHash = if (Test-Path -LiteralPath $HostExe) { (Get-FileHash -LiteralPath $HostExe -Algorithm SHA256).Hash } else { $null }
+if ($InstalledHash -ne $SourceHash) {
+  Copy-Item -LiteralPath $HostSource -Destination $HostExe -Force
+}
 function Write-Manifest($Manifest, [string]$Path) {
   $Json = $Manifest | ConvertTo-Json -Depth 5
   [System.IO.File]::WriteAllText($Path, $Json, [System.Text.UTF8Encoding]::new($false))
