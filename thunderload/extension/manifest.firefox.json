@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "ThunderLoad Download Manager",
   "short_name": "ThunderLoad",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "A quiet, lightweight download companion with automatic media detection and optional desktop acceleration.",
   "permissions": ["activeTab", "scripting", "downloads", "contextMenus", "webRequest", "cookies"],
   "optional_permissions": ["nativeMessaging"],

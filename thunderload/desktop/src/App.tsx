@@ -713,7 +713,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       <div className="sidebar-bottom">
         <div className="engine-line"><i />Local engine</div>
         <button title="Settings" aria-label="Settings" className={"nav-item " + (page === "settings" ? "selected" : "")} onClick={() => setPage("settings")}><span>⚙</span>Settings</button>
-        <div className="version">ThunderLoad · 0.3.0</div>
+        <div className="version">ThunderLoad · 0.3.1</div>
       </div>
     </aside>
 
@@ -859,7 +859,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
             {extensionFileStatus && <div className="notice native-host-notice">{extensionFileStatus}</div>}
           </div>
           <div className="rule" />
-          <div className="settings-section"><div><h2>About</h2><p>Local desktop transfer engine · Version 0.3.0</p></div><div className="about-line"><span>Supported media</span><strong>Direct files · HLS VOD · Static DASH VOD</strong></div><div className="about-line"><span>Direct downloads</span><strong>Pause · Resume · Cancel · Speed limit · Schedule</strong></div><div className="about-line"><span>Still in development</span><strong>Multi-connection resume · Live DASH</strong></div></div>
+          <div className="settings-section"><div><h2>About</h2><p>Local desktop transfer engine · Version 0.3.1</p></div><div className="about-line"><span>Supported media</span><strong>Direct files · HLS VOD · Static DASH VOD</strong></div><div className="about-line"><span>Direct downloads</span><strong>Pause · Resume · Cancel · Speed limit · Schedule</strong></div><div className="about-line"><span>Still in development</span><strong>Multi-connection resume · Live DASH</strong></div></div>
         </section>}
 
         <footer className="app-footer"><span>ThunderLoad</span><span>Downloads stay on this device.</span></footer>
