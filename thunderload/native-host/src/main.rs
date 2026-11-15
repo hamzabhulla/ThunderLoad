@@ -1,3 +1,11 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Release builds on Windows must not show a console window: Chrome spawns
+// this host for native messaging, and without this attribute the host is
+// built with the console subsystem, so a black console window appears
+// whenever the extension connects. The native-messaging protocol talks
+// over inherited stdin/stdout pipes (read_message/write_message below),
+// which keep working in a windows-subsystem binary — it just gets no
+// console window. Debug builds keep the console for local testing.
 use anyhow::{anyhow, Result};
 use std::{collections::HashMap, sync::{Arc, Mutex, OnceLock}};
 use serde_json::{json, Value};

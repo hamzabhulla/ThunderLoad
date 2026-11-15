@@ -17,6 +17,27 @@ const HISTORY_KEY = "thunderload.history.v2";
 const CONNECTIONS_KEY = "thunderload.connections.v1";
 const PARALLEL_KEY = "thunderload.parallel.v1";
 const SPEED_LIMIT_KEY = "thunderload.speed-limit.v1";
+const NATIVE_IDS_KEY = "thunderload.native-extension-ids.v1";
+
+// Extension IDs the user entered once in Settings → Browser connection,
+// one per browser. The startup check re-registers from these, so the
+// user never has to paste an ID twice.
+function readNativeIds(): Record<string, string> {
+  try {
+    const saved = JSON.parse(localStorage.getItem(NATIVE_IDS_KEY) || "{}");
+    if (!saved || typeof saved !== "object") return {};
+    const ids: Record<string, string> = {};
+    for (const [browser, id] of Object.entries(saved)) {
+      if (typeof id === "string" && id.trim()) ids[browser] = id.trim();
+    }
+    return ids;
+  } catch { return {}; }
+}
+
+// Refusal shown when a pasted URL inspects as a webpage instead of a
+// direct media file — the same wording as the Format support note on the
+// Video page.
+const YOUTUBE_PAGE_MESSAGE = "A YouTube watch page is not a direct media URL; page extraction of its streams is not supported";
 
 function bytes(value: number): string {
   if (!Number.isFinite(value) || value <= 0) return "0 B";
@@ -111,9 +132,14 @@ export default function App() {
   const [speedLimit, setSpeedLimit] = useState(() => readSetting(SPEED_LIMIT_KEY, 0, [0, 262144, 524288, 1048576, 2097152, 5242880, 10485760]));
   const [clock, setClock] = useState(Date.now());
   const [nativeBrowser, setNativeBrowser] = useState("chrome");
-  const [nativeExtensionId, setNativeExtensionId] = useState("");
+  const [nativeExtensionId, setNativeExtensionId] = useState(() => readNativeIds()["chrome"] || "");
   const [nativeSetupStatus, setNativeSetupStatus] = useState("");
   const [nativeSettingUp, setNativeSettingUp] = useState(false);
+  // Non-blocking startup prompt: "missing-id" when no extension ID was
+  // ever saved, "register-failed" when a saved ID could not be
+  // re-registered. Dismissal lasts for this app session only.
+  const [nativeBanner, setNativeBanner] = useState<"missing-id" | "register-failed" | null>(null);
+  const [nativeBannerDismissed, setNativeBannerDismissed] = useState(false);
   const [extensionFileStatus, setExtensionFileStatus] = useState("");
   const [extensionFileSaving, setExtensionFileSaving] = useState(false);
   const [ffmpegPath, setFfmpegPath] = useState("ffmpeg");
@@ -161,6 +187,30 @@ export default function App() {
       const desktop = merged.filter((item) => item.source !== "native");
       if (desktop.length) void invoke("sync_jobs", { jobs: desktop.map(itemToSyncJob) }).catch(() => {});
     }).catch(() => {});
+  }, []);
+
+  // Fix 4: on startup, check the native-host registration for every
+  // browser whose extension ID was saved once before, and re-register
+  // silently when it went missing (browser reset, registry cleaner,
+  // moved install). When no ID was ever saved, show a prominent
+  // non-blocking banner instead — never a modal, never a silent no-op.
+  const nativeCheckedRef = useRef(false);
+  useEffect(() => {
+    if (nativeCheckedRef.current) return;
+    nativeCheckedRef.current = true;
+    const entries = Object.entries(readNativeIds());
+    if (!entries.length) { setNativeBanner("missing-id"); return; }
+    void (async () => {
+      let failed = false;
+      for (const [browser, extensionId] of entries) {
+        try {
+          const registered = await invoke<boolean>("check_native_host", { browser, extensionId });
+          if (registered) continue;
+          await invoke<string>("register_native_host", { browser, extensionId });
+        } catch { failed = true; }
+      }
+      if (failed) setNativeBanner("register-failed");
+    })();
   }, []);
 
   useEffect(() => {
@@ -304,7 +354,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     });
   }, [items, active, parallel, connections, clock]);
 
-  function add(value: string, saveAs?: string, requestedKind?: Kind, representationId?: string, audioRepresentationId?: string) {
+  async function add(value: string, saveAs?: string, requestedKind?: Kind, representationId?: string, audioRepresentationId?: string) {
     const clean = value.trim();
     if (!/^https?:\/\//i.test(clean)) { setNotice("Enter a valid HTTP or HTTPS URL."); return; }
     let kind: Kind = requestedKind || "direct";
@@ -319,6 +369,28 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     if (scheduledAt !== undefined && (!Number.isFinite(scheduledAt) || scheduledAt <= Date.now())) {
       setNotice("Choose a future start time, or clear the schedule field.");
       return;
+    }
+    // Paste path only (no requestedKind): ask the engine to classify the
+    // URL before any job exists. Callers that pass requestedKind already
+    // classified it — the Video page inspected the URL, the grabber only
+    // yields media links, and a retry re-queues a job that was already
+    // accepted — so they skip this probe. inspect_video rejects a webpage
+    // (its error says the URL "is a webpage"); that verdict refuses the
+    // add with the Format-support wording and creates no job, so a
+    // YouTube watch page can no longer reach start_download as a fake
+    // direct file. Any other probe failure (server refused the metadata
+    // probe, network down) is not a webpage verdict: the URL queues
+    // exactly as before and start_download still validates it.
+    if (!requestedKind) {
+      setNotice("Checking link…");
+      try {
+        await invoke<Variant[]>("inspect_video_url", { url: clean, referer: null });
+      } catch (error) {
+        if (String(error).includes("is a webpage")) {
+          setNotice(YOUTUBE_PAGE_MESSAGE);
+          return;
+        }
+      }
     }
     const suggested = nameFromUrl(clean);
     const item: Item = {
@@ -574,6 +646,11 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
         browser: nativeBrowser,
         extensionId
       });
+      // Save the ID once: later startups re-register from it silently.
+      const ids = readNativeIds();
+      ids[nativeBrowser] = extensionId;
+      localStorage.setItem(NATIVE_IDS_KEY, JSON.stringify(ids));
+      setNativeBanner(null);
       setNativeSetupStatus(message);
     } catch (error) {
       setNativeSetupStatus(String(error));
@@ -643,6 +720,15 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     <main className="main">
       <header className="topbar"><div>THUNDERLOAD <span>/</span> {title.toUpperCase()}</div><button className="quiet-button folder-button" onClick={openFolder}>Open downloads folder ↗</button></header>
       <div className="page">
+        {nativeBanner && !nativeBannerDismissed && <div className="setup-banner" role="status">
+          <div><strong>{nativeBanner === "missing-id" ? "Browser connection not set up yet" : "Browser connection could not be restored"}</strong><p>{nativeBanner === "missing-id"
+            ? "Downloads from the browser extension need a one-time connection. It takes a minute: install the extension, copy its ID, and connect it in Settings."
+            : "ThunderLoad tried to reconnect a browser whose extension ID was saved before, but registration failed. Open the browser setup to try again."}</p></div>
+          <div className="setup-banner-actions">
+            <button className="primary-button" onClick={() => setPage("settings")}>Set up browser connection →</button>
+            <button className="quiet-button" onClick={() => setNativeBannerDismissed(true)}>Dismiss</button>
+          </div>
+        </div>}
         <div className="page-heading"><div><h1>{title}</h1><p>{subtitle}</p></div>{page === "downloads" && <button className="primary-button" onClick={() => document.getElementById("download-url")?.focus()}>＋ Add download</button>}</div>
 
         {page === "downloads" && <>
@@ -738,8 +824,9 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
             <div><h2>Browser connection</h2><p>Register the optional local engine for adaptive video downloads. Direct file downloads work without this connection.</p></div>
             <div className="native-host-grid">
               <label><span>Browser</span><select className="select-field" value={nativeBrowser} onChange={(event) => {
-                setNativeBrowser(event.target.value);
-                if (event.target.value === "firefox" && !nativeExtensionId) setNativeExtensionId("thunderload@example.com");
+                const next = event.target.value;
+                setNativeBrowser(next);
+                setNativeExtensionId(readNativeIds()[next] || (next === "firefox" ? "thunderload@example.com" : ""));
               }}>
                 <option value="chrome">Google Chrome</option>
                 <option value="edge">Microsoft Edge</option>
@@ -750,7 +837,12 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
               <button className="secondary-button" onClick={registerNativeHost} disabled={nativeSettingUp}>{nativeSettingUp ? "Registering…" : "Connect browser"}</button>
             </div>
             {nativeSetupStatus && <div className="notice native-host-notice">{nativeSetupStatus}</div>}
-            <p className="footnote">Copy the ID from the browser's Extensions page. After registration, restart the browser and allow Native messaging in the ThunderLoad extension.</p>
+            <ol className="setup-steps">
+              <li><strong>Install the extension first</strong> — download it below in Browser extension files and load it in your browser (Chromium: Load unpacked in developer mode; Firefox: Install Add-on From File).</li>
+              <li><strong>Find the extension ID</strong> — open <code>chrome://extensions</code> (Edge: <code>edge://extensions</code>, Brave: <code>brave://extensions</code>), turn <strong>Developer mode</strong> on, and copy the <strong>ID</strong> shown under the ThunderLoad extension. Firefox uses the fixed ID <code>thunderload@example.com</code> — it is filled in for you.</li>
+              <li><strong>Connect it here</strong> — paste the ID above, choose your browser, and click <strong>Connect browser</strong>. ThunderLoad copies the native host into place, writes the browser manifest, and registers it. You only do this once per browser.</li>
+              <li><strong>Restart the browser</strong> and allow <strong>Native messaging</strong> in the ThunderLoad extension when prompted. ThunderLoad re-registers automatically on later startups if the registration ever goes missing.</li>
+            </ol>
           </div>
           <div className="rule" />
           <div className="settings-section">

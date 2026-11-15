@@ -7,6 +7,23 @@ use std::{collections::VecDeque, path::{Path, PathBuf}, sync::{atomic::{AtomicU6
 use tokio::{fs, io::{AsyncSeekExt, AsyncWriteExt, SeekFrom}, sync::{mpsc, Mutex as AsyncMutex}, task::{AbortHandle, JoinHandle}};
 use uuid::Uuid;
 
+/// Returned when a URL turns out to be a webpage, not a direct media file.
+/// Single source of truth for this wording: `inspect_video` in video.rs
+/// reports the same message, so the desktop shows one consistent error
+/// whether the URL was inspected first or pasted straight into a download.
+pub(crate) const WEBPAGE_NOT_MEDIA_MESSAGE: &str = "This URL is a webpage, not a direct media file. Paste an MP4/audio URL or an HLS playlist. Page extraction is not available for this source.";
+
+/// Whether a response is a webpage: `text/html`, ignoring any `; charset=…`
+/// suffix (and case). Checked on the GET response before any bytes are
+/// written, so a pasted watch-page URL fails fast instead of saving HTML.
+fn response_is_webpage(headers: &header::HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("text/html"))
+        .unwrap_or(false)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DownloadProgress {
     pub downloaded: u64,
@@ -131,15 +148,32 @@ pub async fn download_url(
         let head_request = client.head(url);
         let head_request = apply_session(session, head_request, url);
         let head = head_request.send().await.ok();
+        // F1: fail fast on a webpage HEAD, before the segmented path can
+        // save the page as a file. A HEAD that omits Content-Type is
+        // still caught: the sequential fallback checks the GET response,
+        // and the segmented tasks check each segment response.
+        if head
+            .as_ref()
+            .filter(|response| response.status().is_success())
+            .is_some_and(|response| response_is_webpage(response.headers()))
+        {
+            return Err(anyhow!(WEBPAGE_NOT_MEDIA_MESSAGE));
+        }
         // Read the total from the Content-Length header, NOT from
         // response.content_length(): for a HEAD response hyper reports the
         // body size, which is always 0 (a HEAD response has no body), so
         // using content_length() here would make the segmented path below
         // unreachable and every download fall back to sequential.
+        // A Content-Length of 0 means "unknown", not a 0-byte object:
+        // chunked servers (notably YouTube watch pages) report 0 on HEAD
+        // while streaming a body on GET. Treating it as Some(0) would make
+        // the sequential completion check fail a finished transfer, and
+        // would claim a 0-byte total in progress reports.
         let mut total = head.as_ref().filter(|response| response.status().is_success())
             .and_then(|response| response.headers().get(header::CONTENT_LENGTH))
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok());
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|total| *total != 0);
         let mut supports_ranges = head.as_ref().filter(|response| response.status().is_success()).map(|response| {
             response.headers().get(header::ACCEPT_RANGES)
                 .and_then(|value| value.to_str().ok())
@@ -205,6 +239,9 @@ async fn download_sequential(
     let temp = target.with_extension(format!("{}{}.part", target.extension().and_then(|x| x.to_str()).unwrap_or("file"), Uuid::new_v4()));
     let request = apply_session(session, client.get(url), url);
     let response = request.send().await?.error_for_status()?;
+    if response_is_webpage(response.headers()) {
+        return Err(anyhow!(WEBPAGE_NOT_MEDIA_MESSAGE));
+    }
     let actual_total = response.content_length().or(total);
 
     let transfer_result = async {
@@ -299,6 +336,11 @@ async fn download_segmented(
             validate_content_range(actual_range, start, end, total)?;
             if response.content_length().is_some_and(|length| length != end - start + 1) {
                 return Err(anyhow!("Server returned a range with an unexpected content length"));
+            }
+            // F1 backstop: a server whose HEAD omits Content-Type reaches
+            // here. Abort before this segment's bytes touch a part file.
+            if response_is_webpage(response.headers()) {
+                return Err(anyhow!(WEBPAGE_NOT_MEDIA_MESSAGE));
             }
             let mut stream = response.bytes_stream();
             let mut file = fs::File::create(&part_path).await?;
@@ -719,6 +761,11 @@ struct ServerInfo {
     supports_ranges: bool,
     etag: Option<String>,
     last_modified: Option<String>,
+    // Whether the HEAD response advertised a webpage (text/html). The
+    // dispatchers fail fast on this (F1): without it, a page with
+    // Content-Length >= 2 MiB and Accept-Ranges: bytes was segmented and
+    // saved as a "Completed" file.
+    is_webpage: bool,
 }
 
 async fn fetch_server_info(
@@ -732,12 +779,21 @@ async fn fetch_server_info(
     // Read the total from the Content-Length header, NOT from
     // response.content_length(): for a HEAD response hyper reports the body
     // size, which is always 0, so content_length() would report a total of 0.
+    // A Content-Length of 0 likewise means "unknown", not a 0-byte object:
+    // chunked servers (notably YouTube watch pages) report 0 on HEAD while
+    // streaming a body on GET. Keeping Some(0) would fail a finished
+    // transfer in the sequential completion check ("server reported 0"),
+    // and the segmented path is only entered on a known total, so None
+    // routes such downloads to the sequential path, which skips the check
+    // when the total is unknown. A genuinely empty file still completes:
+    // 0 bytes delivered, no check to fail.
     let mut total = head
         .as_ref()
         .filter(|response| response.status().is_success())
         .and_then(|response| response.headers().get(header::CONTENT_LENGTH))
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok());
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|total| *total != 0);
     let mut supports_ranges = head
         .as_ref()
         .filter(|response| response.status().is_success())
@@ -763,6 +819,14 @@ async fn fetch_server_info(
         .map(str::to_owned);
     let mut etag = etag;
     let mut last_modified = last_modified;
+    // F1: a webpage HEAD means the URL is a page, not media. Recorded
+    // here so the dispatchers can fail before any segmented or
+    // sequential work creates part files or writes bytes.
+    let is_webpage = head
+        .as_ref()
+        .filter(|response| response.status().is_success())
+        .map(|response| response_is_webpage(response.headers()))
+        .unwrap_or(false);
     // Probe when HEAD omits Accept-Ranges or the total (common on
     // CDN/object-storage endpoints). A valid one-byte 206 is stronger
     // evidence than the hint. A validator found only by the probe is
@@ -783,7 +847,13 @@ async fn fetch_server_info(
             supports_ranges = true;
         }
     }
-    ServerInfo { total, supports_ranges, etag, last_modified }
+    ServerInfo {
+        total,
+        supports_ranges,
+        etag,
+        last_modified,
+        is_webpage,
+    }
 }
 
 fn resume_identity_matches(
@@ -1011,6 +1081,12 @@ async fn download_segment_range(
     validate_content_range(actual_range, start, end, total)?;
     if response.content_length().is_some_and(|length| length != end - start + 1) {
         return Err(anyhow!("Server returned a range with an unexpected content length"));
+    }
+    // F1 backstop: a server whose HEAD omits Content-Type reaches here,
+    // as does a stale pre-fix checkpoint resumed from disk. Abort before
+    // this chunk's bytes are written into the partial file.
+    if response_is_webpage(response.headers()) {
+        return Err(anyhow!(WEBPAGE_NOT_MEDIA_MESSAGE));
     }
     let mut file = fs::OpenOptions::new().write(true).open(part).await?;
     file.seek(SeekFrom::Start(start)).await?;
@@ -1896,6 +1972,16 @@ pub async fn download_url_resumable_with_connections(
         .unwrap_or(true);
     let server = fetch_server_info(&client, url, session, probe).await;
 
+    // F1: a webpage is never a download. Fail here — before the resume
+    // branch, the fresh segmented branch, or the sequential path can
+    // create part files or write bytes — so a large ranged page errors
+    // with no file left behind. The segment fetchers carry the same
+    // check as a backstop for servers whose HEAD omits Content-Type,
+    // and for stale pre-fix checkpoints resumed below.
+    if server.is_webpage {
+        return Err(anyhow!(WEBPAGE_NOT_MEDIA_MESSAGE));
+    }
+
     // A segmented checkpoint resumes in parallel — but only when the server
     // still reports the same object, still supports ranges, and the stored
     // layout matches the layout for (total, connections). Anything else
@@ -2050,6 +2136,16 @@ async fn download_sequential_resumable(
         return Err(anyhow!("Server returned partial content without a requested byte range"));
     }
 
+    // Fail fast on webpages: the GET response is a page, not media. This
+    // runs after any If-Range restart above, so it sees the final response,
+    // and before the checkpoint metadata is written or the part file is
+    // opened, so no file is created. HLS/DASH downloads never reach here:
+    // they go through inspect_video in video.rs, which already rejects
+    // webpages with this same message.
+    if response_is_webpage(response.headers()) {
+        return Err(anyhow!(WEBPAGE_NOT_MEDIA_MESSAGE));
+    }
+
     let start_offset = if append { offset } else { 0 };
     let response_etag = response.headers().get(header::ETAG)
         .and_then(|value| value.to_str().ok()).map(str::to_owned).or(head_etag);
@@ -2061,7 +2157,10 @@ async fn download_sequential_resumable(
             .and_then(|value| parse_resume_content_range(value, offset).ok().flatten())
             .or(server_total)
     } else {
-        response.content_length().or(server_total)
+        // A Content-Length of 0 on the GET means "unknown" (same
+        // chunked-server case as the HEAD probe); a genuinely empty file
+        // still completes because an unknown total skips the check below.
+        response.content_length().filter(|length| *length != 0).or(server_total)
     };
 
     let current_metadata = ResumeMetadata {
@@ -2182,7 +2281,7 @@ mod resumable_http_tests {
     use super::{
         download_url_resumable, partial_download_metadata_path, partial_download_path,
         reserve_download_path, DownloadControl, DownloadOutcome, GlobalRateLimiter,
-        SessionHeaders,
+        SessionHeaders, WEBPAGE_NOT_MEDIA_MESSAGE,
     };
     use std::{
         io::{Read, Write},
@@ -2695,6 +2794,254 @@ mod resumable_http_tests {
         file_server.join().unwrap();
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
+
+    /// Mimics a chunked watch page (the YouTube case): HEAD reports
+    /// Content-Length: 0 with no Accept-Ranges, and GET streams the body
+    /// with Transfer-Encoding: chunked and no Content-Length. A Range
+    /// probe GET is answered with the same 200 chunked body (no 206), so
+    /// the probe yields no total either — exactly the live behaviour that
+    /// used to leave the download believing the server reported 0.
+    fn spawn_head_zero_chunked_server() -> (String, Vec<u8>, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        let body: Vec<u8> = (0..100_003_usize).map(|i| (i % 256) as u8).collect();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_body = body.clone();
+        let thread_shutdown = shutdown.clone();
+        let handle = thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => {
+                        let _ = connection.0.set_nonblocking(false);
+                        connection
+                    },
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(3));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => {
+                            request.extend_from_slice(&buffer[..count]);
+                            if request.windows(4).any(|window| window == b"\r\n\r\n") { break; }
+                        }
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let first = request.lines().next().unwrap_or_default();
+                if first.starts_with("HEAD ") {
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    continue;
+                }
+                let headers = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n";
+                if stream.write_all(headers).is_err() { continue; }
+                for chunk in thread_body.chunks(8192) {
+                    if stream.write_all(format!("{:x}\r\n", chunk.len()).as_bytes()).is_err() { break; }
+                    if stream.write_all(chunk).is_err() { break; }
+                    if stream.write_all(b"\r\n").is_err() { break; }
+                }
+                let _ = stream.write_all(b"0\r\n\r\n");
+            }
+        });
+        (format!("http://{address}/watch"), body, shutdown, handle)
+    }
+
+    /// Serves a webpage: `text/html; charset=utf-8` on GET.
+    fn spawn_html_page_server() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        let html = b"<!doctype html><html><head><title>Watch</title></head><body>not media</body></html>";
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = shutdown.clone();
+        let handle = thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => {
+                        let _ = connection.0.set_nonblocking(false);
+                        connection
+                    },
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(3));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => {
+                            request.extend_from_slice(&buffer[..count]);
+                            if request.windows(4).any(|window| window == b"\r\n\r\n") { break; }
+                        }
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let first = request.lines().next().unwrap_or_default();
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n",
+                    html.len()
+                );
+                if stream.write_all(headers.as_bytes()).is_err() { continue; }
+                if first.starts_with("HEAD ") { continue; }
+                let _ = stream.write_all(html);
+            }
+        });
+        (format!("http://{address}/watch"), shutdown, handle)
+    }
+
+    /// A webpage large enough to segment (Content-Length >= 2 MiB) that
+    /// also advertises byte ranges — the exact shape F1 closed: without
+    /// the HEAD webpage check this page was downloaded in parallel
+    /// segments and saved as a "Completed" file.
+    fn spawn_large_ranged_html_page_server() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        const PAGE_SIZE: usize = 2 * 1024 * 1024 + 37;
+        let mut page = b"<html><body>".to_vec();
+        page.resize(PAGE_SIZE, b'a');
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = shutdown.clone();
+        let handle = thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => {
+                        let _ = connection.0.set_nonblocking(false);
+                        connection
+                    },
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(3));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => {
+                            request.extend_from_slice(&buffer[..count]);
+                            if request.windows(4).any(|window| window == b"\r\n\r\n") { break; }
+                        }
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let first = request.lines().next().unwrap_or_default();
+                let range = request.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("range").then(|| value.trim().to_string())
+                });
+                let bounds = range.as_deref()
+                    .and_then(|value| value.strip_prefix("bytes="))
+                    .and_then(|value| value.split_once('-'))
+                    .and_then(|(start, end)| Some((start.parse::<usize>().ok()?, end.parse::<usize>().ok()?)))
+                    .filter(|(start, end)| *start <= *end && *end < PAGE_SIZE);
+                let headers = if first.starts_with("HEAD ") {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {PAGE_SIZE}\r\nContent-Type: text/html; charset=utf-8\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+                    )
+                } else if let Some((start, end)) = bounds {
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{PAGE_SIZE}\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n",
+                        end - start + 1
+                    )
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {PAGE_SIZE}\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n"
+                    )
+                };
+                if stream.write_all(headers.as_bytes()).is_err() { continue; }
+                if first.starts_with("HEAD ") { continue; }
+                let payload: &[u8] = match bounds {
+                    Some((start, end)) => &page[start..=end],
+                    None => &page,
+                };
+                let _ = stream.write_all(payload);
+            }
+        });
+        (format!("http://{address}/watch"), shutdown, handle)
+    }
+
+    #[tokio::test]
+    async fn head_content_length_zero_with_chunked_body_still_completes() {
+        let (url, expected, shutdown, server) = spawn_head_zero_chunked_server();
+        let directory = std::env::temp_dir().join(format!("thunderload-head-zero-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("page.bin")).await.unwrap();
+        let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        let outcome = download_url_resumable(
+            &url, &target, None, control_rx, Arc::new(GlobalRateLimiter::new()), progress_tx,
+        ).await.unwrap();
+        assert_eq!(outcome, DownloadOutcome::Completed);
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(bytes, expected);
+        assert!(!tokio::fs::try_exists(partial_download_path(&target)).await.unwrap());
+        assert!(!tokio::fs::try_exists(partial_download_metadata_path(&target)).await.unwrap());
+        drop(control_tx);
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn webpage_content_type_fails_fast_without_writing_a_file() {
+        let (url, shutdown, server) = spawn_html_page_server();
+        let directory = std::env::temp_dir().join(format!("thunderload-webpage-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("video.mp4")).await.unwrap();
+        let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        let error = download_url_resumable(
+            &url, &target, None, control_rx, Arc::new(GlobalRateLimiter::new()), progress_tx,
+        ).await.unwrap_err();
+        assert_eq!(error.to_string(), WEBPAGE_NOT_MEDIA_MESSAGE);
+        // Nothing was written: the target is still only the empty
+        // reservation the test itself created, and neither the part file
+        // nor the checkpoint sidecar exists.
+        assert_eq!(tokio::fs::metadata(&target).await.unwrap().len(), 0);
+        assert!(!tokio::fs::try_exists(partial_download_path(&target)).await.unwrap());
+        assert!(!tokio::fs::try_exists(partial_download_metadata_path(&target)).await.unwrap());
+        drop(control_tx);
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn large_webpage_with_ranges_fails_fast_without_writing_a_file() {
+        let (url, shutdown, server) = spawn_large_ranged_html_page_server();
+        let directory = std::env::temp_dir().join(format!("thunderload-webpage-large-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("video.mp4")).await.unwrap();
+        let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        let error = download_url_resumable(
+            &url, &target, None, control_rx, Arc::new(GlobalRateLimiter::new()), progress_tx,
+        ).await.unwrap_err();
+        assert_eq!(error.to_string(), WEBPAGE_NOT_MEDIA_MESSAGE);
+        // Nothing was written: the target is still only the empty
+        // reservation the test itself created, and neither the part file
+        // nor the checkpoint sidecar exists — the HEAD check fires before
+        // the fresh segmented branch can create them.
+        assert_eq!(tokio::fs::metadata(&target).await.unwrap().len(), 0);
+        assert!(!tokio::fs::try_exists(partial_download_path(&target)).await.unwrap());
+        assert!(!tokio::fs::try_exists(partial_download_metadata_path(&target)).await.unwrap());
+        drop(control_tx);
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -2759,7 +3106,7 @@ mod resume_metadata_tests {
 mod segmented_http_tests {
     use super::{
         client, download_segmented, download_url, probe_range_support, DownloadProgress,
-        GlobalRateLimiter,
+        GlobalRateLimiter, WEBPAGE_NOT_MEDIA_MESSAGE,
     };
     use reqwest::Client;
     use std::{
@@ -2894,6 +3241,83 @@ mod segmented_http_tests {
         (format!("http://{address}/file.bin"), range_requests, shutdown, handle)
     }
 
+    /// Same body as `spawn_segment_server`, but the HEAD response claims
+    /// a binary Content-Type while ranged GETs arrive as text/html — the
+    /// shape that reaches the segmented tasks with a silent HEAD. The
+    /// segment-response check must still abort before any bytes are
+    /// written.
+    fn spawn_html_segment_server() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = shutdown.clone();
+        let body = Arc::new((0..BODY_SIZE).map(|index| (index % 251) as u8).collect::<Vec<u8>>());
+        let handle = thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => {
+                        let _ = connection.0.set_nonblocking(false);
+                        connection
+                    },
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => {
+                            request.extend_from_slice(&buffer[..count]);
+                            if request.windows(4).any(|window| window == b"\r\n\r\n") { break; }
+                        }
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let first = request.lines().next().unwrap_or_default();
+                let range = request.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("range").then(|| value.trim().to_string())
+                });
+                let bounds = range.as_deref()
+                    .and_then(|value| value.strip_prefix("bytes="))
+                    .and_then(|value| value.split_once('-'))
+                    .and_then(|(start, end)| Some((start.parse::<usize>().ok()?, end.parse::<usize>().ok()?)))
+                    .filter(|(start, end)| *start <= *end && *end < BODY_SIZE);
+                if first.starts_with("HEAD ") {
+                    // HEAD claims a binary file: the dispatcher's HEAD
+                    // check cannot fire, so the request reaches the
+                    // segmented tasks.
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {BODY_SIZE}\r\nAccept-Ranges: bytes\r\nContent-Type: application/octet-stream\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n"
+                    );
+                    if stream.write_all(headers.as_bytes()).is_err() { continue; }
+                    continue;
+                }
+                if let Some((start, end)) = bounds {
+                    let payload = &body[start..=end];
+                    let headers = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{BODY_SIZE}\r\nContent-Type: text/html; charset=utf-8\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n",
+                        payload.len()
+                    );
+                    if stream.write_all(headers.as_bytes()).is_err() { continue; }
+                    let _ = stream.write_all(payload);
+                } else {
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {BODY_SIZE}\r\nContent-Type: text/html; charset=utf-8\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n"
+                    );
+                    if stream.write_all(headers.as_bytes()).is_err() { continue; }
+                    let _ = stream.write_all(&body);
+                }
+            }
+        });
+        (format!("http://{address}/file.bin"), shutdown, handle)
+    }
+
     #[tokio::test]
     async fn multi_connection_download_probes_ranges_and_assembles_exact_bytes() {
         let (url, range_requests, shutdown, server) = spawn_segment_server();
@@ -2931,6 +3355,26 @@ mod segmented_http_tests {
             if progress.phase == "complete" && progress.percent == Some(100.0) { saw_complete = true; }
         }
         assert!(saw_complete);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn segmented_download_rejects_webpage_when_head_omits_content_type() {
+        // F1 backstop: the HEAD response claims a binary file, so only
+        // the segment-response check can catch this page. The one-shot
+        // entry removes its reservation on error, so no file is left.
+        let (url, shutdown, server) = spawn_html_segment_server();
+        let directory = std::env::temp_dir().join(format!("thunderload-segment-html-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = directory.join("video.mp4");
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel::<DownloadProgress>();
+        let error = download_url(
+            &url, &target, 4, None, progress_tx, Arc::new(GlobalRateLimiter::new()),
+        ).await.unwrap_err();
+        assert_eq!(error.to_string(), WEBPAGE_NOT_MEDIA_MESSAGE);
+        assert!(!tokio::fs::try_exists(&target).await.unwrap());
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap();
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 
@@ -3879,6 +4323,7 @@ mod dynamic_segmentation_tests {
             supports_ranges: true,
             etag: Some("\"v1\"".into()),
             last_modified: None,
+            is_webpage: false,
         };
         let part = partial_download_path(target);
         let metadata_path = partial_download_metadata_path(target);

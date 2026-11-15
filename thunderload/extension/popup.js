@@ -17,6 +17,22 @@ let sources = [];
 let selected = new Set();
 let truncated = false;
 
+// Fix 3: the ThunderLoad app / native host is required for Direct
+// media. A googlevideo segment downloaded by the browser is one
+// audio/video chunk, not the video, so there is no silent browser
+// fallback any more: a missing permission or a disconnected host
+// surfaces this error instead, pointing at the desktop app's
+// one-time Browser setup (the setup steps themselves live in the
+// desktop app, not here).
+const NATIVE_NOT_CONNECTED_ERROR = "ThunderLoad app is not connected. Open the ThunderLoad desktop app and complete the one-time Browser setup, then try again.";
+function isNativeConnectionError(message) {
+  return /permission has not been granted|permission was not granted|disconnected|timed out|native messaging host not found/i.test(String(message || ""));
+}
+function nativeErrorMessage(error) {
+  const text = error?.message || String(error || "");
+  return isNativeConnectionError(text) ? NATIVE_NOT_CONNECTED_ERROR : text;
+}
+
 function showToast(text) {
   toast.textContent = text;
   toast.classList.add("show");
@@ -71,6 +87,10 @@ function render() {
     });
     const info = el("div", "source-info");
     info.append(el("div", "source-title", source.label || "Media source"), el("div", "kind", source.kind || "Media"));
+    // The DASH manifest card carries the full-video note from the
+    // background (ranked first); segment cards carry their
+    // Audio/Video + itag label instead of a blind "Direct media".
+    if (source.note) info.append(el("div", "source-note", source.note));
     head.append(check, info);
     card.append(head);
 
@@ -120,7 +140,7 @@ async function downloadSelected() {
     if (result?.ok) started += 1;
     else {
       if (!firstError) firstError = result?.error || "Could not start this download.";
-      if (result?.error === "Desktop engine permission was not granted.") promptAllowed = false;
+      if (result?.error === NATIVE_NOT_CONNECTED_ERROR) promptAllowed = false;
     }
   }
   // Restore only the buttons the freeze itself disabled (S1): a
@@ -138,22 +158,26 @@ async function downloadSelected() {
 async function downloadOne(source, askPermission = true) {
   // Single-item download core, shared by the per-card button and the
   // grabber's "Download selected" batch loop. Returns a result instead
-  // of touching the UI, so the batch caller can summarize. The flow is
-  // unchanged from the old one-click path: inspect HLS/DASH and take
-  // the best downloadable quality, start direct files through the
-  // engine with a browser-download fallback. `askPermission` lets the
-  // batch loop prompt once and then stop asking after a denial (F7).
+  // of touching the UI, so the batch caller can summarize.
+  //
+  // Fix 3: no silent browser fallback for Direct media. Previously a
+  // missing nativeMessaging permission — or any native failure — fell
+  // through to BROWSER_DOWNLOAD, and a googlevideo segment downloaded
+  // that way is a single audio/video chunk (the audio-only bug), with
+  // no error shown. Now every kind goes through the ThunderLoad
+  // engine: requestNative() prompts for the optional nativeMessaging
+  // permission on demand (askPermission, the existing
+  // optional-permission pattern), and a missing permission, a denied
+  // prompt, or a disconnected/erroring host returns the clear
+  // "app not connected" error pointing at the desktop app's one-time
+  // Browser setup. There is no explicit "Download in browser" action
+  // in the popup, so no browser-download path remains in this
+  // function. `askPermission` lets the batch loop prompt once and
+  // then stop asking after a denial (F7).
   try {
-    const permission = await api.permissions.contains({ permissions: ["nativeMessaging"] });
-    if (source.kind === "Direct media" && !permission) {
-      const filename = filenameFromUrl(source.url, "download.bin");
-      const result = await api.runtime.sendMessage({ type: "BROWSER_DOWNLOAD", url: source.url, filename });
-      if (!result?.ok) throw new Error(result?.error || "Could not start this download.");
-      return { ok: true, message: "Download started in your browser." };
-    }
     if (source.kind === "HLS playlist" || source.kind === "DASH manifest") {
       const inspected = await requestNative("video.inspect", { url: source.url, referer: pageUrl }, askPermission);
-      if (!inspected?.ok) throw new Error(inspected?.error || "Could not inspect this media source.");
+      if (!inspected?.ok) throw new Error(nativeErrorMessage(inspected?.error || "Could not inspect this media source."));
       const variants = (inspected.data?.variants || []).filter((item) => item?.downloadable && item?.url);
       variants.sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bandwidth || 0) - (a.bandwidth || 0));
       const selected = variants[0];
@@ -164,17 +188,9 @@ async function downloadOne(source, askPermission = true) {
     const filename = filenameFromUrl(source.url, "download.bin");
     const result = await requestNative("download.start", { url: source.url, filename, referer: pageUrl }, askPermission);
     if (result?.ok) return { ok: true, message: "Download started in ThunderLoad." };
-    const fallback = await api.runtime.sendMessage({ type: "BROWSER_DOWNLOAD", url: source.url, filename });
-    if (fallback?.ok) return { ok: true, message: "Download started in your browser." };
-    throw new Error(result?.error || fallback?.error || "Could not start this download.");
+    throw new Error(nativeErrorMessage(result?.error || "Could not start this download."));
   } catch (error) {
-    if (source.kind === "Direct media") {
-      try {
-        const fallback = await api.runtime.sendMessage({ type: "BROWSER_DOWNLOAD", url: source.url, filename: filenameFromUrl(source.url, "download.bin") });
-        if (fallback?.ok) return { ok: true, message: "Download started in your browser." };
-      } catch (_) { /* Report the original issue below. */ }
-    }
-    return { ok: false, error: error?.message || String(error) };
+    return { ok: false, error: nativeErrorMessage(error) };
   }
 }
 async function quickDownload(source, card, button) {
@@ -195,7 +211,7 @@ async function startVariant(variant, source, action, askPermission = false) {
     representationId: variant.representationId,
     audioRepresentationId: variant.audioRepresentationId || ""
   }, askPermission);
-  if (!result?.ok) throw new Error(result?.error || "Could not start the selected quality.");
+  if (!result?.ok) throw new Error(nativeErrorMessage(result?.error || "Could not start the selected quality."));
   return { ok: true, message: "Downloading " + (variant.quality || "media") + " in ThunderLoad." };
 }
 async function inspectSource(source, card, button) {
@@ -203,7 +219,7 @@ async function inspectSource(source, card, button) {
   button.textContent = "Checking…";
   try {
     const result = await requestNative("video.inspect", { url: source.url, referer: pageUrl }, true);
-    if (!result?.ok) throw new Error(result?.error || "Install the ThunderLoad desktop companion to inspect quality options.");
+    if (!result?.ok) throw new Error(nativeErrorMessage(result?.error || "Install the ThunderLoad desktop companion to inspect quality options."));
     const qualityList = el("div", "quality-list");
     const variants = result.data?.variants || [];
     variants.forEach((variant) => {
@@ -237,7 +253,7 @@ async function inspectSource(source, card, button) {
     card.append(qualityList);
     button.textContent = "Hide qualities";
   } catch (error) {
-    showToast(error?.message || String(error));
+    showToast(nativeErrorMessage(error));
     button.textContent = "Other qualities";
   } finally { button.disabled = false; }
 }

@@ -38,6 +38,15 @@ cargo test -p thunderload-engine
 cargo run --release -p thunderload-engine --bin bench
 ```
 
+### One-time browser setup
+
+Browser downloads need one manual setup per browser — after that, ThunderLoad re-registers the connection automatically on later startups if it ever goes missing:
+
+1. Install the desktop app and the browser extension (in the app: Settings → Browser extension files).
+2. Copy the extension ID: open `chrome://extensions` (`edge://extensions`, `brave://extensions`), turn Developer mode on — the ID is shown under the ThunderLoad extension. Firefox uses the fixed ID `thunderload@example.com`.
+3. In the app, open Settings → Browser connection, paste the ID and click Connect browser, then restart the browser and allow Native messaging when prompted.
+4. Done — direct file downloads never need this setup.
+
 <!-- Screenshots: pending real screenshots from Hamza's machine (docs/screenshots/desktop-queue.png, extension-popup.png, demo.gif). No AI-generated imagery — add the section back once the files exist. -->
 
 ## Features
