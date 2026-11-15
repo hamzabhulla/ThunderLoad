@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use crate::session::{apply_session, SessionHeaders};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::{path::{Path, PathBuf}, sync::{atomic::{AtomicU64, AtomicUsize, Ordering}, Arc}};
+use std::{path::{Path, PathBuf}, sync::{atomic::{AtomicU64, AtomicUsize, Ordering}, Arc}, time::Duration};
 use tokio::{fs, io::AsyncWriteExt, process::Command as TokioCommand, sync::{mpsc, watch}};
 use quick_xml::{events::Event, Reader};
 use futures_util::StreamExt;
@@ -1736,8 +1736,22 @@ async fn read_hls_checkpoint(path: &Path) -> Option<HlsJobState> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Windows routinely holds a freshly written file open for a moment
+/// (Defender/AV scan, just-closed handle), so a single remove_dir_all
+/// can fail with a sharing violation right after a download stops.
+/// Retry briefly instead of silently leaving partial files behind.
+async fn remove_dir_all_retry(path: &Path) {
+    for attempt in 0..5 {
+        match fs::remove_dir_all(path).await {
+            Ok(()) => return,
+            Err(_) if attempt < 4 => tokio::time::sleep(Duration::from_millis(50)).await,
+            Err(_) => return,
+        }
+    }
+}
+
 async fn remove_hls_resume_files(target: &Path) {
-    let _ = fs::remove_dir_all(hls_work_dir(target)).await;
+    remove_dir_all_retry(&hls_work_dir(target)).await;
     let _ = fs::remove_file(hls_metadata_path(target)).await;
     let _ = fs::remove_file(target).await;
 }
@@ -2148,7 +2162,7 @@ pub async fn download_hls_resumable(
     let _ = fs::remove_file(target).await;
     fs::rename(&final_file, target).await
         .with_context(|| format!("Could not move the assembled HLS file to {}", target.display()))?;
-    let _ = fs::remove_dir_all(&work_dir).await;
+    remove_dir_all_retry(&work_dir).await;
     let _ = fs::remove_file(&meta_path).await;
     let _ = progress_tx.send(DownloadProgress {
         downloaded: downloaded_bytes.load(Ordering::Relaxed), total: None,
@@ -2757,7 +2771,7 @@ pub fn dash_work_dir(target: &Path) -> PathBuf {
 }
 
 async fn remove_dash_resume_files(target: &Path) {
-    let _ = fs::remove_dir_all(dash_work_dir(target)).await;
+    remove_dir_all_retry(&dash_work_dir(target)).await;
     let _ = fs::remove_file(partial_download_metadata_path(target)).await;
     let _ = fs::remove_file(target).await;
 }
@@ -3167,7 +3181,7 @@ async fn download_dash_resumable_with_plan(
     let _ = fs::remove_file(target).await;
     fs::rename(&output_file, target).await
         .with_context(|| format!("Could not move the assembled DASH file to {}", target.display()))?;
-    let _ = fs::remove_dir_all(&work_dir).await;
+    remove_dir_all_retry(&work_dir).await;
     let _ = fs::remove_file(&meta_path).await;
     let _ = progress_tx.send(DownloadProgress {
         downloaded: downloaded_bytes.load(Ordering::Relaxed),
