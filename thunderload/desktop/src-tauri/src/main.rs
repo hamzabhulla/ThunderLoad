@@ -895,6 +895,117 @@ fn native_host_manifest_matches(
         .map_or(false, |host| Path::new(host).is_file())
 }
 
+/// Content hash of the bundled native-host binary (FNV-1a, 64-bit).
+/// The installed copy is named after its content — `thunderload-host-<hash>.exe`
+/// — so re-installing the same binary never rewrites its file, and a new
+/// binary never overwrites the file a running host executes from.
+///
+/// A tiny hand-rolled hash is deliberate: the desktop crate has no hash
+/// dependency, and this value is only a filename discriminator (the
+/// byte-for-byte comparison in `install_native_host_binary` is the real
+/// identity check). `DefaultHasher` must NOT be used here: it is randomly
+/// seeded, so the filename would change on every launch.
+fn native_host_content_hash(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Installed file name for one host binary version.
+fn native_host_binary_name(hash: &str, windows: bool) -> String {
+    if windows {
+        format!("thunderload-host-{hash}.exe")
+    } else {
+        format!("thunderload-host-{hash}")
+    }
+}
+
+/// Display name for the browser in user-facing messages.
+fn native_browser_display_name(browser: &str) -> &str {
+    match browser {
+        "chrome" => "Google Chrome",
+        "chromium" => "Chromium",
+        "edge" => "Microsoft Edge",
+        "brave" => "Brave",
+        "firefox" => "Firefox",
+        _ => browser,
+    }
+}
+
+/// The one user-facing message for a locked host file, or `None` when the
+/// raw OS error is not a sharing violation. Pure (takes the raw code, not
+/// the `io::Error`) so it is unit-testable on any platform: Windows reports
+/// a locked executable as raw OS error 32 (`ERROR_SHARING_VIOLATION`);
+/// the raw code is logged by the caller and never shown to the user.
+fn native_host_locked_message(raw_os_error: Option<i32>, browser: &str) -> Option<String> {
+    if raw_os_error != Some(32) {
+        return None;
+    }
+    Some(format!(
+        "The native host is still running. Close {} completely and try again.",
+        native_browser_display_name(browser)
+    ))
+}
+
+/// Maps an install failure to the message the user sees. A sharing
+/// violation becomes an action ("close the browser and retry"); anything
+/// else keeps the existing "Could not install native host: …" wording.
+/// The raw error is also logged so the exact OS failure is not lost.
+fn describe_host_install_error(error: &std::io::Error, browser: &str) -> String {
+    eprintln!("[ThunderLoad] native host install failed: {error}");
+    native_host_locked_message(error.raw_os_error(), browser)
+        .unwrap_or_else(|| format!("Could not install native host: {error}"))
+}
+
+/// Installs the bundled native-host binary into `install_dir` and returns
+/// the path the browser manifest must point at.
+///
+/// Windows locks a running executable's file against writes, so the old
+/// code — `fs::copy` over a fixed `thunderload-host.exe` — failed with
+/// "The process cannot access the file because it is being used by another
+/// process. (os error 32)" whenever Chrome already had the host running
+/// (the extension holds a persistent `connectNative` port, so the host
+/// runs for as long as the browser is open). Re-registering the same
+/// version therefore failed even though nothing needed to change.
+///
+/// This installs content-addressed instead:
+/// - identical bytes already installed → no write at all, no lock failure;
+/// - different bytes → a new `thunderload-host-<hash>` file, so the file a
+///   running host executes from is never overwritten (killing the host is
+///   deliberately avoided: it is the download engine for browser jobs,
+///   and killing it mid-download would abort in-flight downloads; Chrome
+///   spawns a fresh host on the extension's next connect anyway).
+///
+/// Stale installs are deliberately left in place, never deleted: another
+/// browser's manifest may still point at an older version (each browser
+/// re-registers on its own schedule), and deleting its file would break
+/// that browser until the next app start. An orphaned install is inert —
+/// one ~2.5 MB file per host-binary change — and the manifest is the only
+/// thing that decides which one runs.
+fn install_native_host_binary(
+    source: &Path,
+    install_dir: &Path,
+    browser: &str,
+) -> Result<PathBuf, String> {
+    let bytes = std::fs::read(source)
+        .map_err(|error| format!("Could not read native host binary: {error}"))?;
+    std::fs::create_dir_all(install_dir).map_err(|error| error.to_string())?;
+    let dest = install_dir.join(native_host_binary_name(
+        &native_host_content_hash(&bytes),
+        cfg!(target_os = "windows"),
+    ));
+    if let Ok(installed) = std::fs::read(&dest) {
+        if installed == bytes {
+            return Ok(dest);
+        }
+    }
+    std::fs::write(&dest, &bytes).map_err(|error| describe_host_install_error(&error, browser))?;
+    Ok(dest)
+}
+
 #[tauri::command]
 async fn register_native_host(
     browser: String,
@@ -918,9 +1029,7 @@ async fn register_native_host(
         let local_app_data = std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from).ok_or_else(|| "LOCALAPPDATA is not available.".to_string())?;
         let install_dir = local_app_data.join("ThunderLoad").join("native-host");
-        std::fs::create_dir_all(&install_dir).map_err(|error| error.to_string())?;
-        let host_path = install_dir.join("thunderload-host.exe");
-        std::fs::copy(&source, &host_path).map_err(|error| format!("Could not install native host: {error}"))?;
+        let host_path = install_native_host_binary(&source, &install_dir, &browser)?;
         let manifest = native_host_manifest(family, extension_id, &host_path);
         let manifest_path = install_dir.join(format!("{browser}-native-host.json"));
         let bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?;
@@ -962,10 +1071,7 @@ async fn register_native_host(
             .app_data_dir()
             .map_err(|error| error.to_string())?
             .join("native-host");
-        std::fs::create_dir_all(&install_dir).map_err(|error| error.to_string())?;
-        let host_path = install_dir.join("thunderload-host");
-        std::fs::copy(&source, &host_path)
-            .map_err(|error| format!("Could not install native host: {error}"))?;
+        let host_path = install_native_host_binary(&source, &install_dir, &browser)?;
         std::fs::set_permissions(&host_path, std::fs::Permissions::from_mode(0o755))
             .map_err(|error| error.to_string())?;
         let manifest = native_host_manifest(family, extension_id, &host_path);
@@ -1794,8 +1900,10 @@ mod scheduler_tests {
 #[cfg(test)]
 mod native_host_tests {
     use super::{
-        native_browser_family, native_host_manifest, native_host_manifest_matches,
-        validate_native_extension_id, NativeBrowserFamily,
+        describe_host_install_error, install_native_host_binary, native_browser_family,
+        native_host_binary_name, native_host_content_hash, native_host_locked_message,
+        native_host_manifest, native_host_manifest_matches, validate_native_extension_id,
+        NativeBrowserFamily,
     };
     use std::path::Path;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1920,6 +2028,143 @@ mod native_host_tests {
             NativeBrowserFamily::Chromium,
             "abcdefghijklmnopabcdefghijklmnop"
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn host_content_hash_is_deterministic_and_content_sensitive() {
+        assert_eq!(
+            native_host_content_hash(b"thunderload-host"),
+            native_host_content_hash(b"thunderload-host")
+        );
+        assert_ne!(
+            native_host_content_hash(b"thunderload-host"),
+            native_host_content_hash(b"thunderload-hosT")
+        );
+        // FNV-1a of empty input is the offset basis itself.
+        assert_eq!(native_host_content_hash(b""), "cbf29ce484222325");
+    }
+
+    #[test]
+    fn host_binary_name_keeps_the_windows_suffix() {
+        assert_eq!(
+            native_host_binary_name("0123456789abcdef", true),
+            "thunderload-host-0123456789abcdef.exe"
+        );
+        assert_eq!(
+            native_host_binary_name("0123456789abcdef", false),
+            "thunderload-host-0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn locked_file_message_names_the_browser_and_the_action() {
+        assert_eq!(
+            native_host_locked_message(Some(32), "chrome"),
+            Some(
+                "The native host is still running. Close Google Chrome completely and try again."
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            native_host_locked_message(Some(32), "firefox"),
+            Some(
+                "The native host is still running. Close Firefox completely and try again."
+                    .to_string()
+            )
+        );
+        // Any other OS error is not a sharing violation: no friendly message.
+        assert_eq!(native_host_locked_message(Some(2), "chrome"), None);
+        assert_eq!(native_host_locked_message(None, "chrome"), None);
+    }
+
+    #[test]
+    fn install_error_maps_os_error_32_to_the_close_browser_message() {
+        let locked = std::io::Error::from_raw_os_error(32);
+        assert_eq!(
+            describe_host_install_error(&locked, "chrome"),
+            "The native host is still running. Close Google Chrome completely and try again."
+        );
+        let other = std::io::Error::from_raw_os_error(2);
+        assert!(describe_host_install_error(&other, "chrome")
+            .starts_with("Could not install native host: "));
+    }
+
+    #[test]
+    fn install_skips_the_write_when_the_same_bytes_are_installed() {
+        // The property that fixes the reported bug: re-registering the
+        // same host version must not touch the installed file at all, so
+        // a running host's lock can never break it.
+        let dir = std::env::temp_dir().join("thunderload-native-host-install-skip-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.exe");
+        std::fs::write(&source, b"host-bytes-v1").unwrap();
+        let install_dir = dir.join("install");
+        let first = install_native_host_binary(&source, &install_dir, "chrome").unwrap();
+        let mtime = std::fs::metadata(&first).unwrap().modified().unwrap();
+        let second = install_native_host_binary(&source, &install_dir, "chrome").unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            std::fs::metadata(&second).unwrap().modified().unwrap(),
+            mtime,
+            "identical bytes must not rewrite the installed file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn install_versions_new_bytes_in_a_new_file() {
+        let dir = std::env::temp_dir().join("thunderload-native-host-install-version-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.exe");
+        std::fs::write(&source, b"host-bytes-v1").unwrap();
+        let install_dir = dir.join("install");
+        let first = install_native_host_binary(&source, &install_dir, "chrome").unwrap();
+        assert_eq!(std::fs::read(&first).unwrap(), b"host-bytes-v1");
+        // A different binary lands in a different file; the old file is
+        // never overwritten — and never deleted either: another browser's
+        // manifest may still point at it, so it stays usable until that
+        // browser re-registers.
+        std::fs::write(&source, b"host-bytes-v2").unwrap();
+        let second = install_native_host_binary(&source, &install_dir, "chrome").unwrap();
+        assert_ne!(second, first);
+        assert_eq!(std::fs::read(&second).unwrap(), b"host-bytes-v2");
+        assert_eq!(
+            std::fs::read(&first).unwrap(),
+            b"host-bytes-v1",
+            "the old install is left alone, bytes intact"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn install_leaves_the_legacy_unversioned_file_alone() {
+        // v0.3.0/v0.3.1 installed a fixed `thunderload-host[.exe]`; the
+        // versioned install supersedes it but must not delete it — a
+        // manifest written by those versions still points at it, and
+        // deleting it would break that browser until it re-registers.
+        let dir = std::env::temp_dir().join("thunderload-native-host-install-legacy-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.exe");
+        std::fs::write(&source, b"host-bytes-v1").unwrap();
+        let install_dir = dir.join("install");
+        std::fs::create_dir_all(&install_dir).unwrap();
+        let legacy = install_dir.join(if cfg!(target_os = "windows") {
+            "thunderload-host.exe"
+        } else {
+            "thunderload-host"
+        });
+        std::fs::write(&legacy, b"legacy-host").unwrap();
+        let installed = install_native_host_binary(&source, &install_dir, "chrome").unwrap();
+        assert_ne!(installed, legacy);
+        assert_eq!(
+            std::fs::read(&legacy).unwrap(),
+            b"legacy-host",
+            "the legacy install is left alone, bytes intact"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
