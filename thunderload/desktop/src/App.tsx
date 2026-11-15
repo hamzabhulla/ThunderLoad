@@ -3,14 +3,16 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
 
-type Page = "downloads" | "queue" | "video" | "settings";
+type Page = "downloads" | "queues" | "scheduler" | "settings";
+type StatusTab = "all" | "active" | "completed" | "failed";
+type InspectorTab = "overview" | "files" | "segments" | "activity";
 type Kind = "direct" | "hls" | "dash";
 type Status = "Queued" | "Downloading" | "Pausing" | "Paused" | "Cancelling" | "Completed" | "Failed" | "Interrupted" | "Cancelled";
 type Variant = { kind: string; quality: string; width?: number; height?: number; bandwidth?: number; url: string; downloadable: boolean; note?: string; representationId?: string; audioRepresentationId?: string; audioOnly?: boolean };
 type GrabItem = { url: string; kind: string; name: string };
 type GrabResult = { items: GrabItem[]; truncated: boolean };
 type Progress = { downloaded: number; total?: number; percent?: number; phase: string };
-type Item = { id: string; name: string; url: string; kind: Kind; status: Status; percent: number; downloaded: number; total?: number; detail: string; error?: string; createdAt: number; targetPath?: string; scheduledAt?: number; source?: "native"; representationId?: string; audioRepresentationId?: string };
+type Item = { id: string; name: string; url: string; kind: Kind; status: Status; percent: number; downloaded: number; total?: number; detail: string; error?: string; createdAt: number; targetPath?: string; scheduledAt?: number; source?: "native"; representationId?: string; audioRepresentationId?: string; segmentsDone?: number; segmentsTotal?: number };
 type StoredJob = { id: string; name: string; url: string; kind: string; origin: string; state: string; downloaded: number; total?: number; percent?: number; segmentsDone?: number; segmentsTotal?: number; targetPath?: string; checkpointPath?: string; representationId?: string; audioRepresentationId?: string; scheduledAtMs?: number; detail: string; error?: string; createdAtMs: number; updatedAtMs: number };
 
 const HISTORY_KEY = "thunderload.history.v2";
@@ -49,13 +51,13 @@ function readItems(): Item[] {
   try {
     const saved = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
     if (!Array.isArray(saved)) return [];
-    return saved.map((item: Item) => item.source === "native"
+    return saved.map((item: Item) => forgetStaleSchedule(item.source === "native"
       ? item
       : item.status === "Downloading" || item.status === "Pausing"
         ? item.targetPath
           ? { ...item, status: "Queued", detail: "Recovering saved partial download…" }
           : { ...item, status: "Interrupted", detail: "App closed before a resumable checkpoint was created" }
-        : item);
+        : item));
   } catch { return []; }
 }
 function readSetting(key: string, fallback: number, allowed: number[]): number {
@@ -81,7 +83,8 @@ function storedJobToItem(row: StoredJob): Item {
     downloaded: row.downloaded, total: row.total, detail: row.detail || "",
     error: row.error, createdAt: row.createdAtMs, targetPath: row.targetPath,
     scheduledAt: row.scheduledAtMs, representationId: row.representationId,
-    audioRepresentationId: row.audioRepresentationId
+    audioRepresentationId: row.audioRepresentationId,
+    segmentsDone: row.segmentsDone, segmentsTotal: row.segmentsTotal
   };
 }
 function itemToSyncJob(item: Item) {
@@ -97,14 +100,62 @@ function itemToSyncJob(item: Item) {
 function pageInfo(page: Page) {
   const values = {
     downloads: ["Downloads", "A clear view of what is moving and what is finished."],
-    queue: ["Queue", "Transfers waiting, running, or needing attention."],
-    video: ["Video grabber", "Inspect one media URL, or grab every media file from one page."],
+    queues: ["Queues", "Transfers waiting, running, or needing attention."],
+    scheduler: ["Scheduler", "Downloads waiting for their start time."],
     settings: ["Settings", "A few useful controls. No decorative switches."]
   };
   return values[page];
 }
 function Status({ value }: { value: Status }) {
   return <span className={"status status-" + value.toLowerCase()}><i />{value}</span>;
+}
+
+// Statuses for which Cancel is offered — the same set the row actions
+// use, so the Scheduler page can never offer a Cancel the backend
+// silently ignores (a completed job has no live task to cancel).
+const CANCELLABLE_STATUSES: Status[] = ["Downloading", "Pausing", "Paused", "Failed", "Interrupted", "Queued"];
+function canCancel(item: Item): boolean {
+  return CANCELLABLE_STATUSES.includes(item.status);
+}
+// The row × button never shows while a transfer is live or
+// cancelling; browser jobs additionally need a state the companion can
+// dismiss. Mirrors the old inline condition exactly.
+function canRemove(item: Item): boolean {
+  if (item.status === "Downloading" || item.status === "Pausing" || item.status === "Cancelling") return false;
+  return item.source !== "native" || ["Completed", "Cancelled", "Failed", "Interrupted", "Paused"].includes(item.status);
+}
+
+// File-type classification for the Downloads filter chips (IDM
+// categories), derived from the filename extension — the transfer
+// kind (direct/hls/dash) says how it downloads, this says what it is.
+type FileType = "video" | "music" | "documents" | "compressed" | "programs" | "other";
+type KindFilter = "all" | "video" | "music" | "documents" | "compressed" | "programs" | "other";
+function fileTypeOf(item: Item): FileType {
+  const ext = item.name.split(".").pop()?.toLowerCase() || "";
+  if (["mp4", "webm", "mkv", "mov", "avi", "m4v", "m3u8", "mpd", "ts"].includes(ext)) return "video";
+  if (["mp3", "wav", "flac", "ogg", "oga", "m4a", "opus", "aac"].includes(ext)) return "music";
+  if (["pdf", "doc", "docx", "txt", "epub", "md", "xls", "xlsx", "ppt", "pptx", "csv", "rtf"].includes(ext)) return "documents";
+  if (["zip", "rar", "7z", "tar", "gz", "bz2", "xz"].includes(ext)) return "compressed";
+  if (["exe", "msi", "dmg", "pkg", "apk", "appimage", "deb", "rpm"].includes(ext)) return "programs";
+  return "other";
+}
+
+// A schedule only means something while the job has not started yet: a
+// job with a checkpoint (targetPath) or any status other than Queued
+// already fired its schedule, so a stale scheduledAt — written before
+// this fix — must not bring it back onto the Scheduler page.
+function forgetStaleSchedule(item: Item): Item {
+  if (item.scheduledAt === undefined) return item;
+  if (item.status === "Queued" && !item.targetPath) return item;
+  return { ...item, scheduledAt: undefined };
+}
+
+// True when keyboard focus sits in an editable field: global shortcuts
+// (Ctrl/Cmd+N, Delete, P) must not fire while the user is typing.
+function isTypingTarget(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null;
+  if (!el || typeof el.tagName !== "string") return false;
+  return el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT" || el.isContentEditable;
 }
 
 export default function App() {
@@ -145,16 +196,107 @@ export default function App() {
   const [ffmpegPath, setFfmpegPath] = useState("ffmpeg");
   const [ffmpegStatus, setFfmpegStatus] = useState("");
   const [ffmpegSaving, setFfmpegSaving] = useState(false);
+  // Direction A ("The Task List") layout state: the status tab + search
+  // filter the Downloads table; a row click opens the right inspector;
+  // the Add form and the video grabber live in dialogs, not pages.
+  const [statusTab, setStatusTab] = useState<StatusTab>("all");
+  const [search, setSearch] = useState("");
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [inspectorTab, setInspectorTab] = useState<InspectorTab>("overview");
+  const [addOpen, setAddOpen] = useState(false);
+  const [grabberOpen, setGrabberOpen] = useState(false);
+  const [kindFilter, setKindFilter] = useState<KindFilter>("all");
+  const [showKind, setShowKind] = useState(false);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; id: string } | null>(null);
   // Mirror of the job list for one-shot startup effects (the durable
   // store seed below needs the current list without re-running).
   const itemsRef = useRef(items);
   useEffect(() => { itemsRef.current = items; }, [items]);
+  // Motrix speed rule, computed from progress events: each
+  // download-progress event records bytes + time; the table derives a
+  // live rate from the last two samples. A rate of exactly 0 shows
+  // "0 B/s"; a stale or missing sample shows muted "–"; anything that
+  // is not actively downloading shows a blank cell. `rate: null` means
+  // only one sample exists so far — the rate is still unknown.
+  const speedSamples = useRef(new Map<string, { downloaded: number; at: number; rate: number | null }>());
+
+  // Live transfer rate for one job: a number when a fresh rate is
+  // known, null when the rate is unknown, undefined when the cell does
+  // not apply (the job is not downloading).
+  function jobSpeed(item: Item): number | null | undefined {
+    if (item.status !== "Downloading") return undefined;
+    const sample = speedSamples.current.get(item.id);
+    if (!sample || sample.rate === null || clock - sample.at > 2500) return null;
+    return sample.rate;
+  }
+  function speedCell(item: Item): string {
+    const speed = jobSpeed(item);
+    if (speed === undefined) return "";
+    if (speed === null) return "–";
+    return speed === 0 ? "0 B/s" : bytes(speed) + "/s";
+  }
+  function etaText(seconds: number): string {
+    if (!Number.isFinite(seconds) || seconds < 0) return "–";
+    if (seconds < 60) return Math.ceil(seconds) + " s";
+    if (seconds < 3600) return Math.ceil(seconds / 60) + " min";
+    return Math.floor(seconds / 3600) + " h " + Math.ceil(seconds % 3600 / 60) + " min";
+  }
+  function etaCell(item: Item): string {
+    if (item.status !== "Downloading") return "";
+    const speed = jobSpeed(item);
+    if (speed === null || speed === undefined || speed <= 0 || !item.total) return "–";
+    return etaText(Math.max(0, item.total - item.downloaded) / speed);
+  }
+  // Closed status vocabulary for the tabs: terminal-but-cancelled jobs
+  // sit with Completed, Failed/Interrupted sit with Failed, everything
+  // else is Active — so no job is hidden from every tab.
+  function tabOf(item: Item): "active" | "completed" | "failed" {
+    if (item.status === "Completed" || item.status === "Cancelled") return "completed";
+    if (item.status === "Failed" || item.status === "Interrupted") return "failed";
+    return "active";
+  }
 
   const active = items.filter((item) => item.status === "Downloading" || item.status === "Pausing" || item.status === "Cancelling").length;
   const queued = items.filter((item) => item.status === "Queued").length;
   const done = items.filter((item) => item.status === "Completed").length;
   const attention = items.filter((item) => item.status === "Failed" || item.status === "Interrupted").length;
   const ordered = useMemo(() => items.slice().sort((a, b) => b.createdAt - a.createdAt), [items]);
+  // Direction A filtered views, derived from the same ordered list.
+  const tabCounts = useMemo(() => ({
+    all: ordered.length,
+    active: ordered.filter((item) => tabOf(item) === "active").length,
+    completed: ordered.filter((item) => tabOf(item) === "completed").length,
+    failed: ordered.filter((item) => tabOf(item) === "failed").length
+  }), [ordered]);
+  const searched = useMemo(() => {
+    const query = search.trim().toLowerCase();
+    if (!query) return ordered;
+    return ordered.filter((item) => (item.name + " " + item.url).toLowerCase().includes(query));
+  }, [ordered, search]);
+  const tabbed = useMemo(() => statusTab === "all" ? searched : searched.filter((item) => tabOf(item) === statusTab), [searched, statusTab]);
+  const kindFiltered = useMemo(() => kindFilter === "all" ? tabbed : tabbed.filter((item) => fileTypeOf(item) === kindFilter), [tabbed, kindFilter]);
+  const kindCounts = useMemo(() => {
+    const counts: Record<KindFilter, number> = { all: tabbed.length, video: 0, music: 0, documents: 0, compressed: 0, programs: 0, other: 0 };
+    for (const item of tabbed) {
+      const type = fileTypeOf(item);
+      counts[type] += 1;
+    }
+    return counts;
+  }, [tabbed]);
+  // The Queues page promises "waiting, running, or needing attention":
+  // Failed/Interrupted jobs belong here too, with their Retry action.
+  const queueItems = useMemo(() => ordered.filter((item) => tabOf(item) === "active" || tabOf(item) === "failed"), [ordered]);
+  const scheduledItems = useMemo(() => ordered.filter((item) => item.scheduledAt !== undefined).sort((a, b) => (a.scheduledAt || 0) - (b.scheduledAt || 0)), [ordered]);
+  const aggregateSpeed = items.reduce((sum, item) => {
+    const speed = jobSpeed(item);
+    return sum + (typeof speed === "number" ? speed : 0);
+  }, 0);
+  // Motrix rule for the aggregate too: a real 0 is "0 B/s", but when
+  // downloads are running and no rate is known yet the bar shows "–",
+  // matching the per-row cells instead of claiming 0 B/s.
+  const downloadingCount = items.filter((item) => item.status === "Downloading").length;
+  const hasKnownRate = items.some((item) => typeof jobSpeed(item) === "number");
+  const aggregateLabel = downloadingCount > 0 && !hasKnownRate ? "–" : aggregateSpeed === 0 ? "0 B/s" : bytes(aggregateSpeed) + "/s";
   const [title, subtitle] = pageInfo(page);
 
   useEffect(() => { localStorage.setItem(HISTORY_KEY, JSON.stringify(items)); }, [items]);
@@ -168,6 +310,42 @@ export default function App() {
     const timer = window.setInterval(() => setClock(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, []);
+  // Direction A shortcuts: Ctrl/Cmd+N opens Add (never while typing);
+  // Escape closes the topmost layer (context menu, dialog, inspector);
+  // Delete removes and P pauses/resumes the selected row.
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "n") {
+        if (isTypingTarget(event.target)) return;
+        event.preventDefault();
+        // A dialog must never open under an open context menu: dismiss
+        // the menu first (it is the only dialog opener reachable while
+        // the menu is up — buttons sit behind the menu overlay).
+        setContextMenu(null);
+        setAddOpen(true);
+      } else if (event.key === "Escape") {
+        if (contextMenu) setContextMenu(null);
+        else if (grabberOpen) setGrabberOpen(false);
+        else if (addOpen) setAddOpen(false);
+        else setSelectedId(null);
+      } else if (!addOpen && !grabberOpen && !contextMenu && selectedId && !isTypingTarget(event.target) && !event.ctrlKey && !event.metaKey && !event.altKey) {
+        const item = items.find((entry) => entry.id === selectedId);
+        if (!item) return;
+        if (event.key === "Delete" || event.key === "Backspace") {
+          event.preventDefault();
+          // Same gate as the row × button and context-menu Remove: a
+          // live transfer must not be killed (and its partial file
+          // deleted) from the keyboard.
+          if (canRemove(item)) void remove(selectedId);
+        } else if (event.key.toLowerCase() === "p") {
+          if (item.status === "Downloading") void pause(item);
+          else if (item.status === "Paused") void resume(item);
+        }
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [addOpen, grabberOpen, selectedId, items, contextMenu]);
 
   // Slice 5: seed the queue from the durable job database on startup,
   // then send the merged desktop list back so jobs the store does not
@@ -182,7 +360,10 @@ export default function App() {
       const stored = rows.filter((row) => row.origin !== "native").map(storedJobToItem);
       const byId = new Map(itemsRef.current.map((item) => [item.id, item]));
       for (const item of stored) byId.set(item.id, item);
-      const merged = Array.from(byId.values()).sort((a, b) => b.createdAt - a.createdAt);
+      // Drop stale schedules from stored rows too (a started/completed
+      // job whose row still carries its old start time), or the next
+      // startup would put it back on the Scheduler page.
+      const merged = Array.from(byId.values()).sort((a, b) => b.createdAt - a.createdAt).map(forgetStaleSchedule);
       setItems(merged);
       const desktop = merged.filter((item) => item.source !== "native");
       if (desktop.length) void invoke("sync_jobs", { jobs: desktop.map(itemToSyncJob) }).catch(() => {});
@@ -272,6 +453,18 @@ export default function App() {
     (async () => {
       const listeners = await Promise.all([
         listen<{ jobId: string; progress: Progress }>("download-progress", ({ payload }) => {
+          // Record a speed sample for the Motrix rule: the rate comes
+          // from the bytes moved since the previous event, never from
+          // a single absolute value.
+          const now = Date.now();
+          const prev = speedSamples.current.get(payload.jobId);
+          if (prev) {
+            const dt = (now - prev.at) / 1000;
+            const rate = dt > 0 ? Math.max(0, (payload.progress.downloaded - prev.downloaded) / dt) : prev.rate;
+            speedSamples.current.set(payload.jobId, { downloaded: payload.progress.downloaded, at: now, rate });
+          } else {
+            speedSamples.current.set(payload.jobId, { downloaded: payload.progress.downloaded, at: now, rate: null });
+          }
           setItems((current) => current.map((item) => item.id !== payload.jobId ? item : {
             ...item,
             downloaded: payload.progress.downloaded,
@@ -283,8 +476,11 @@ export default function App() {
           }));
         }),
         listen<{ jobId: string; path: string }>("download-complete", ({ payload }) => {
+          // Terminal state: the rate sample is done, and a schedule
+          // that fired long ago must not linger on the Scheduler page.
+          speedSamples.current.delete(payload.jobId);
           setItems((current) => current.map((item) => item.id === payload.jobId
-            ? { ...item, status: "Completed", percent: 100, detail: "Saved · " + payload.path, error: undefined }
+            ? { ...item, status: "Completed", percent: 100, detail: "Saved · " + payload.path, error: undefined, scheduledAt: undefined }
             : item));
           setNotice("Download completed.");
         }),
@@ -294,13 +490,15 @@ export default function App() {
             : item));
         }),
         listen<{ jobId: string }>("download-cancelled", ({ payload }) => {
+          speedSamples.current.delete(payload.jobId);
           setItems((current) => current.map((item) => item.id === payload.jobId
-            ? { ...item, status: "Cancelled", detail: "Cancelled · partial file removed", targetPath: undefined, downloaded: 0, percent: 0 }
+            ? { ...item, status: "Cancelled", detail: "Cancelled · partial file removed", targetPath: undefined, downloaded: 0, percent: 0, scheduledAt: undefined }
             : item));
         }),
 listen<{ jobId: string; error: string; targetPath?: string }>("download-error", ({ payload }) => {
+          speedSamples.current.delete(payload.jobId);
           setItems((current) => current.map((item) => item.id === payload.jobId
-            ? { ...item, status: "Failed", detail: "Transfer interrupted · partial data kept", targetPath: payload.targetPath || item.targetPath, error: payload.error }
+            ? { ...item, status: "Failed", detail: "Transfer interrupted · partial data kept", targetPath: payload.targetPath || item.targetPath, error: payload.error, scheduledAt: undefined }
             : item));
           setNotice(payload.error);
         })
@@ -321,13 +519,19 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       try {
         if (item.scheduledAt) {
           void invoke("cancel_app_wake", { jobId: item.id }).catch(() => {});
+          // The schedule has fired: forget it so the job leaves the
+          // Scheduler page and badge now, and pass no schedule to the
+          // start call below — the backend records the value it is
+          // given in the durable row, and a stale one would bring the
+          // job back onto the Scheduler page after a restart.
+          setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, scheduledAt: undefined } : entry));
         }
         if (item.kind === "hls") {
           // Pass the paused/failed job's target back so the backend
           // reuses its on-disk checkpoint instead of reserving a fresh
           // target and restarting from scratch. The returned path is
           // stored so Cancel works while the job is running.
-          const targetPath = await invoke<string>("start_hls_download", { jobId: item.id, url: item.url, filename: item.name, targetPath: item.targetPath || null, scheduledAt: item.scheduledAt || null });
+          const targetPath = await invoke<string>("start_hls_download", { jobId: item.id, url: item.url, filename: item.name, targetPath: item.targetPath || null, scheduledAt: null });
           setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, targetPath } : entry));
         } else if (item.kind === "dash") {
           // Pass the paused/failed job's target back so the backend
@@ -337,12 +541,12 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           const targetPath = await invoke<string>("start_dash_download", {
             jobId: item.id, url: item.url, representationId: item.representationId,
             audioRepresentationId: item.audioRepresentationId || null, filename: item.name,
-            targetPath: item.targetPath || null, scheduledAt: item.scheduledAt || null
+            targetPath: item.targetPath || null, scheduledAt: null
           });
           setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, targetPath } : entry));
         } else {
           const targetPath = await invoke<string>("start_download", {
-            jobId: item.id, url: item.url, filename: item.name, targetPath: item.targetPath || null, connections, scheduledAt: item.scheduledAt || null
+            jobId: item.id, url: item.url, filename: item.name, targetPath: item.targetPath || null, connections, scheduledAt: null
           });
           setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, targetPath } : entry));
         }
@@ -467,6 +671,9 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
   async function cancel(item: Item) {
     if (item.scheduledAt) {
       await invoke("cancel_app_wake", { jobId: item.id }).catch(() => {});
+      // A cancelled schedule is no longer waiting: forget it so the job
+      // leaves the Scheduler page instead of lingering there as Cancelled.
+      setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, scheduledAt: undefined } : entry));
     }
     if (item.source === "native") {
       try {
@@ -537,6 +744,9 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     if (item?.source !== "native") {
       void invoke("remove_job", { jobId: id }).catch(() => {});
     }
+    // The job is gone: its rate sample must not linger and skew the
+    // status-bar aggregate.
+    speedSamples.current.delete(id);
     setItems((current) => current.filter((entry) => entry.id !== id || entry.status === "Downloading" || entry.status === "Pausing"));
   }
   function retry(item: Item) {
@@ -557,6 +767,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     // re-seeded from the database on the next startup.
     await Promise.all(finished.filter((item) => item.source !== "native")
       .map((item) => invoke("remove_job", { jobId: item.id }).catch(() => {})));
+    finished.forEach((item) => speedSamples.current.delete(item.id));
     setItems((current) => current.filter((item) => item.status !== "Completed" && item.status !== "Cancelled"));
   }
   async function inspect() {
@@ -681,86 +892,153 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     try { await invoke("open_download_folder"); }
     catch (error) { setNotice("Could not open download folder: " + String(error)); }
   }
-  function transferList(list: Item[]) {
-    if (!list.length) return <div className="empty-state"><span className="empty-icon">↓</span><strong>No transfers yet</strong><p>Add a direct file URL to begin. Your activity will appear here.</p></div>;
-    return <div className="transfer-list">{list.map((item) => <article className="transfer" key={item.id}>
-      <div className="file-type">{item.kind === "hls" ? "▶" : "↓"}</div>
-      <div className="transfer-body">
-        <div className="transfer-top"><strong title={item.name}>{item.name}</strong><Status value={item.status} /></div>
-        <div className="transfer-detail" title={item.url}>{item.detail}</div>
-        {(item.status === "Downloading" || item.status === "Pausing" || item.status === "Paused" || item.status === "Completed") && <div className="progress"><span style={{ width: item.percent + "%" }} /></div>}
-        {item.error && <div className="error-text">{item.error}</div>}
-      </div>
-      <div className="transfer-actions">
-        {item.status === "Downloading" && <button className="quiet-button transfer-control" onClick={() => void pause(item)}>Pause</button>}
-        {item.status === "Paused" && <button className="quiet-button transfer-control" onClick={() => resume(item)}>Resume</button>}
-        {(item.status === "Failed" || item.status === "Interrupted") && <button className="quiet-button transfer-control" onClick={() => retry(item)}>{item.targetPath ? "Resume" : "Retry"}</button>}
-        {(item.status === "Downloading" || item.status === "Pausing" || item.status === "Paused" || item.status === "Failed" || item.status === "Interrupted" || item.status === "Queued") && <button className="quiet-button transfer-control" onClick={() => void cancel(item)}>Cancel</button>}
-        {item.status !== "Downloading" && item.status !== "Pausing" && item.status !== "Cancelling" && (item.source !== "native" || item.status === "Completed" || item.status === "Cancelled" || item.status === "Failed" || item.status === "Interrupted" || item.status === "Paused") && <button className="remove-button" title="Remove" aria-label="Remove" onClick={() => void remove(item.id)}>×</button>}
-      </div>
-    </article>)}</div>;
+  // Sidebar navigation also closes the inspector (and any open context
+  // menu): details belong to the page they were opened from.
+  function goTo(next: Page) {
+    setPage(next);
+    setSelectedId(null);
+    setContextMenu(null);
   }
-
-  return <div className="app-shell">
-    <aside className="sidebar">
-      <div className="brand"><div className="brand-mark">↯</div><div><strong>ThunderLoad</strong><small>DOWNLOAD MANAGER</small></div></div>
-      <div className="nav-caption">WORKSPACE</div>
-      <nav>
-        <button title="Downloads" aria-label="Downloads" className={"nav-item " + (page === "downloads" ? "selected" : "")} onClick={() => setPage("downloads")}><span>↓</span>Downloads</button>
-        <button title="Queue" aria-label="Queue" className={"nav-item " + (page === "queue" ? "selected" : "")} onClick={() => setPage("queue")}><span>≡</span>Queue{queued > 0 && <em>{queued}</em>}</button>
-        <button title="Video grabber" aria-label="Video grabber" className={"nav-item " + (page === "video" ? "selected" : "")} onClick={() => setPage("video")}><span>▷</span>Video grabber</button>
-      </nav>
-      <div className="sidebar-bottom">
-        <div className="engine-line"><i />Local engine</div>
-        <button title="Settings" aria-label="Settings" className={"nav-item " + (page === "settings" ? "selected" : "")} onClick={() => setPage("settings")}><span>⚙</span>Settings</button>
-        <div className="version">ThunderLoad · 0.3.2</div>
+  // The per-row controls, unchanged from the old card layout: they
+  // appear on row hover (EagleGet pattern) and always in the inspector,
+  // so touch and keyboard users never lose them.
+  function actionButtons(item: Item) {
+    return <>
+      {item.status === "Downloading" && <button className="quiet-button transfer-control" onClick={(event) => { event.stopPropagation(); void pause(item); }}>Pause</button>}
+      {item.status === "Paused" && <button className="quiet-button transfer-control" onClick={(event) => { event.stopPropagation(); void resume(item); }}>Resume</button>}
+      {(item.status === "Failed" || item.status === "Interrupted") && <button className="quiet-button transfer-control" onClick={(event) => { event.stopPropagation(); void retry(item); }}>{item.targetPath ? "Resume" : "Retry"}</button>}
+      {canCancel(item) && <button className="quiet-button transfer-control" onClick={(event) => { event.stopPropagation(); void cancel(item); }}>Cancel</button>}
+      {canRemove(item) && <button className="remove-button" title="Remove" aria-label="Remove" onClick={(event) => { event.stopPropagation(); void remove(item.id); }}>×</button>}
+    </>;
+  }
+  // Direction A table: six data columns by default (Name · Progress ·
+  // Size · Speed · Time left · Status), plus an optional Transfer kind
+  // column behind the Columns toggle. A real <table>, not custom rows —
+  // numbers are tabular and right aligned, and a click selects the
+  // row for the inspector. Headers do not sort (no sort state exists).
+  function downloadTable(list: Item[], emptyTitle: string, emptyHint: string, showKindColumn = false) {
+    // One coloured primary per view: the empty state offers a ghost
+    // button, the page heading keeps the "+ Add" primary.
+    if (!list.length) return <div className="empty-state"><span className="empty-icon">↓</span><strong>{emptyTitle}</strong><p>{emptyHint}</p><button className="secondary-button" onClick={() => setAddOpen(true)}>＋ Add download</button></div>;
+    return <div className="table-scroll"><table className="dl-table">
+      <thead><tr><th className="col-name">Name</th><th className="col-progress">Progress</th><th className="col-num">Size</th><th className="col-num">Speed</th><th className="col-num">Time left</th>{showKindColumn && <th className="col-kind">Transfer kind</th>}<th className="col-status">Status</th></tr></thead>
+      <tbody>{list.map((item) => {
+        const speed = speedCell(item);
+        const eta = etaCell(item);
+        return <tr key={item.id} className={"dl-row" + (selectedId === item.id ? " selected" : "")} onClick={() => { setSelectedId(item.id); setInspectorTab("overview"); }} tabIndex={0} onContextMenu={(event) => { event.preventDefault(); setSelectedId(item.id); setInspectorTab("overview"); setContextMenu({ x: Math.min(event.clientX, window.innerWidth - 190), y: Math.min(event.clientY, window.innerHeight - 230), id: item.id }); }} onKeyDown={(event) => { if (event.target !== event.currentTarget) return; if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setSelectedId(item.id); setInspectorTab("overview"); } }}>
+          <td className="col-name"><span className="dl-name" title={item.name}>{item.name}</span><span className="dl-sub" title={item.url}>{hostOf(item.url) || item.kind}</span>{item.error && <span className="error-text">{item.error}</span>}</td>
+          <td className="col-progress"><div className="progress"><span style={{ width: item.percent + "%" }} /></div><span className="dl-percent">{item.percent}%</span></td>
+          <td className="col-num">{item.total ? bytes(item.total) : "–"}</td>
+          <td className={"col-num" + (speed === "–" ? " muted" : "")}>{speed}</td>
+          <td className={"col-num" + (eta === "–" ? " muted" : "")}>{eta}</td>
+          {showKindColumn && <td className="col-kind">{item.kind === "hls" ? "HLS" : item.kind === "dash" ? "DASH" : "Direct"}</td>}
+          <td className="col-status"><Status value={item.status} /><span className="row-actions">{actionButtons(item)}</span></td>
+        </tr>;
+      })}</tbody>
+    </table></div>;
+  }
+  // Row right-click menu: the same actions as the hover row controls,
+  // under the same conditions — Pause/Resume, Retry, Cancel, Remove.
+  function contextMenuPanel() {
+    if (!contextMenu) return null;
+    const item = items.find((entry) => entry.id === contextMenu.id);
+    if (!item) return null;
+    return <div className="context-overlay" onClick={() => setContextMenu(null)} onContextMenu={(event) => { event.preventDefault(); setContextMenu(null); }}>
+      <div className="context-menu" style={{ left: contextMenu.x, top: contextMenu.y }} role="menu" onClick={(event) => event.stopPropagation()}>
+        {item.status === "Downloading" && <button role="menuitem" onClick={() => { setContextMenu(null); void pause(item); }}>Pause</button>}
+        {item.status === "Paused" && <button role="menuitem" onClick={() => { setContextMenu(null); void resume(item); }}>Resume</button>}
+        {(item.status === "Failed" || item.status === "Interrupted") && <button role="menuitem" onClick={() => { setContextMenu(null); void retry(item); }}>{item.targetPath ? "Resume" : "Retry"}</button>}
+        {canCancel(item) && <button role="menuitem" onClick={() => { setContextMenu(null); void cancel(item); }}>Cancel</button>}
+        {canRemove(item) && <><hr /><button role="menuitem" onClick={() => { setContextMenu(null); void remove(item.id); }}>Remove</button></>}
       </div>
-    </aside>
-
-    <main className="main">
-      <header className="topbar"><div>THUNDERLOAD <span>/</span> {title.toUpperCase()}</div><button className="quiet-button folder-button" onClick={openFolder}>Open downloads folder ↗</button></header>
-      <div className="page">
-        {nativeBanner && !nativeBannerDismissed && <div className="setup-banner" role="status">
-          <div><strong>{nativeBanner === "missing-id" ? "Browser connection not set up yet" : "Browser connection could not be restored"}</strong><p>{nativeBanner === "missing-id"
-            ? "Downloads from the browser extension need a one-time connection. It takes a minute: install the extension, copy its ID, and connect it in Settings."
-            : "ThunderLoad tried to reconnect a browser whose extension ID was saved before, but registration failed. Open the browser setup to try again."}</p></div>
-          <div className="setup-banner-actions">
-            <button className="primary-button" onClick={() => setPage("settings")}>Set up browser connection →</button>
-            <button className="quiet-button" onClick={() => setNativeBannerDismissed(true)}>Dismiss</button>
-          </div>
-        </div>}
-        <div className="page-heading"><div><h1>{title}</h1><p>{subtitle}</p></div>{page === "downloads" && <button className="primary-button" onClick={() => document.getElementById("download-url")?.focus()}>＋ Add download</button>}</div>
-
-        {page === "downloads" && <>
-          <section className="summary">
-            <div><strong>{active}</strong><span>Active</span></div><div><strong>{queued}</strong><span>Queued</span></div><div><strong>{done}</strong><span>Completed</span></div><div><strong>{attention}</strong><span>Needs attention</span></div>
-          </section>
-          <section className="panel">
-            <div className="panel-heading"><div><h2>Add a download</h2><p>Direct file links and supported HLS playlists.</p></div><span className="connection-tag">{connections} CONNECTIONS</span></div>
-            <form onSubmit={(event) => { event.preventDefault(); add(url, filename); }}>
-              <label htmlFor="download-url">Download URL</label>
-              <input id="download-url" className="field" value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://example.com/archive.zip" />
-              <div className="add-actions"><div className="filename-field"><label htmlFor="download-name">Save as <small>OPTIONAL</small></label><input id="download-name" className="field" value={filename} onChange={(event) => setFilename(event.target.value)} placeholder="Use original filename" /></div><button type="submit" className="primary-button">Add to queue ↗</button></div>
-              <div className="schedule-row"><label htmlFor="schedule-at">Start later <small>OPTIONAL</small></label><input id="schedule-at" type="datetime-local" className="field schedule-field" min={new Date(clock - new Date(clock).getTimezoneOffset() * 60000).toISOString().slice(0, 16)} value={scheduleAt} onChange={(event) => setScheduleAt(event.target.value)} /></div>
-            </form>
-            <div className="notice">{notice}</div>
-            {url.trim() && <button className="text-link" onClick={() => { setVideoUrl(url.trim()); setPage("video"); }}>Inspect media qualities instead →</button>}
-          </section>
-          <section className="panel">
-            <div className="panel-heading"><div><h2>Recent transfers</h2><p>Latest activity on this device.</p></div><button className="quiet-button" onClick={clearFinished}>Clear finished</button></div>
-            {transferList(ordered.slice(0, 6))}
-            {ordered.length > 6 && <button className="text-link" onClick={() => setPage("queue")}>View all transfers →</button>}
-          </section>
-        </>}
-
-        {page === "queue" && <section className="panel queue-panel">
-          <div className="summary queue-summary"><div><strong>{active}</strong><span>Active</span></div><div><strong>{queued}</strong><span>Waiting</span></div><div><strong>{done}</strong><span>Completed</span></div><div><strong>{attention}</strong><span>Failed</span></div></div>
-          <div className="panel-heading"><div><h2>All transfers</h2><p>Jobs start automatically, up to your active transfer limit.</p></div><button className="quiet-button" onClick={clearFinished}>Clear finished</button></div>
-          {transferList(ordered)}
-          <p className="footnote">Direct HTTP, HLS and DASH downloads keep partial files on disk. Pause saves a checkpoint, Resume continues from it, and startup automatically recovers saved checkpoints. Jobs are also recorded in a durable job database, so the queue — including queued and scheduled entries — survives an app restart.</p>
-        </section>}
-
-        {page === "video" && <section className="panel video-panel">
+    </div>;
+  }
+  // Right inspector (Motrix pattern): Overview · Files · Segments ·
+  // Activity. Every tab shows only what the app actually knows — no
+  // invented history, no invented segment data.
+  function inspectorPanel() {
+    const item = items.find((entry) => entry.id === selectedId);
+    if (!item) return null;
+    const tabs: Array<[InspectorTab, string]> = [["overview", "Overview"], ["files", "Files"], ["segments", "Segments"], ["activity", "Activity"]];
+    return <aside className="inspector" aria-label="Download details">
+      <div className="inspector-head">
+        <div><strong title={item.name}>{item.name}</strong><Status value={item.status} /></div>
+        <button className="remove-button" title="Close details" aria-label="Close details" onClick={() => setSelectedId(null)}>×</button>
+      </div>
+      <div className="inspector-tabs">{tabs.map(([id, label]) => <button key={id} className={"inspector-tab" + (inspectorTab === id ? " selected" : "")} onClick={() => setInspectorTab(id)}>{label}</button>)}</div>
+      {inspectorTab === "overview" && <div className="inspector-body">
+        <dl className="kv">
+          <div><dt>Status</dt><dd>{item.status} · {item.percent}%</dd></div>
+          <div><dt>URL</dt><dd className="kv-wrap" title={item.url}>{item.url || "—"}</dd></div>
+          <div><dt>Size</dt><dd>{item.total ? bytes(item.total) : "Unknown"}</dd></div>
+          <div><dt>Downloaded</dt><dd>{bytes(item.downloaded)}</dd></div>
+          <div><dt>Speed</dt><dd>{speedCell(item) || "—"}</dd></div>
+          <div><dt>Time left</dt><dd>{etaCell(item) || "—"}</dd></div>
+          <div><dt>Saved to</dt><dd className="kv-wrap" title={item.targetPath || ""}>{item.targetPath || "Not started yet"}</dd></div>
+          <div><dt>Created</dt><dd>{new Date(item.createdAt).toLocaleString()}</dd></div>
+          {item.scheduledAt && <div><dt>Scheduled for</dt><dd>{new Date(item.scheduledAt).toLocaleString()}</dd></div>}
+          <div><dt>Resume capability</dt><dd>{item.targetPath ? "Yes — checkpoint saved" : "No"}</dd></div>
+          {item.error && <div><dt>Error</dt><dd className="error-text">{item.error}</dd></div>}
+        </dl>
+        <p className="inspector-detail">{item.detail}</p>
+        <div className="inspector-actions">{actionButtons(item)}</div>
+      </div>}
+      {inspectorTab === "files" && <div className="inspector-body">
+        <div className="file-row"><span className="file-type">{item.kind === "hls" ? "▶" : "↓"}</span><div><strong title={item.name}>{item.name}</strong><small>{item.total ? bytes(item.total) : bytes(item.downloaded) + " downloaded so far"}</small></div></div>
+        <dl className="kv">
+          <div><dt>Location</dt><dd className="kv-wrap" title={item.targetPath || ""}>{item.targetPath || "Not started yet"}</dd></div>
+          <div><dt>Transfer kind</dt><dd>{item.kind === "hls" ? "HLS playlist" : item.kind === "dash" ? "DASH manifest" : "Direct file"}</dd></div>
+        </dl>
+        <p className="footnote">Partial data is kept next to the target while a transfer is incomplete. Pause saves a checkpoint; Resume continues from it.</p>
+      </div>}
+      {inspectorTab === "segments" && <div className="inspector-body">
+        <dl className="kv">
+          <div><dt>Connections</dt><dd>{connections} per file</dd></div>
+          <div><dt>Segments</dt><dd>{item.segmentsDone !== undefined && item.segmentsTotal !== undefined ? item.segmentsDone + " of " + item.segmentsTotal + " done" : "This transfer does not report per-segment progress."}</dd></div>
+          <div><dt>Downloaded</dt><dd>{bytes(item.downloaded)}{item.total ? " of " + bytes(item.total) : ""}</dd></div>
+        </dl>
+        <p className="footnote">Checkpoint-safe downloads currently use one stream. Multi-connection resume is still being developed.</p>
+      </div>}
+      {inspectorTab === "activity" && <div className="inspector-body">
+        <ul className="activity-list">
+          <li><strong>Created</strong><span>{new Date(item.createdAt).toLocaleString()}</span></li>
+          {item.scheduledAt && <li><strong>Scheduled for</strong><span>{new Date(item.scheduledAt).toLocaleString()}</span></li>}
+          <li><strong>Current status</strong><span>{item.status} — {item.detail}</span></li>
+          {item.error && <li><strong>Error</strong><span className="error-text">{item.error}</span></li>}
+        </ul>
+        <p className="footnote">Only events this app has actually seen are listed here.</p>
+      </div>}
+    </aside>;
+  }
+  // Add dialog: the old Downloads-page form, moved behind the one
+  // primary "+ Add" button (Motrix "+" pattern). Behaviour unchanged.
+  function addDialog() {
+    if (!addOpen) return null;
+    return <div className="dialog-overlay" role="dialog" aria-label="Add a download" onClick={() => setAddOpen(false)}>
+      <div className="dialog" onClick={(event) => event.stopPropagation()}>
+        <div className="dialog-head"><div><h2>Add a download</h2><p>Direct file links and supported HLS playlists.</p></div><button className="remove-button" title="Close" aria-label="Close" onClick={() => setAddOpen(false)}>×</button></div>
+        <form onSubmit={(event) => { event.preventDefault(); add(url, filename); }}>
+          <label htmlFor="download-url">Download URL</label>
+          <input id="download-url" className="field" value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://example.com/archive.zip" autoFocus />
+          <div className="add-actions"><div className="filename-field"><label htmlFor="download-name">Save as <small>OPTIONAL</small></label><input id="download-name" className="field" value={filename} onChange={(event) => setFilename(event.target.value)} placeholder="Use original filename" /></div><button type="submit" className="primary-button">Add to queue ↗</button></div>
+          <div className="schedule-row"><label htmlFor="schedule-at">Start later <small>OPTIONAL</small></label><input id="schedule-at" type="datetime-local" className="field schedule-field" min={new Date(clock - new Date(clock).getTimezoneOffset() * 60000).toISOString().slice(0, 16)} value={scheduleAt} onChange={(event) => setScheduleAt(event.target.value)} /></div>
+        </form>
+        <div className="notice">{notice}</div>
+        {url.trim() && <button className="text-link" onClick={() => { setVideoUrl(url.trim()); setAddOpen(false); setGrabberOpen(true); }}>Inspect media qualities instead →</button>}
+        <div className="dialog-foot"><span className="connection-tag">{connections} CONNECTIONS</span><button className="quiet-button" onClick={() => setAddOpen(false)}>Done</button></div>
+      </div>
+    </div>;
+  }
+  // Video grabber dialog (Direction A: the grabber is not a main-window
+  // page — it is a dialog reachable from the Queues page and from the
+  // Add form's "Inspect media qualities" link). Content is the old
+  // Video page, unchanged.
+  function grabberDialog() {
+    if (!grabberOpen) return null;
+    return <div className="dialog-overlay" role="dialog" aria-label="Video grabber" onClick={() => setGrabberOpen(false)}>
+      <div className="dialog dialog-wide" onClick={(event) => event.stopPropagation()}>
+        <div className="dialog-head"><div><h2>Video grabber</h2><p>Inspect one media URL, or grab every media file from one page.</p></div><button className="remove-button" title="Close" aria-label="Close" onClick={() => setGrabberOpen(false)}>×</button></div>
+        <div className="video-panel">
           <div className="panel-heading"><div><h2>Inspect a media URL</h2><p>Quality choices appear only when the source exposes them.</p></div></div>
           <form onSubmit={(event) => { event.preventDefault(); void inspect(); }}>
             <label htmlFor="video-url">Page or media URL</label>
@@ -796,7 +1074,81 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
             </div>)}
           </div>}
           <div className="support-note"><strong>Format support</strong><p>Direct HTTP/HTTPS files use resumable transfers. HLS supports completed unencrypted VOD, with Pause/Resume/Cancel. DASH supports static MPDs with SegmentTemplate/SegmentTimeline, SegmentList, SegmentBase and multi-period, with Pause/Resume/Cancel; separate audio/video requires FFmpeg. Live/dynamic MPDs and DRM are not supported. A YouTube watch page is not a direct media URL; page extraction of its streams is not supported, but "Grab a page" above lists media files a page links to directly.</p></div>
-        </section>}
+        </div>
+      </div>
+    </div>;
+  }
+
+  return <div className="app-shell">
+    <aside className="sidebar">
+      <div className="brand"><div className="brand-mark">↯</div><div><strong>ThunderLoad</strong><small>DOWNLOAD MANAGER</small></div></div>
+      <div className="nav-caption">WORKSPACE</div>
+      <nav>
+        <button title="Downloads" aria-label="Downloads" className={"nav-item " + (page === "downloads" ? "selected" : "")} onClick={() => goTo("downloads")}><span>↓</span>Downloads</button>
+        <button title="Queues" aria-label="Queues" className={"nav-item " + (page === "queues" ? "selected" : "")} onClick={() => goTo("queues")}><span>≡</span>Queues{queued > 0 && <em>{queued}</em>}</button>
+        <button title="Scheduler" aria-label="Scheduler" className={"nav-item " + (page === "scheduler" ? "selected" : "")} onClick={() => goTo("scheduler")}><span>◷</span>Scheduler{scheduledItems.length > 0 && <em>{scheduledItems.length}</em>}</button>
+      </nav>
+      <div className="sidebar-bottom">
+        <div className="engine-line"><i />Local engine</div>
+        <button title="Settings" aria-label="Settings" className={"nav-item " + (page === "settings" ? "selected" : "")} onClick={() => goTo("settings")}><span>⚙</span>Settings</button>
+        <div className="version">ThunderLoad · 0.3.2</div>
+      </div>
+    </aside>
+
+    <main className="main">
+      <header className="topbar"><div>THUNDERLOAD <span>/</span> {title.toUpperCase()}</div><button className="quiet-button folder-button" onClick={openFolder}>Open downloads folder ↗</button></header>
+      <div className="content-row">
+      <div className="page">
+        {nativeBanner && !nativeBannerDismissed && <div className="setup-banner" role="status">
+          <div><strong>{nativeBanner === "missing-id" ? "Browser connection not set up yet" : "Browser connection could not be restored"}</strong><p>{nativeBanner === "missing-id"
+            ? "Downloads from the browser extension need a one-time connection. It takes a minute: install the extension, copy its ID, and connect it in Settings."
+            : "ThunderLoad tried to reconnect a browser whose extension ID was saved before, but registration failed. Open the browser setup to try again."}</p></div>
+          <div className="setup-banner-actions">
+            <button className="secondary-button" onClick={() => goTo("settings")}>Set up browser connection →</button>
+            <button className="quiet-button" onClick={() => setNativeBannerDismissed(true)}>Dismiss</button>
+          </div>
+        </div>}
+        <div className="page-heading"><div><h1>{title}</h1><p>{subtitle}</p></div>{page !== "settings" && <button className="primary-button" onClick={() => setAddOpen(true)}>＋ Add</button>}</div>
+
+        {page === "downloads" && <>
+          <div className="list-toolbar">
+            <div className="tabs" role="tablist" aria-label="Filter by status">
+              {(["all", "active", "completed", "failed"] as StatusTab[]).map((tab) => <button key={tab} role="tab" aria-selected={statusTab === tab} className={"tab" + (statusTab === tab ? " selected" : "")} onClick={() => setStatusTab(tab)}>{tab === "all" ? "All" : tab === "active" ? "Active" : tab === "completed" ? "Completed" : "Failed"} <em>{tabCounts[tab]}</em></button>)}
+            </div>
+            <input className="field search-field" type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search downloads…" aria-label="Search downloads" />
+            <button className={"quiet-button" + (showKind ? " toggle-on" : "")} aria-pressed={showKind} title="Show or hide the Transfer kind column" onClick={() => setShowKind((current) => !current)}>Transfer kind column</button>
+            {(done > 0 || items.some((item) => item.status === "Cancelled")) && <button className="quiet-button" onClick={clearFinished}>Clear finished</button>}
+          </div>
+          <div className="chips" role="group" aria-label="Filter by file type">
+            {(["all", "video", "music", "documents", "compressed", "programs", "other"] as KindFilter[]).map((type) => <button key={type} className={"chip" + (kindFilter === type ? " selected" : "")} aria-pressed={kindFilter === type} onClick={() => setKindFilter(type)}>{type === "all" ? "All" : type === "video" ? "Video" : type === "music" ? "Music" : type === "documents" ? "Documents" : type === "compressed" ? "Compressed" : type === "programs" ? "Programs" : "Other"} <em>{kindCounts[type]}</em></button>)}
+          </div>
+          {downloadTable(kindFiltered,
+            statusTab === "all" ? "Download list is empty." : statusTab === "active" ? "No active transfers." : statusTab === "completed" ? "No completed downloads yet." : "No failed downloads.",
+            statusTab === "all" ? "Add new download URL." : statusTab === "active" ? "Active, queued and paused transfers appear here." : statusTab === "completed" ? "Finished and cancelled downloads appear here." : "Failed and interrupted transfers appear here with a Retry action.",
+            showKind)}
+          {notice !== "Ready." && <div className="notice">{notice}</div>}
+        </>}
+
+        {page === "queues" && <>
+          <section className="summary">
+            <div><strong>{active}</strong><span>Active</span></div><div><strong>{queued}</strong><span>Waiting</span></div><div><strong>{done}</strong><span>Completed</span></div><div><strong>{attention}</strong><span>Failed</span></div>
+          </section>
+          <div className="list-toolbar">
+            <p className="queue-note">Jobs start automatically, up to your active transfer limit.</p>
+            <button className="secondary-button" onClick={() => setGrabberOpen(true)}>Video grabber ▷</button>
+          </div>
+          {downloadTable(queueItems, "Queue is empty.", "Add a download to begin. Waiting, running and failed transfers appear here.")}
+          <p className="footnote">Direct HTTP, HLS and DASH downloads keep partial files on disk. Pause saves a checkpoint, Resume continues from it, and startup automatically recovers saved checkpoints. Jobs are also recorded in a durable job database, so the queue — including queued and scheduled entries — survives an app restart.</p>
+        </>}
+
+        {page === "scheduler" && <>
+          {scheduledItems.length ? <div className="sched-list">{scheduledItems.map((item) => <div className="sched-row" key={item.id}>
+            <div><strong title={item.name}>{item.name}</strong><small title={item.url}>{hostOf(item.url) || item.kind} · </small><Status value={item.status} /></div>
+            <div className="sched-time">{item.scheduledAt ? new Date(item.scheduledAt).toLocaleString() : "—"}</div>
+            {canCancel(item) && <button className="quiet-button transfer-control" onClick={() => void cancel(item)}>Cancel</button>}
+          </div>)}</div> : <div className="empty-state"><span className="empty-icon">◷</span><strong>No scheduled downloads</strong><p>Add a download and choose a start time.</p><button className="secondary-button" onClick={() => setAddOpen(true)}>＋ Add download</button></div>}
+          <p className="footnote">Scheduled downloads start automatically at their time — a wake task is registered when you schedule one. Cancelling a scheduled download also removes its wake task.</p>
+        </>}
 
         {page === "settings" && <section className="panel settings-panel">
           <div className="settings-section"><div><h2>Transfer behaviour</h2><p>Saved locally. Applies to new downloads.</p></div>
@@ -862,8 +1214,13 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           <div className="settings-section"><div><h2>About</h2><p>Local desktop transfer engine · Version 0.3.2</p></div><div className="about-line"><span>Supported media</span><strong>Direct files · HLS VOD · Static DASH VOD</strong></div><div className="about-line"><span>Direct downloads</span><strong>Pause · Resume · Cancel · Speed limit · Schedule</strong></div><div className="about-line"><span>Still in development</span><strong>Multi-connection resume · Live DASH</strong></div></div>
         </section>}
 
-        <footer className="app-footer"><span>ThunderLoad</span><span>Downloads stay on this device.</span></footer>
       </div>
+      {inspectorPanel()}
+      </div>
+      <footer className="statusbar"><span className="statusbar-speed">↓ {aggregateLabel}</span><span>{active} active · {queued} queued · {done} completed · {attention} failed</span><span className="statusbar-right"><i className="engine-dot" />Local engine · Downloads stay on this device.</span></footer>
     </main>
+    {addDialog()}
+    {grabberDialog()}
+    {contextMenuPanel()}
   </div>;
 }

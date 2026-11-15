@@ -398,10 +398,13 @@ impl JobStore {
             // Cancel deletes the files; the row stays (so the user still
             // sees the cancelled job until they clear it) but must not
             // point at a target that no longer exists — and a job that
-            // can never resume must not keep its bearer credential.
+            // can never resume must not keep its bearer credential or
+            // its start time, or a later reader would put it back on
+            // the Scheduler page.
             job.target_path = None;
             job.checkpoint_path = None;
             job.session = None;
+            job.scheduled_at_ms = None;
         }
         self.save()?;
         Ok(true)
@@ -1014,6 +1017,7 @@ mod tests {
         let (mut store, path) = store_in(&dir);
         let mut record = sample_record("u");
         record.session = Some(sample_session());
+        record.scheduled_at_ms = Some(1_700_000_100_000);
         store.upsert(record).unwrap();
         assert!(store
             .update_state("u", JobState::Paused, Some("Paused by user"), None)
@@ -1040,6 +1044,9 @@ mod tests {
         assert_eq!(row.target_path, None);
         assert_eq!(row.checkpoint_path, None);
         assert_eq!(row.session, None);
+        // ... nor its start time, or a later reader would put it back
+        // on the Scheduler page.
+        assert_eq!(row.scheduled_at_ms, None);
         assert!(store.remove("u").unwrap());
         assert!(!store.remove("u").unwrap());
         let (reloaded, _) = JobStore::load(&path, Duration::from_secs(0));
