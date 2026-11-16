@@ -251,7 +251,12 @@ async function loadInterceptToggle() {
 }
 rescanBtn.addEventListener("click", scanActiveTab);
 interceptToggle.addEventListener("change", () => {
-  api.storage.local.set({ [INTERCEPT_SETTING_KEY]: interceptToggle.checked }).catch(() => {});
+  // Mirror loadInterceptToggle's guard (:248): evaluating
+  // api.storage.local throws a synchronous TypeError when the
+  // storage API is unavailable, and .catch only handles the
+  // promise — so the access itself must be guarded.
+  try { api.storage?.local?.set({ [INTERCEPT_SETTING_KEY]: interceptToggle.checked })?.catch(() => {}); }
+  catch (_) { /* Storage unavailable; the toggle still applies to this session. */ }
 });
 api.runtime.onMessage.addListener((message) => {
   if (message?.type === "NATIVE_EVENT") {
