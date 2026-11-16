@@ -48,6 +48,16 @@ async function hasNativePermission() {
 }
 function ensureNativePort() {
   if (nativePort) return nativePort;
+  // Chrome only exposes runtime.connectNative while the optional
+  // nativeMessaging permission is granted; without it the function
+  // is undefined and calling it throws a raw TypeError ("... is not
+  // a function") that would reach the user as a toast. Check first
+  // and fail with the clean permission error instead — requestNative's
+  // catch turns it into { ok: false, error }, and quickDownloadMedia
+  // maps it to the "app is not connected" message.
+  if (typeof api.runtime.connectNative !== "function") {
+    throw new Error("Optional desktop-engine permission has not been granted");
+  }
   nativePort = api.runtime.connectNative(HOST_NAME);
   nativePort.onMessage.addListener((message) => {
     if (message && message.id && pendingRequests.has(message.id)) {
@@ -224,18 +234,8 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "VIDEO_SOURCES_FOUND") {
     const tabId = sender.tab?.id;
     if (typeof tabId === "number") {
-      const map = new Map((sourcesByTab.get(tabId) || []).map((item) => [item.url, item]));
-      for (const item of (message.sources || [])) {
-        if (!item?.url || !/^https?:\/\//i.test(item.url)) continue;
-        // Defense in depth: the content script filters service URLs
-        // too, but DOM-sourced junk must never reach the popup even
-        // if content.js is bypassed or stale.
-        if (isYouTubeServiceUrl(item.url)) continue;
-        map.set(item.url, enrichSource(item));
-      }
-      const all = sortSources(Array.from(map.values()));
-      if (all.length > MAX_SOURCES_PER_TAB || message.truncated) truncatedByTab.set(tabId, true);
-      sourcesByTab.set(tabId, all.slice(0, MAX_SOURCES_PER_TAB));
+      mergeTabSources(tabId, message.sources || [], message.truncated);
+      persistTabSources(tabId, sender.tab?.url);
     }
     sendResponse({ ok: true });
     return false;
@@ -245,23 +245,52 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
       try {
         const [tab] = await api.tabs.query({ active: true, currentWindow: true });
         if (!tab?.id) return sendResponse({ ok: false, error: "No active tab" });
+        // Rehydrate persisted detections for this exact page first,
+        // so a restarted worker still shows sources even if the live
+        // scan below finds nothing new. The return value carries the
+        // persisted truncation signal: truncatedByTab is cleared
+        // below before the live scan, so it must be captured here
+        // and OR-ed into the final flag.
+        const rehydratedTruncated = await rehydrateTabSources(tab.id, tab.url || "");
         // Recompute truncation from this scan (R1): clear the flag
         // before the fresh scan, so a page that shrank below the caps
         // stops reporting truncated. It is set again below from the
-        // SCAN_NOW response and from any VIDEO_SOURCES_FOUND messages
-        // that arrive during the settle wait.
+        // SCAN_NOW response, the scanned-media pull, and any
+        // VIDEO_SOURCES_FOUND messages that arrive during the settle
+        // wait.
         truncatedByTab.delete(tab.id);
         await api.scripting.executeScript({ target: { tabId: tab.id }, files: ["content.js"] });
         const scanResult = await api.tabs.sendMessage(tab.id, { type: "SCAN_NOW" }).catch(() => null);
         await new Promise((resolve) => setTimeout(resolve, 250));
-        // The SCAN_NOW result is authoritative for this scan (R1
-        // follow-up): it overwrites the flag after the settle wait,
+        // Pull the content script's own scanned media (audit F1/F6):
+        // add() only ever reports NEW items, so SCAN_NOW's count and
+        // the VIDEO_SOURCES_FOUND messages from the settle window
+        // cannot repopulate a sourcesByTab wiped by a worker restart.
+        // GET_SCANNED_MEDIA returns the content script's full `found`
+        // map, which survives worker restarts (it lives in the page).
+        // Fail-open with a timeout: a tab still running a content
+        // script from an older extension version has no such handler
+        // and would never respond, so never await it unboundedly.
+        const scanned = await Promise.race([
+          api.tabs.sendMessage(tab.id, { type: "GET_SCANNED_MEDIA" }).catch(() => null),
+          new Promise((resolve) => setTimeout(() => resolve(null), 250))
+        ]);
+        let mergedTruncated = false;
+        if (scanned && Array.isArray(scanned.sources)) {
+          mergedTruncated = mergeTabSources(tab.id, scanned.sources, scanned.truncated);
+        }
+        // The scan results are authoritative for this scan (R1
+        // follow-up): they overwrite the flag after the settle wait,
         // so a mid-scan notify from add() that disagreed with the
         // scan's own recompute cannot leave a stale true behind.
-        // Messages from the same scan agree with it; a null result
-        // (content script blocked) clears the flag as well.
-        if (scanResult?.truncated) truncatedByTab.set(tab.id, true);
+        // The merge overflow above is a third signal: network +
+        // DOM sources combined can exceed the cap even when neither
+        // scan flag is set. The persisted truncation signal from the
+        // rehydrate above is a fourth: a stored truncated:true must
+        // survive a live scan that reports truncated:false.
+        if (scanResult?.truncated || mergedTruncated || rehydratedTruncated) truncatedByTab.set(tab.id, true);
         else truncatedByTab.delete(tab.id);
+        await persistTabSources(tab.id, tab.url || "");
         sendResponse({ ok: true, tabId: tab.id, sources: sortSources(sourcesByTab.get(tab.id) || []), pageUrl: tab.url || "", truncated: !!truncatedByTab.get(tab.id) });
       } catch (error) {
         sendResponse({ ok: false, error: error?.message || "This page does not allow extension scanning" });
@@ -292,7 +321,7 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return false;
 });
 
-api.tabs.onRemoved.addListener((tabId) => { sourcesByTab.delete(tabId); truncatedByTab.delete(tabId); });
+api.tabs.onRemoved.addListener((tabId) => { sourcesByTab.delete(tabId); truncatedByTab.delete(tabId); removePersistedTabSources(tabId); });
 
 // IDM-style network backstop: catch media the DOM scan cannot see
 // (fetch/XHR-loaded streams, cross-origin iframes). Observation only —
@@ -318,6 +347,122 @@ function parseGoogleVideoSegment(url) {
     return { mediaType, itag: itag || null };
   } catch (_) { return null; }
 }
+// Shared merge for every detection path (DOM messages, network
+// observer, storage rehydrate, scanned-media pull): dedupe by URL,
+// drop non-http(s) and YouTube service URLs, re-enrich, sort, cap.
+// Returns true when the merged list is truncated (cap overflow or the
+// caller's truncated flag), so the caller can set the flag exactly.
+function mergeTabSources(tabId, items, truncatedFlag) {
+  if (typeof tabId !== "number") return false;
+  const map = new Map((sourcesByTab.get(tabId) || []).map((item) => [item.url, item]));
+  for (const item of (items || [])) {
+    if (!item?.url || !/^https?:\/\//i.test(item.url)) continue;
+    // Defense in depth: the content script filters service URLs
+    // too, but DOM-sourced junk must never reach the popup even
+    // if content.js is bypassed or stale.
+    // The DASH-manifest check runs first, mirroring classify() and
+    // classifyNetworkResponse(): /api/manifest/dash matches the
+    // service-path pattern (/api/...) and would otherwise be
+    // excluded as a service URL — the manifest must reach the popup.
+    if (!YOUTUBE_DASH_MANIFEST.test(item.url) && isYouTubeServiceUrl(item.url)) continue;
+    map.set(item.url, enrichSource(item));
+  }
+  const all = sortSources(Array.from(map.values()));
+  const truncated = all.length > MAX_SOURCES_PER_TAB || !!truncatedFlag;
+  if (truncated) truncatedByTab.set(tabId, true);
+  sourcesByTab.set(tabId, all.slice(0, MAX_SOURCES_PER_TAB));
+  return truncated;
+}
+
+// Persisted detections (audit F3): sourcesByTab lives only in worker
+// memory and is wiped on every service-worker restart. Mirror it to
+// chrome.storage.local per tab, together with the tab's page URL, so a
+// restarted worker can rehydrate — but only for the same page (a
+// navigation makes stored sources stale).
+//
+// Storage schema (one key per tab, minimal, namespaced):
+//   key:   "thunderload.tabSources.v1.<tabId>"
+//   value: { pageUrl: string, sources: Array<{url, kind, label,
+//            discoveredAt, isYouTubeDash?, mediaType?, itag?}>,
+//            truncated: boolean, updatedAt: number }
+// The intercept toggle ("interceptBrowserDownloads") is a separate
+// key and is untouched by this code.
+//
+// Storage is best-effort: every call below is guarded, so a missing
+// storage API or a quota error can only lose the mirror, never
+// detection. The "storage" permission is declared in both manifests
+// (no install warning), so chrome.storage is available in the real
+// browser; the guards only cover a missing API on older installs.
+const TAB_SOURCES_KEY_PREFIX = "thunderload.tabSources.v1.";
+function tabSourcesKey(tabId) { return TAB_SOURCES_KEY_PREFIX + tabId; }
+// JSON of the last value written per tab (pageUrl + sources +
+// truncated, without updatedAt), so re-recording an unchanged list
+// does not hammer storage.
+const lastPersistedJsonByTab = new Map();
+function storageLocal() { return api.storage?.local ?? null; }
+async function persistTabSources(tabId, pageUrl) {
+  const local = storageLocal();
+  if (!local || !pageUrl) return;
+  try {
+    const sources = sourcesByTab.get(tabId) || [];
+    const key = tabSourcesKey(tabId);
+    if (!sources.length) {
+      await local.remove(key);
+      lastPersistedJsonByTab.delete(tabId);
+      return;
+    }
+    const value = { pageUrl, sources, truncated: !!truncatedByTab.get(tabId), updatedAt: Date.now() };
+    const dedupeJson = JSON.stringify({ pageUrl: value.pageUrl, sources: value.sources, truncated: value.truncated });
+    if (lastPersistedJsonByTab.get(tabId) === dedupeJson) return;
+    lastPersistedJsonByTab.set(tabId, dedupeJson);
+    await local.set({ [key]: value });
+  } catch (_) { /* Storage is a best-effort mirror. */ }
+}
+async function removePersistedTabSources(tabId) {
+  lastPersistedJsonByTab.delete(tabId);
+  try { await storageLocal()?.remove(tabSourcesKey(tabId)); } catch (_) { /* Best-effort. */ }
+}
+// Returns mergeTabSources' truncation result (true when the restored
+// list is truncated), so GET_ACTIVE_SOURCES can OR the persisted
+// signal into the final flag — the flag is cleared and recomputed
+// from the live scan, so a persisted truncated:true would otherwise
+// be lost when the live scan reports truncated:false.
+async function rehydrateTabSources(tabId, pageUrl) {
+  const local = storageLocal();
+  if (!local || !pageUrl) return false;
+  try {
+    const entry = (await local.get(tabSourcesKey(tabId)))?.[tabSourcesKey(tabId)];
+    if (!entry || entry.pageUrl !== pageUrl || !Array.isArray(entry.sources)) return false;
+    return mergeTabSources(tabId, entry.sources, entry.truncated);
+  } catch (_) { /* A stale or unreadable entry is simply ignored. */ return false; }
+}
+
+// Worker startup: rehydrate persisted detections for tabs that still
+// show the same page; drop entries for closed tabs or navigated pages.
+(async () => {
+  const local = storageLocal();
+  if (!local) return;
+  try {
+    const all = (await local.get(null)) || {};
+    for (const [key, entry] of Object.entries(all)) {
+      if (!key.startsWith(TAB_SOURCES_KEY_PREFIX)) continue;
+      const tabId = Number(key.slice(TAB_SOURCES_KEY_PREFIX.length));
+      if (!Number.isInteger(tabId)) continue;
+      try {
+        const tab = await api.tabs.get(tabId);
+        if (tab?.url && entry?.pageUrl === tab.url && Array.isArray(entry.sources)) {
+          mergeTabSources(tabId, entry.sources, entry.truncated);
+        } else {
+          await local.remove(key).catch(() => {});
+        }
+      } catch (_) {
+        // Tab is gone; its stored entry is stale.
+        await local.remove(key).catch(() => {});
+      }
+    }
+  } catch (_) { /* Rehydrate is best-effort. */ }
+})();
+
 function enrichSource(item) {
   if (!item?.url) return item;
   const url = item.url;
@@ -380,15 +525,16 @@ function classifyNetworkResponse(url, headers) {
 }
 function recordNetworkSource(tabId, url, kind) {
   if (typeof tabId !== "number" || tabId < 0) return;
-  const map = new Map((sourcesByTab.get(tabId) || []).map((item) => [item.url, item]));
   // Re-enrich an existing entry too: a segment first seen by the DOM
   // scan arrives as a bare "Direct media" label, and only the network
   // observer knows its mime/itag.
-  const previous = map.get(url);
-  map.set(url, enrichSource({ url, kind, label: previous?.label || kind, discoveredAt: previous?.discoveredAt || Date.now() }));
-  const all = sortSources(Array.from(map.values()));
-  if (all.length > MAX_SOURCES_PER_TAB) truncatedByTab.set(tabId, true);
-  sourcesByTab.set(tabId, all.slice(0, MAX_SOURCES_PER_TAB));
+  const previous = (sourcesByTab.get(tabId) || []).find((item) => item.url === url);
+  mergeTabSources(tabId, [{ url, kind, label: previous?.label || kind, discoveredAt: previous?.discoveredAt || Date.now() }], false);
+  // Persist with the tab's current page URL (the manifest is observed
+  // here, often before the popup ever opens, so the URL is looked up
+  // rather than taken from a map that may not know this tab yet).
+  try { api.tabs.get(tabId).then((tab) => persistTabSources(tabId, tab?.url)).catch(() => {}); }
+  catch (_) { /* Tabs lookup is best-effort. */ }
 }
 if (api.webRequest?.onHeadersReceived) {
   api.webRequest.onHeadersReceived.addListener((details) => {
@@ -396,7 +542,7 @@ if (api.webRequest?.onHeadersReceived) {
     if (kind) recordNetworkSource(details.tabId, details.url, kind);
   }, { urls: ["<all_urls>"], types: ["xmlhttprequest", "media", "other"] }, ["responseHeaders"]);
 }
-api.tabs.onUpdated.addListener((tabId, changeInfo) => { if (changeInfo.status === "loading") { sourcesByTab.delete(tabId); truncatedByTab.delete(tabId); } });
+api.tabs.onUpdated.addListener((tabId, changeInfo) => { if (changeInfo.status === "loading") { sourcesByTab.delete(tabId); truncatedByTab.delete(tabId); removePersistedTabSources(tabId); } });
 api.commands?.onCommand.addListener(async (command) => {
   if (command !== "scan-media") return;
   const [tab] = await api.tabs.query({ active: true, currentWindow: true });

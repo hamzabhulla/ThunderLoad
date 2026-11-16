@@ -19,6 +19,7 @@ for (const [name,manifest] of [["Chromium",chromium],["Firefox",firefox]]) {
   if (manifest.manifest_version !== 3 || !manifest.version || !manifest.name || !manifest.action?.default_popup) throw new Error(name+" manifest metadata is invalid");
   if (!manifest.permissions?.includes("activeTab") || !manifest.permissions?.includes("downloads")) throw new Error(name+" manifest lacks activeTab or downloads");
   if (!manifest.permissions?.includes("webRequest")) throw new Error(name+" manifest lacks webRequest for media-traffic observation");
+  if (!manifest.permissions?.includes("storage")) throw new Error(name+" manifest lacks storage for the intercept toggle and persisted detections");
   if (!manifest.optional_permissions?.includes("nativeMessaging")) throw new Error(name+" must make nativeMessaging optional");
   if (!manifest.host_permissions?.includes("<all_urls>")) throw new Error(name+" must request <all_urls> host access for automatic detection");
   const script = manifest.content_scripts?.[0];
