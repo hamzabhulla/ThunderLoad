@@ -2,13 +2,13 @@
 
 [![CI](https://github.com/hamzabhulla/ThunderLoad/actions/workflows/ci.yml/badge.svg)](https://github.com/hamzabhulla/ThunderLoad/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-![Version](https://img.shields.io/badge/version-0.3.3-blue)
+![Version](https://img.shields.io/badge/version-0.3.4-blue)
 
 **A cross-platform download manager that treats an interrupted download as a pause, not a failure — a Rust engine, a Tauri desktop app, and a browser extension that work as one queue.**
 
 ThunderLoad is an IDM-style download manager for Windows, Linux, and macOS. It downloads files, HLS streams, and DASH videos with multi-connection checkpoint resume, a persistent job queue, and desktop controls for jobs started in the browser — so a closed laptop, a crashed app, or a dead connection costs you the remaining bytes, not the whole file.
 
-> **Status:** v0.3.3, active development. CI is green on Windows, Linux, and macOS. 139 engine tests passing, 0 warnings (engine + host). See [Current limitations](#current-limitations) for what is not done yet — no code signing, no real-machine smoke test, no store listings.
+> **Status:** v0.3.4, active development. CI is green on Windows, Linux, and macOS. 139 engine tests passing, 0 warnings (engine + host). See [Current limitations](#current-limitations) for what is not done yet — no code signing, no real-machine smoke test, no store listings.
 
 ## Quick start
 
