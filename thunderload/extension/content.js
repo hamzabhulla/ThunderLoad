@@ -742,5 +742,88 @@
   window.addEventListener("resize", () => {
     if (activeVideo) positionOverlay(activeVideo);
   }, { passive: true });
+  // Slice 2: MAIN-world hook bridge. The hook (hook.js, world MAIN,
+  // document_start) sees MediaSource/blob/fetch URLs the isolated
+  // world cannot. Findings arrive via window.postMessage guarded by
+  // a per-page random token the hook announces in a HELLO handshake.
+  // The token is NOT a secret from the page (page scripts can read
+  // postMessage traffic) — it stops accidental collisions and casual
+  // spoofing. Every finding is re-validated here (source + token +
+  // payload shape + this world's own classifier), and segments never
+  // become sources.
+  let hookToken = null;
+  let hookHelloReceived = false;
+  // Evidence-only state for blob: players (never a source list):
+  // blob URL -> { mediaSourceId, mimeTypes, duration, segments,
+  // bytes }. It proves a blob player exists and is streaming; the
+  // downloadable media itself still comes through add(), from the
+  // manifest URLs the hook reports alongside.
+  const blobMedia = new Map();
+  const BLOB_MEDIA_MAX = 20;
+  function hookPost(type) {
+    try { window.postMessage({ __thunderLoadHook: true, type }, "*"); } catch (_) {}
+  }
+  function handleHookMessage(event) {
+    try {
+      if (event.source !== window) return;
+      const data = event.data;
+      if (!data || data.__thunderLoadHook !== true) return;
+      if (data.type === "THUNDERLOAD_HOOK_HELLO") {
+        if (hookHelloReceived) return;
+        if (typeof data.token !== "string" || !data.token) return;
+        hookToken = data.token;
+        hookHelloReceived = true;
+        return;
+      }
+      if (!hookHelloReceived || data.token !== hookToken) return;
+      if (data.type === "THUNDERLOAD_HOOK_FINDING") {
+        if (typeof data.url !== "string") return;
+        // Re-classify in the isolated world: the hook's kind is only
+        // accepted if this world's own classifier agrees — segments
+        // and YouTube service URLs can never become sources this way.
+        const kind = classify(data.url);
+        if (!kind) return;
+        add(data.url, kind);
+        return;
+      }
+      if (data.type === "THUNDERLOAD_HOOK_BLOB") {
+        if (typeof data.blobUrl !== "string" || !/^blob:/i.test(data.blobUrl)) return;
+        if (blobMedia.size >= BLOB_MEDIA_MAX && !blobMedia.has(data.blobUrl)) return;
+        blobMedia.set(data.blobUrl, {
+          mediaSourceId: typeof data.mediaSourceId === "number" ? data.mediaSourceId : null,
+          mimeTypes: Array.isArray(data.mimeTypes) ? data.mimeTypes.filter((m) => typeof m === "string") : [],
+          duration: Number.isFinite(data.duration) ? data.duration : null,
+          segments: 0,
+          bytes: 0
+        });
+        // A blob player just started: the manifest likely arrived
+        // alongside, so rescan now instead of waiting for the next
+        // observer tick.
+        scheduleScan();
+        return;
+      }
+      if (data.type === "THUNDERLOAD_HOOK_MSE") {
+        if (typeof data.mediaSourceId !== "number") return;
+        for (const info of blobMedia.values()) {
+          if (info.mediaSourceId === data.mediaSourceId) {
+            if (Number.isFinite(data.segments)) info.segments = data.segments;
+            if (Number.isFinite(data.bytes)) info.bytes = data.bytes;
+            if (Array.isArray(data.mimeTypes)) {
+              info.mimeTypes = data.mimeTypes.filter((m) => typeof m === "string");
+            }
+            if (Number.isFinite(data.duration)) info.duration = data.duration;
+          }
+        }
+        return;
+      }
+    } catch (_) { /* A malformed hook message is ignored. */ }
+  }
+  window.addEventListener("message", handleHookMessage);
+  // Ping the hook for its token; one retry covers a late hook
+  // install. Without a HELLO the bridge stays silent and detection
+  // degrades to the DOM scan + webRequest paths.
+  hookPost("THUNDERLOAD_HOOK_PING");
+  setTimeout(() => { if (!hookHelloReceived) hookPost("THUNDERLOAD_HOOK_PING"); }, 1000);
+
   scan();
 })();

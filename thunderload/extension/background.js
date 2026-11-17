@@ -279,6 +279,11 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
         if (scanned && Array.isArray(scanned.sources)) {
           mergedTruncated = mergeTabSources(tab.id, scanned.sources, scanned.truncated);
         }
+        // Slice 2: merge service-worker (tabId === -1) sources that
+        // match this tab's page — exact Referer first, initiator
+        // origin as fallback. Runs after the live scan so the flag
+        // below can include the merge-overflow signal.
+        const unassignedTruncated = mergeUnassignedForTab(tab.id, tab.url || "");
         // The scan results are authoritative for this scan (R1
         // follow-up): they overwrite the flag after the settle wait,
         // so a mid-scan notify from add() that disagreed with the
@@ -287,8 +292,10 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
         // DOM sources combined can exceed the cap even when neither
         // scan flag is set. The persisted truncation signal from the
         // rehydrate above is a fourth: a stored truncated:true must
-        // survive a live scan that reports truncated:false.
-        if (scanResult?.truncated || mergedTruncated || rehydratedTruncated) truncatedByTab.set(tab.id, true);
+        // survive a live scan that reports truncated:false. The
+        // unassigned merge is a fifth: it can push the list over
+        // the cap after the live scan.
+        if (scanResult?.truncated || mergedTruncated || rehydratedTruncated || unassignedTruncated) truncatedByTab.set(tab.id, true);
         else truncatedByTab.delete(tab.id);
         await persistTabSources(tab.id, tab.url || "");
         sendResponse({ ok: true, tabId: tab.id, sources: sortSources(sourcesByTab.get(tab.id) || []), pageUrl: tab.url || "", truncated: !!truncatedByTab.get(tab.id) });
@@ -405,8 +412,8 @@ function mergeTabSources(tabId, items, truncatedFlag) {
 // Storage schema (one key per tab, minimal, namespaced):
 //   key:   "thunderload.tabSources.v1.<tabId>"
 //   value: { pageUrl: string, sources: Array<{url, kind, label,
-//            discoveredAt, isYouTubeDash?, mediaType?, itag?}>,
-//            truncated: boolean, updatedAt: number }
+//            discoveredAt, isYouTubeDash?, mediaType?, itag?,
+//            referer?}>, truncated: boolean, updatedAt: number }
 // The intercept toggle ("interceptBrowserDownloads") is a separate
 // key and is untouched by this code.
 //
@@ -529,39 +536,158 @@ function isYouTubeServiceUrl(url) {
 function classifyNetworkResponse(url, headers) {
   if (!url || !/^https?:\/\//i.test(url)) return null;
   const contentType = (headers || []).find((header) => header.name?.toLowerCase() === "content-type")?.value?.toLowerCase() || "";
-  if (/\.m3u8(?:$|[?#])/i.test(url) || contentType.includes("application/x-mpegurl") || contentType.includes("application/vnd.apple.mpegurl")) return "HLS playlist";
+  // URL-pattern checks first (parity with content.js classify()):
+  // an .m3u8/.mpd suffix or the YouTube DASH-manifest URL classifies
+  // regardless of Content-Type.
+  if (/\.m3u8(?:$|[?#])/i.test(url)) return "HLS playlist";
   // YouTube's DASH manifest has no .mpd suffix, and its Content-Type
   // is not relied on here: match the manifest URL pattern itself, so
   // detection works whichever Content-Type YouTube serves it with.
-  // (The application/dash+xml check below stays as a second trigger
-  // for manifests served with that type.) The manifest is fetched
-  // via XHR, which the onHeadersReceived listener below already
-  // observes, so no new webRequest filter was needed.
   if (YOUTUBE_DASH_MANIFEST.test(url)) return "DASH manifest";
-  if (/\.mpd(?:$|[?#])/i.test(url) || contentType.includes("application/dash+xml")) return "DASH manifest";
-  if (NETWORK_SEGMENT_EXT.test(url)) return null;
+  if (/\.mpd(?:$|[?#])/i.test(url)) return "DASH manifest";
+  // Slice 2: the service-URL exclusion runs BEFORE any Content-Type
+  // check. A YouTube service endpoint serving JSON with a video/* or
+  // mpegurl Content-Type is not media — previously the m3u8
+  // Content-Type check above it could classify such a response as
+  // an HLS playlist (mergeTabSources dropped it as defense in depth,
+  // but the classifier itself was wrong).
   if (isYouTubeServiceUrl(url)) return null;
+  // Content-Type checks (extension-less manifests/segments): HLS
+  // playlist types per the media-sniffing standard, DASH, then
+  // generic video/audio. A Content-Type alone never overrides the
+  // junk filter above.
+  if (contentType.includes("application/x-mpegurl") || contentType.includes("application/vnd.apple.mpegurl")
+    || contentType.includes("audio/mpegurl") || contentType.includes("audio/x-mpegurl")) return "HLS playlist";
+  if (contentType.includes("application/dash+xml")) return "DASH manifest";
+  if (NETWORK_SEGMENT_EXT.test(url)) return null;
   if (contentType.startsWith("video/") || contentType.startsWith("audio/")) return "Direct media";
   if (NETWORK_MEDIA_EXT.test(url)) return "Direct media";
   return null;
 }
-function recordNetworkSource(tabId, url, kind) {
-  if (typeof tabId !== "number" || tabId < 0) return;
+function recordNetworkSource(tabId, url, kind, extra = {}) {
+  if (typeof tabId === "number" && tabId < 0) {
+    // Slice 2: the site's service worker fetched this — no tab to
+    // attribute it to. Dropping it loses real detections;
+    // attributing it to a random tab is worse. Keep it unassigned;
+    // GET_ACTIVE_SOURCES merges only the ones matching the active
+    // tab's page (exact Referer match, initiator-origin fallback).
+    recordUnassignedSource(url, kind, extra.referer, extra.initiator);
+    return;
+  }
+  if (typeof tabId !== "number") return;
   // Re-enrich an existing entry too: a segment first seen by the DOM
   // scan arrives as a bare "Direct media" label, and only the network
   // observer knows its mime/itag.
   const previous = (sourcesByTab.get(tabId) || []).find((item) => item.url === url);
-  mergeTabSources(tabId, [{ url, kind, label: previous?.label || kind, discoveredAt: previous?.discoveredAt || Date.now() }], false);
+  mergeTabSources(tabId, [{ url, kind, label: previous?.label || kind, discoveredAt: previous?.discoveredAt || Date.now(), ...(extra.referer ? { referer: extra.referer } : {}) }], false);
   // Persist with the tab's current page URL (the manifest is observed
   // here, often before the popup ever opens, so the URL is looked up
   // rather than taken from a map that may not know this tab yet).
   try { api.tabs.get(tabId).then((tab) => persistTabSources(tabId, tab?.url)).catch(() => {}); }
   catch (_) { /* Tabs lookup is best-effort. */ }
 }
+
+// Slice 2: Referer capture. onSendHeaders records the Referer per
+// requestId so the response handler can attach it to the source —
+// many CDNs 403 without it, so later authenticated requests (Slice
+// 5/6) need it. The map is bounded (FIFO eviction) and entries are
+// dropped when their response is observed or the request errors,
+// so it cannot grow without bound. No new permission: requestHeaders
+// is an extraInfoSpec, not a permission (webRequest is declared).
+const refererByRequestId = new Map();
+const REFERER_MAP_MAX = 1000;
+if (api.webRequest?.onSendHeaders) {
+  api.webRequest.onSendHeaders.addListener((details) => {
+    try {
+      const referer = (details.requestHeaders || []).find((header) => header.name?.toLowerCase() === "referer")?.value || "";
+      if (!referer) return;
+      if (refererByRequestId.size >= REFERER_MAP_MAX) {
+        const first = refererByRequestId.keys().next().value;
+        if (first !== undefined) refererByRequestId.delete(first);
+      }
+      refererByRequestId.set(details.requestId, referer);
+    } catch (_) { /* Referer capture is best-effort. */ }
+  }, { urls: ["<all_urls>"], types: ["xmlhttprequest", "media", "other"] }, ["requestHeaders"]);
+}
+function takeReferer(requestId) {
+  const referer = refererByRequestId.get(requestId) || "";
+  refererByRequestId.delete(requestId);
+  return referer;
+}
+if (api.webRequest?.onErrorOccurred) {
+  api.webRequest.onErrorOccurred.addListener((details) => {
+    refererByRequestId.delete(details.requestId);
+  }, { urls: ["<all_urls>"] });
+}
+
+// Slice 2: unassigned (tabId === -1) sources. A service-worker
+// fetch carries no tab, but it does carry an initiator origin and
+// usually a Referer naming the page that triggered it. Entries are
+// kept here (never in a random tab's list), expire after 5 minutes,
+// and are merged into a tab only by GET_ACTIVE_SOURCES when they
+// match that tab's page. Unassigned sources are NOT persisted:
+// without a tab there is no page URL to rehydrate against.
+const unassignedSources = [];
+const UNASSIGNED_MAX = 100;
+const UNASSIGNED_TTL_MS = 5 * 60 * 1000;
+function recordUnassignedSource(url, kind, referer, initiator) {
+  try {
+    const now = Date.now();
+    for (let i = unassignedSources.length - 1; i >= 0; i--) {
+      if (now - unassignedSources[i].discoveredAt > UNASSIGNED_TTL_MS) unassignedSources.splice(i, 1);
+    }
+    if (unassignedSources.some((item) => item.url === url)) return;
+    unassignedSources.push({ url, kind, label: kind, discoveredAt: now, referer: referer || "", initiator: initiator || "" });
+    if (unassignedSources.length > UNASSIGNED_MAX) {
+      unassignedSources.splice(0, unassignedSources.length - UNASSIGNED_MAX);
+    }
+  } catch (_) { /* Unassigned storage is best-effort. */ }
+}
+// Returns mergeTabSources' truncation result (true when the merged
+// list is truncated), or false when nothing matched.
+function mergeUnassignedForTab(tabId, pageUrl) {
+  if (typeof tabId !== "number" || !pageUrl) return false;
+  let pageOrigin = "";
+  try { pageOrigin = new URL(pageUrl).origin; } catch (_) { return false; }
+  const matched = [];
+  const remaining = [];
+  for (const item of unassignedSources) {
+    let refererUrl = "";
+    try { refererUrl = item.referer ? new URL(item.referer).href : ""; } catch (_) {}
+    const exact = !!refererUrl && refererUrl === pageUrl;
+    let origin = "";
+    try { origin = item.initiator ? new URL(item.initiator).origin : ""; } catch (_) {}
+    if (exact || (origin && origin === pageOrigin)) {
+      matched.push(item);
+      // Origin-only matches stay: another same-origin tab may own
+      // them. Exact-Referer matches belong to exactly this page.
+      if (!exact) remaining.push(item);
+    } else {
+      remaining.push(item);
+    }
+  }
+  if (!matched.length) return false;
+  unassignedSources.length = 0;
+  unassignedSources.push(...remaining);
+  return mergeTabSources(tabId, matched.map((item) => {
+    const merged = { url: item.url, kind: item.kind, label: item.label, discoveredAt: item.discoveredAt };
+    if (item.referer) merged.referer = item.referer;
+    return merged;
+  }), false);
+}
 if (api.webRequest?.onHeadersReceived) {
   api.webRequest.onHeadersReceived.addListener((details) => {
     const kind = classifyNetworkResponse(details.url, details.responseHeaders || []);
-    if (kind) recordNetworkSource(details.tabId, details.url, kind);
+    if (kind) {
+      recordNetworkSource(details.tabId, details.url, kind, {
+        referer: takeReferer(details.requestId),
+        initiator: details.initiator || ""
+      });
+    } else {
+      // No media: still drop the Referer entry so the map does not
+      // hold entries for requests we will never attribute.
+      takeReferer(details.requestId);
+    }
   }, { urls: ["<all_urls>"], types: ["xmlhttprequest", "media", "other"] }, ["responseHeaders"]);
 }
 api.tabs.onUpdated.addListener((tabId, changeInfo) => { if (changeInfo.status === "loading") { sourcesByTab.delete(tabId); truncatedByTab.delete(tabId); removePersistedTabSources(tabId); } });

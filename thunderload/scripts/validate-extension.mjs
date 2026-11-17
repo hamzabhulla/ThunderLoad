@@ -3,7 +3,7 @@ import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const ext = resolve(root, "extension");
-for (const file of ["background.js","content.js","popup.html","popup.css","popup.js","icons/16.png","icons/32.png","icons/48.png","icons/128.png"]) await access(resolve(ext,file));
+for (const file of ["background.js","content.js","hook.js","popup.html","popup.css","popup.js","icons/16.png","icons/32.png","icons/48.png","icons/128.png"]) await access(resolve(ext,file));
 const chromium = JSON.parse(await readFile(resolve(ext,"manifest.json"),"utf8"));
 const firefox = JSON.parse(await readFile(resolve(ext,"manifest.firefox.json"),"utf8"));
 // Why the extension requests broad host access: IDM-style automatic video
@@ -24,6 +24,14 @@ for (const [name,manifest] of [["Chromium",chromium],["Firefox",firefox]]) {
   if (!manifest.host_permissions?.includes("<all_urls>")) throw new Error(name+" must request <all_urls> host access for automatic detection");
   const script = manifest.content_scripts?.[0];
   if (!script || !script.matches?.includes("<all_urls>") || !script.js?.includes("content.js") || script.run_at !== "document_idle" || script.all_frames !== true) throw new Error(name+" must auto-inject content.js on every page (all frames, document_idle)");
+  // Slice 2: the MAIN-world hook (hook.js) runs in the page's own
+  // JavaScript world at document_start so it can wrap MediaSource /
+  // fetch / XHR before page scripts run. Chrome supports world MAIN
+  // since 111 (manifest requires 116); Firefox since 128 (manifest
+  // requires 128.0) — older Firefox ignores the key and runs the
+  // script isolated, where it observes nothing (harmless no-op).
+  const hook = manifest.content_scripts?.find((entry) => entry.world === "MAIN");
+  if (!hook || !hook.js?.includes("hook.js") || hook.run_at !== "document_start" || hook.all_frames !== true) throw new Error(name+" must inject hook.js in the MAIN world at document_start (all frames)");
 }
 if (!firefox.browser_specific_settings?.gecko?.id) throw new Error("Firefox manifest needs a stable Gecko add-on ID");
 console.log("Extension manifests and required assets are valid.");
