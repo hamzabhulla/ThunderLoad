@@ -6,7 +6,7 @@ import { save } from "@tauri-apps/plugin-dialog";
 type Page = "downloads" | "queues" | "scheduler" | "settings";
 type StatusTab = "all" | "active" | "completed" | "failed";
 type InspectorTab = "overview" | "files" | "segments" | "activity";
-type Kind = "direct" | "hls" | "dash";
+type Kind = "direct" | "hls" | "dash" | "ytdlp";
 type Status = "Queued" | "Downloading" | "Pausing" | "Paused" | "Cancelling" | "Completed" | "Failed" | "Interrupted" | "Cancelled";
 type Variant = { kind: string; quality: string; width?: number; height?: number; bandwidth?: number; url: string; downloadable: boolean; note?: string; representationId?: string; audioRepresentationId?: string; audioOnly?: boolean };
 type GrabItem = { url: string; kind: string; name: string };
@@ -38,8 +38,20 @@ function readNativeIds(): Record<string, string> {
 
 // Refusal shown when a pasted URL inspects as a webpage instead of a
 // direct media file — the same wording as the Format support note on the
-// Video page.
-const YOUTUBE_PAGE_MESSAGE = "A YouTube watch page is not a direct media URL; page extraction of its streams is not supported";
+// Video page. (YouTube/social pages never reach this: they route to the
+// yt-dlp inspect flow in add() below.)
+const YOUTUBE_PAGE_MESSAGE = "That page is not a direct media URL. Paste a YouTube or social video page to inspect it with yt-dlp, or a direct media link.";
+
+// Slice 3: pages yt-dlp knows how to extract — same host list as the
+// extension's YTDLP_HOSTS. A pasted page URL here routes to the yt-dlp
+// inspect flow instead of the direct-media probe.
+const YTDLP_PAGE_HOSTS = ["youtube.com", "youtu.be", "instagram.com", "tiktok.com", "twitter.com", "x.com", "facebook.com", "fb.watch", "reddit.com", "twitch.tv", "vimeo.com"];
+function isYtDlpPageUrl(value: string): boolean {
+  try {
+    const host = new URL(value).hostname.toLowerCase();
+    return YTDLP_PAGE_HOSTS.some((listed) => host === listed || host.endsWith("." + listed));
+  } catch { return false; }
+}
 
 function bytes(value: number): string {
   if (!Number.isFinite(value) || value <= 0) return "0 B";
@@ -73,7 +85,7 @@ function nameFromUrl(value: string): string {
   } catch { return "download.bin"; }
 }
 function storedJobToItem(row: StoredJob): Item {
-  const kind: Kind = row.kind === "hls" ? "hls" : row.kind === "dash" ? "dash" : "direct";
+  const kind: Kind = row.kind === "hls" ? "hls" : row.kind === "dash" ? "dash" : row.kind === "ytdlp" ? "ytdlp" : "direct";
   const status: Status = (["Queued", "Downloading", "Paused", "Completed", "Failed", "Interrupted", "Cancelled"].includes(row.state) ? row.state : "Failed") as Status;
   const percent = row.percent !== undefined
     ? Math.max(0, Math.min(100, row.percent))
@@ -196,6 +208,14 @@ export default function App() {
   const [ffmpegPath, setFfmpegPath] = useState("ffmpeg");
   const [ffmpegStatus, setFfmpegStatus] = useState("");
   const [ffmpegSaving, setFfmpegSaving] = useState(false);
+  // Slice 3: on-demand yt-dlp/Deno tools (option b — nothing bundled).
+  // The title from a yt-dlp inspect becomes the download filename.
+  const [videoTitle, setVideoTitle] = useState("");
+  const [ytdlpTools, setYtdlpTools] = useState<{ ytdlp: { present: boolean; version?: string }; deno: { present: boolean; version?: string }; toolsDir: string } | null>(null);
+  const [ytdlpToolProgress, setYtdlpToolProgress] = useState<{ tool: string; percent?: number } | null>(null);
+  const [ytdlpDownloading, setYtdlpDownloading] = useState<string | null>(null);
+  const [ytdlpUpdateStatus, setYtdlpUpdateStatus] = useState("");
+  const [ytdlpCheckingUpdate, setYtdlpCheckingUpdate] = useState(false);
   // Direction A ("The Task List") layout state: the status tab + search
   // filter the Downloads table; a row click opens the right inspector;
   // the Add form and the video grabber live in dialogs, not pages.
@@ -412,7 +432,7 @@ export default function App() {
           id: "native-" + job.id,
           name: job.name || "Browser download",
           url: job.url || "",
-          kind: job.kind === "hls" ? "hls" : job.kind === "dash" ? "dash" : "direct",
+          kind: job.kind === "hls" ? "hls" : job.kind === "dash" ? "dash" : job.kind === "ytdlp" ? "ytdlp" : "direct",
           status: (["Downloading", "Paused", "Completed", "Failed", "Interrupted", "Cancelled"].includes(job.status || "") ? job.status : "Failed") as Status,
           percent: Math.max(0, Math.min(100, job.percent || 0)),
           downloaded: job.downloaded || 0,
@@ -447,11 +467,17 @@ export default function App() {
     return () => { alive = false; };
   }, []);
 
+  // Slice 3: load the yt-dlp/Deno tool status whenever Settings opens.
+  useEffect(() => { if (page === "settings") void loadYtDlpTools(); }, [page]);
+
   useEffect(() => {
     let alive = true;
     let cleanup: Array<() => void> = [];
     (async () => {
       const listeners = await Promise.all([
+        listen<{ tool: string; downloaded: number; total?: number; percent?: number }>("ytdlp-tool-progress", ({ payload }) => {
+          setYtdlpToolProgress({ tool: payload.tool, percent: payload.percent });
+        }),
         listen<{ jobId: string; progress: Progress }>("download-progress", ({ payload }) => {
           // Record a speed sample for the Motrix rule: the rate comes
           // from the bytes moved since the previous event, never from
@@ -526,7 +552,20 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           // job back onto the Scheduler page after a restart.
           setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, scheduledAt: undefined } : entry));
         }
-        if (item.kind === "hls") {
+        if (item.kind === "ytdlp") {
+          // Slice 3: the format selector is representationId (+ "+" +
+          // audioRepresentationId for a merged pick) — the backend
+          // re-runs the identical yt-dlp command on resume, and yt-dlp
+          // resumes from its .part files natively.
+          const formatSelector = item.audioRepresentationId
+            ? (item.representationId || "") + "+" + item.audioRepresentationId
+            : (item.representationId || "");
+          const targetPath = await invoke<string>("start_ytdlp_download", {
+            jobId: item.id, url: item.url, formatSelector, filename: item.name,
+            targetPath: item.targetPath || null, scheduledAt: null
+          });
+          setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, targetPath } : entry));
+        } else if (item.kind === "hls") {
           // Pass the paused/failed job's target back so the backend
           // reuses its on-disk checkpoint instead of reserving a fresh
           // target and restarting from scratch. The returned path is
@@ -574,18 +613,26 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       setNotice("Choose a future start time, or clear the schedule field.");
       return;
     }
-    // Paste path only (no requestedKind): ask the engine to classify the
-    // URL before any job exists. Callers that pass requestedKind already
-    // classified it — the Video page inspected the URL, the grabber only
-    // yields media links, and a retry re-queues a job that was already
-    // accepted — so they skip this probe. inspect_video rejects a webpage
-    // (its error says the URL "is a webpage"); that verdict refuses the
-    // add with the Format-support wording and creates no job, so a
-    // YouTube watch page can no longer reach start_download as a fake
-    // direct file. Any other probe failure (server refused the metadata
-    // probe, network down) is not a webpage verdict: the URL queues
-    // exactly as before and start_download still validates it.
+    // Paste path only (no requestedKind): a YouTube/social page routes
+    // to the yt-dlp inspect flow — the grabber opens and the formats are
+    // listed for the user to pick. Everything else asks the engine to
+    // classify the URL before any job exists. Callers that pass
+    // requestedKind already classified it — the Video page inspected the
+    // URL, the grabber only yields media links, and a retry re-queues a
+    // job that was already accepted — so they skip this probe.
+    // inspect_video rejects a webpage (its error says the URL "is a
+    // webpage"); that verdict refuses the add with the Format-support
+    // wording and creates no job. Any other probe failure (server refused
+    // the metadata probe, network down) is not a webpage verdict: the
+    // URL queues exactly as before and start_download still validates it.
     if (!requestedKind) {
+      if (isYtDlpPageUrl(clean)) {
+        setVideoUrl(clean);
+        setAddOpen(false);
+        setGrabberOpen(true);
+        void inspectYtDlp(clean);
+        return;
+      }
       setNotice("Checking link…");
       try {
         await invoke<Variant[]>("inspect_video_url", { url: clean, referer: null });
@@ -770,9 +817,61 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     finished.forEach((item) => speedSamples.current.delete(item.id));
     setItems((current) => current.filter((item) => item.status !== "Completed" && item.status !== "Cancelled"));
   }
+  // Slice 3: inspect a YouTube/social page with yt-dlp and list its
+  // formats as variants (kind "ytdlp", representationId = format id).
+  // A missing tool is data, not an error — the notice names the tool and
+  // points at Settings, where the direct download button lives.
+  async function inspectYtDlp(pageUrl: string) {
+    setInspecting(true); setVariants([]); setVideoTitle("");
+    setVideoNotice("Getting formats…");
+    try {
+      const result = await invoke<{ title?: string; variants: Variant[]; toolsMissing?: string }>("inspect_ytdlp_url", { url: pageUrl });
+      if (result.toolsMissing) {
+        setVideoNotice(result.toolsMissing + " is not installed yet — download it from Settings, then inspect again.");
+        return;
+      }
+      setVariants(result.variants);
+      setVideoTitle(result.title || "");
+      setVideoNotice(result.variants.length ? result.variants.length + " format option(s) found." : "No downloadable formats found.");
+    } catch (error) { setVideoNotice(String(error)); }
+    finally { setInspecting(false); }
+  }
+  async function loadYtDlpTools() {
+    try {
+      const status = await invoke<{ ytdlp: { present: boolean; version?: string }; deno: { present: boolean; version?: string }; toolsDir: string }>("get_ytdlp_tools_status");
+      setYtdlpTools(status);
+    } catch { /* Settings shows the loading state again on next visit. */ }
+  }
+  async function downloadYtDlpTool(tool: "ytdlp" | "deno", displayName: string) {
+    // The tap itself is the consent: nothing downloads until the user
+    // presses this button, and progress names the tool being fetched.
+    setYtdlpDownloading(tool);
+    setYtdlpToolProgress({ tool: displayName, percent: 0 });
+    try {
+      await invoke<string>("ensure_ytdlp_tool", { tool });
+      setYtdlpToolProgress(null);
+      setYtdlpUpdateStatus(displayName + " downloaded and verified.");
+      await loadYtDlpTools();
+    } catch (error) {
+      setYtdlpToolProgress(null);
+      setYtdlpUpdateStatus("Could not download " + displayName + ": " + String(error));
+    } finally {
+      setYtdlpDownloading(null);
+    }
+  }
+  async function checkYtDlpUpdate() {
+    setYtdlpCheckingUpdate(true);
+    setYtdlpUpdateStatus("Checking for yt-dlp updates…");
+    try {
+      setYtdlpUpdateStatus(await invoke<string>("check_ytdlp_update"));
+      await loadYtDlpTools();
+    } catch (error) { setYtdlpUpdateStatus(String(error)); }
+    finally { setYtdlpCheckingUpdate(false); }
+  }
   async function inspect() {
     const clean = videoUrl.trim();
     if (!/^https?:\/\//i.test(clean)) { setVideoNotice("Paste a valid HTTP or HTTPS media URL."); return; }
+    if (isYtDlpPageUrl(clean)) { await inspectYtDlp(clean); return; }
     setInspecting(true); setVariants([]); setVideoNotice("Inspecting media URL…");
     try {
       const result = await invoke<Variant[]>("inspect_video_url", { url: clean, referer: null });
@@ -1049,7 +1148,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           {variants.length > 0 && <div className="variants"><div className="variants-heading"><h3>Available streams</h3><span>{variants.length} OPTIONS</span></div>
             {variants.map((variant, index) => <div className="variant" key={variant.url + index}>
               <div><strong>{variant.quality}</strong><small>{variant.kind.toUpperCase()}{variant.width && variant.height ? " · " + variant.width + " × " + variant.height : ""}{variant.bandwidth ? " · " + Math.round(variant.bandwidth / 1000) + " kbps" : ""}</small>{variant.note && <p>{variant.note}</p>}</div>
-              <button className="secondary-button" disabled={!variant.downloadable} onClick={() => add(variant.kind === "dash" ? videoUrl : variant.url, "video.mp4", variant.kind === "hls" ? "hls" : variant.kind === "dash" ? "dash" : "direct", variant.representationId, variant.audioRepresentationId)}>{variant.downloadable ? "Download" : "Unavailable"}</button>
+              <button className="secondary-button" disabled={!variant.downloadable} onClick={() => add(variant.kind === "dash" ? videoUrl : variant.url, variant.kind === "ytdlp" ? (videoTitle ? videoTitle + ".mp4" : "video.mp4") : "video.mp4", variant.kind === "hls" ? "hls" : variant.kind === "dash" ? "dash" : variant.kind === "ytdlp" ? "ytdlp" : "direct", variant.representationId, variant.audioRepresentationId)}>{variant.downloadable ? "Download" : "Unavailable"}</button>
             </div>)}
           </div>}
           <div className="rule" />
@@ -1073,7 +1172,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
               <label className="grab-item"><input type="checkbox" checked={!!grabChecked[item.url]} onChange={(event) => setGrabChecked((current) => ({ ...current, [item.url]: event.target.checked }))} /><span><strong>{item.name}</strong><small>{item.kind.toUpperCase()} · {hostOf(item.url)}</small></span></label>
             </div>)}
           </div>}
-          <div className="support-note"><strong>Format support</strong><p>Direct HTTP/HTTPS files use resumable transfers. HLS supports completed unencrypted VOD, with Pause/Resume/Cancel. DASH supports static MPDs with SegmentTemplate/SegmentTimeline, SegmentList, SegmentBase and multi-period, with Pause/Resume/Cancel; separate audio/video requires FFmpeg. Live/dynamic MPDs and DRM are not supported. A YouTube watch page is not a direct media URL; page extraction of its streams is not supported, but "Grab a page" above lists media files a page links to directly.</p></div>
+          <div className="support-note"><strong>Format support</strong><p>Direct HTTP/HTTPS files use resumable transfers. HLS supports completed unencrypted VOD, with Pause/Resume/Cancel. DASH supports static MPDs with SegmentTemplate/SegmentTimeline, SegmentList, SegmentBase and multi-period, with Pause/Resume/Cancel; separate audio/video requires FFmpeg. Live/dynamic MPDs and DRM are not supported. YouTube and social video pages are inspected with yt-dlp — paste a video page URL above and pick a format; yt-dlp and Deno download on first use from Settings. "Grab a page" below lists media files a page links to directly.</p></div>
         </div>
       </div>
     </div>;
@@ -1211,7 +1310,35 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
             {extensionFileStatus && <div className="notice native-host-notice">{extensionFileStatus}</div>}
           </div>
           <div className="rule" />
-          <div className="settings-section"><div><h2>About</h2><p>Local desktop transfer engine · Version 0.3.4</p></div><div className="about-line"><span>Supported media</span><strong>Direct files · HLS VOD · Static DASH VOD</strong></div><div className="about-line"><span>Direct downloads</span><strong>Pause · Resume · Cancel · Speed limit · Schedule</strong></div><div className="about-line"><span>Still in development</span><strong>Multi-connection resume · Live DASH</strong></div></div>
+          <div className="settings-section">
+            <div><h2>YouTube &amp; social downloads</h2><p>YouTube and social video pages are downloaded with yt-dlp (Deno runs its JavaScript for full quality). Neither tool is bundled with the installer — download each once, here, and ThunderLoad verifies it before use.</p></div>
+            <div className="setting-row">
+              <div><strong>yt-dlp {ytdlpTools ? (ytdlpTools.ytdlp.present ? "· Installed" + (ytdlpTools.ytdlp.version ? " · " + ytdlpTools.ytdlp.version : "") : "· Not installed") : "· Checking…"}</strong><small>Extracts video formats from YouTube, Instagram, TikTok, X, Facebook, Reddit, Twitch and Vimeo.</small></div>
+              <button className="secondary-button" onClick={() => void downloadYtDlpTool("ytdlp", "yt-dlp")} disabled={ytdlpDownloading !== null}>Download yt-dlp</button>
+            </div>
+            {ytdlpToolProgress?.tool === "yt-dlp" && <div className="notice native-host-notice">yt-dlp download ho raha hai{ytdlpToolProgress.percent !== undefined ? " — " + Math.round(ytdlpToolProgress.percent) + "%" : "…"}</div>}
+            <div className="setting-row">
+              <div><strong>Deno {ytdlpTools ? (ytdlpTools.deno.present ? "· Installed" + (ytdlpTools.deno.version ? " · " + ytdlpTools.deno.version : "") : "· Not installed") : "· Checking…"}</strong><small>JavaScript runtime yt-dlp needs for YouTube's full quality. Without it, YouTube falls back to fewer formats.</small></div>
+              <button className="secondary-button" onClick={() => void downloadYtDlpTool("deno", "Deno")} disabled={ytdlpDownloading !== null}>Download Deno</button>
+            </div>
+            {ytdlpToolProgress?.tool === "Deno" && <div className="notice native-host-notice">Deno download ho raha hai{ytdlpToolProgress.percent !== undefined ? " — " + Math.round(ytdlpToolProgress.percent) + "%" : "…"}</div>}
+            {ytdlpUpdateStatus && <div className="notice native-host-notice">{ytdlpUpdateStatus}</div>}
+            <div className="setting-row">
+              <div><strong>Check for yt-dlp updates</strong><small>YouTube changes often — an extractor error usually means yt-dlp needs an update.</small></div>
+              <button className="secondary-button" onClick={() => void checkYtDlpUpdate()} disabled={ytdlpCheckingUpdate}>{ytdlpCheckingUpdate ? "Checking…" : "Check for updates"}</button>
+            </div>
+            <div className="setting-row">
+              <div><strong>Download it yourself instead</strong><small>Or download the file yourself from the official release page and drop it in the tools folder — ThunderLoad picks it up automatically.</small></div>
+              <div style={{ display: "flex", gap: "8px" }}>
+                <button className="secondary-button" onClick={() => void invoke("open_ytdlp_release_page", { tool: "ytdlp" })}>yt-dlp release page</button>
+                <button className="secondary-button" onClick={() => void invoke("open_ytdlp_release_page", { tool: "deno" })}>Deno release page</button>
+                <button className="secondary-button" onClick={() => void invoke("open_tools_folder")}>Open tools folder</button>
+              </div>
+            </div>
+            <p className="footnote">Tools folder: {ytdlpTools ? ytdlpTools.toolsDir : "…"}</p>
+          </div>
+          <div className="rule" />
+          <div className="settings-section"><div><h2>About</h2><p>Local desktop transfer engine · Version 0.3.4</p></div><div className="about-line"><span>Supported media</span><strong>Direct files · HLS VOD · Static DASH VOD · YouTube &amp; social (yt-dlp)</strong></div><div className="about-line"><span>Direct downloads</span><strong>Pause · Resume · Cancel · Speed limit · Schedule</strong></div><div className="about-line"><span>Still in development</span><strong>Multi-connection resume · Live DASH</strong></div></div>
         </section>}
 
       </div>

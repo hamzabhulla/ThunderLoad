@@ -10,7 +10,7 @@ use anyhow::{anyhow, Result};
 use std::{collections::HashMap, sync::{Arc, Mutex, OnceLock}};
 use serde_json::{json, Value};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::{mpsc, watch}};
-use thunderload_engine::{dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_resumable, download_url_resumable, hls_output_extension, hls_work_dir, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, DownloadControl, DownloadOutcome, GlobalRateLimiter, SessionHeaders};
+use thunderload_engine::{check_ytdlp_update, dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_resumable, download_page, download_url_resumable, ensure_tool, hls_output_extension, hls_work_dir, inspect_page, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, tool_status, tools_dir, DownloadControl, DownloadOutcome, GlobalRateLimiter, SessionHeaders, ToolDownloadProgress, ToolsMissing, YtDlpTool};
 
 const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 
@@ -893,6 +893,276 @@ async fn main() -> Result<()> {
                                     None => {
                                         state["status"] = json!("Interrupted");
                                         state["detail"] = json!("Browser companion disconnected; partial checkpoint kept");
+                                        state["updatedAt"] = json!(timestamp_ms());
+                                        let _ = save_native_job_state(&state).await;
+                                        break 'job;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Ok(mut controls) = native_controls().lock() {
+                        controls.remove(&job_id);
+                    }
+                });
+            }
+            // Slice 3: yt-dlp routing for YouTube/social pages.
+            // The extension sends the PAGE URL (never a sniffed media
+            // URL); the engine inspects it with yt-dlp and maps the
+            // formats onto the panel's VideoVariant rows. A missing
+            // tool is a typed ToolsMissing, not a plain failure — the
+            // extension answers it with the consent UI (named tool +
+            // direct download button), not an error toast.
+            "ytdlp.inspect" => {
+                let url = message.get("url").and_then(Value::as_str).unwrap_or("").to_string();
+                let referer = message.get("referer").and_then(Value::as_str).map(str::to_string);
+                let session = message_session(&message, &url, referer);
+                let tx = outgoing_tx.clone();
+                tokio::spawn(async move {
+                    match inspect_page(&url, session.as_ref()).await {
+                        Ok(inspected) => {
+                            let _ = tx.send(json!({"id": id, "ok": true, "data": {"title": inspected.title, "variants": inspected.variants}}));
+                        }
+                        Err(error) => {
+                            if let Some(missing) = error.downcast_ref::<ToolsMissing>() {
+                                let tools: Vec<&str> = missing.tools.iter().map(|tool| tool.id()).collect();
+                                let _ = tx.send(json!({"id": id, "ok": false, "toolsMissing": tools, "error": error.to_string()}));
+                            } else {
+                                let _ = tx.send(json!({"id": id, "ok": false, "error": error.to_string()}));
+                            }
+                        }
+                    }
+                });
+            }
+            "ytdlp.tools_status" => {
+                let tx = outgoing_tx.clone();
+                tokio::spawn(async move {
+                    let ytdlp = tool_status(YtDlpTool::YtDlp).await;
+                    let deno = tool_status(YtDlpTool::Deno).await;
+                    let _ = tx.send(json!({"id": id, "ok": true, "data": {"ytdlp": ytdlp, "deno": deno, "toolsDir": tools_dir().to_string_lossy()}}));
+                });
+            }
+            // On-demand tool download (option b). The caller already
+            // has explicit consent (the user tapped the download
+            // button); progress is streamed as ytdlp.tool_progress
+            // events so the UI can show "yt-dlp download ho raha hai
+            // — 45%". The download is SHA256-verified in the engine
+            // before the file becomes the tool.
+            "ytdlp.ensure_tool" => {
+                let tool_id = message.get("tool").and_then(Value::as_str).unwrap_or("").to_string();
+                let Some(tool) = YtDlpTool::from_id(&tool_id) else {
+                    let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": "Unknown tool"}));
+                    continue;
+                };
+                let tx = outgoing_tx.clone();
+                tokio::spawn(async move {
+                    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<ToolDownloadProgress>();
+                    let tx_progress = tx.clone();
+                    let progress_handle = tokio::spawn(async move {
+                        while let Some(progress) = progress_rx.recv().await {
+                            let _ = tx_progress.send(json!({"event": "ytdlp.tool_progress", "tool": progress.tool.id(), "downloaded": progress.downloaded, "total": progress.total, "percent": progress.percent}));
+                        }
+                    });
+                    match ensure_tool(tool, Some(progress_tx)).await {
+                        Ok(path) => {
+                            let _ = progress_handle.await;
+                            let _ = tx.send(json!({"id": id, "ok": true, "data": {"tool": tool.id(), "path": path.to_string_lossy()}}));
+                        }
+                        Err(error) => {
+                            let _ = progress_handle.await;
+                            let _ = tx.send(json!({"id": id, "ok": false, "error": error.to_string()}));
+                        }
+                    }
+                });
+            }
+            "ytdlp.check_update" => {
+                let tx = outgoing_tx.clone();
+                tokio::spawn(async move {
+                    match check_ytdlp_update().await {
+                        Ok(message) => {
+                            let _ = tx.send(json!({"id": id, "ok": true, "data": {"message": message}}));
+                        }
+                        Err(error) => {
+                            if let Some(missing) = error.downcast_ref::<ToolsMissing>() {
+                                let tools: Vec<&str> = missing.tools.iter().map(|tool| tool.id()).collect();
+                                let _ = tx.send(json!({"id": id, "ok": false, "toolsMissing": tools, "error": error.to_string()}));
+                            } else {
+                                let _ = tx.send(json!({"id": id, "ok": false, "error": error.to_string()}));
+                            }
+                        }
+                    }
+                });
+            }
+            "ytdlp.download" => {
+                let url = message.get("url").and_then(Value::as_str).unwrap_or("").to_string();
+                let referer = message.get("referer").and_then(Value::as_str).map(str::to_string);
+                let session = message_session(&message, &url, referer);
+                let filename = output_name(message.get("filename"), "video.mp4");
+                // The panel sends the format selector directly; older
+                // callers send representation ids instead.
+                let format_selector = match message.get("formatSelector").and_then(Value::as_str) {
+                    Some(selector) if !selector.trim().is_empty() => selector.to_string(),
+                    _ => {
+                        let representation = message.get("representationId").and_then(Value::as_str).unwrap_or("");
+                        let audio = message.get("audioRepresentationId").and_then(Value::as_str).unwrap_or("");
+                        if audio.is_empty() { representation.to_string() } else { format!("{representation}+{audio}") }
+                    }
+                };
+                if !(url.starts_with("http://") || url.starts_with("https://")) {
+                    let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": "Only HTTP and HTTPS page URLs are supported"}));
+                    continue;
+                }
+                if format_selector.trim().is_empty() {
+                    let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": "No format was selected for this download"}));
+                    continue;
+                }
+                let target = match reserve_download_path(&default_download_dir().join(&filename)).await {
+                    Ok(path) => path,
+                    Err(error) => {
+                        let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": error.to_string()}));
+                        continue;
+                    }
+                };
+                let job_id = uuid::Uuid::new_v4().to_string();
+                let (control_tx, mut control_rx) = watch::channel(DownloadControl::Running);
+                if let Ok(mut controls) = native_controls().lock() {
+                    controls.insert(job_id.clone(), control_tx);
+                } else {
+                    cleanup_native_partial(&target).await;
+                    let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": "Native download control registry is unavailable"}));
+                    continue;
+                }
+                let tx = outgoing_tx.clone();
+                let mut state = native_job_state(&job_id, &filename, &url, "ytdlp");
+                state["targetPath"] = json!(target.to_string_lossy().to_string());
+                state["formatSelector"] = json!(format_selector);
+                if let Some(session) = &session {
+                    state["session"] = serde_json::to_value(session).unwrap_or(Value::Null);
+                }
+                let _ = save_native_job_state(&state).await;
+                let _ = outgoing_tx.send(json!({"id": id, "ok": true, "data": {"accepted": true, "jobId": job_id}}));
+                tokio::spawn(async move {
+                    'job: loop {
+                        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+                        let tx_progress = tx.clone();
+                        let progress_job = job_id.clone();
+                        let mut progress_state = load_native_job_state(&job_id, state.clone()).await;
+                        let progress_handle = tokio::spawn(async move {
+                            let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(10));
+                            loop {
+                                tokio::select! {
+                                    _ = heartbeat.tick() => {
+                                        progress_state["updatedAt"] = json!(timestamp_ms());
+                                        let _ = save_native_job_state(&progress_state).await;
+                                    }
+                                    progress = progress_rx.recv() => match progress {
+                                        Some(progress) => {
+                                            apply_native_progress(&mut progress_state, &progress);
+                                            let _ = save_native_job_state(&progress_state).await;
+                                            let _ = tx_progress.send(json!({"event": "download.progress", "jobId": progress_job, "progress": progress}));
+                                        }
+                                        None => break,
+                                    }
+                                }
+                            }
+                        });
+
+                        let result = download_page(
+                            &url, &format_selector, &target, session.as_ref(), control_rx.clone(), progress_tx
+                        ).await;
+                        let _ = progress_handle.await;
+
+                        match result {
+                            Ok((DownloadOutcome::Completed, produced)) => {
+                                let final_path = produced.unwrap_or_else(|| target.clone());
+                                state = load_native_job_state(&job_id, state).await;
+                                state["status"] = json!("Completed");
+                                state["percent"] = json!(100);
+                                state["detail"] = json!("Download complete");
+                                state["targetPath"] = json!(final_path.to_string_lossy().to_string());
+                                state["updatedAt"] = json!(timestamp_ms());
+                                let _ = save_native_job_state(&state).await;
+                                let _ = tx.send(json!({"event": "download.complete", "jobId": job_id, "path": final_path.to_string_lossy()}));
+                                break 'job;
+                            }
+                            Ok((DownloadOutcome::Cancelled, _)) => {
+                                state = load_native_job_state(&job_id, state).await;
+                                state["status"] = json!("Cancelled");
+                                state["detail"] = json!("Cancelled · partial file removed");
+                                state["targetPath"] = Value::Null;
+                                state["updatedAt"] = json!(timestamp_ms());
+                                let _ = save_native_job_state(&state).await;
+                                let _ = tx.send(json!({"event": "download.cancelled", "jobId": job_id}));
+                                break 'job;
+                            }
+                            Ok((DownloadOutcome::Paused, _)) => {
+                                state = load_native_job_state(&job_id, state).await;
+                                state["status"] = json!("Paused");
+                                state["detail"] = json!("Paused · partial file kept for resume");
+                                state["targetPath"] = json!(target.to_string_lossy().to_string());
+                                state["updatedAt"] = json!(timestamp_ms());
+                                let _ = save_native_job_state(&state).await;
+                                let _ = tx.send(json!({"event": "download.paused", "jobId": job_id}));
+                                match wait_native_job_control(&mut control_rx, &mut state, true).await {
+                                    Some(DownloadControl::Running) => {
+                                        state["status"] = json!("Downloading");
+                                        state["detail"] = json!("Resuming with yt-dlp");
+                                        state["updatedAt"] = json!(timestamp_ms());
+                                        let _ = save_native_job_state(&state).await;
+                                        continue 'job;
+                                    }
+                                    Some(DownloadControl::Cancelled) => {
+                                        cleanup_native_partial(&target).await;
+                                        state["status"] = json!("Cancelled");
+                                        state["detail"] = json!("Cancelled · partial file removed");
+                                        state["targetPath"] = Value::Null;
+                                        state["updatedAt"] = json!(timestamp_ms());
+                                        let _ = save_native_job_state(&state).await;
+                                        let _ = tx.send(json!({"event": "download.cancelled", "jobId": job_id}));
+                                        break 'job;
+                                    }
+                                    Some(DownloadControl::Paused) => unreachable!(),
+                                    None => {
+                                        state["status"] = json!("Interrupted");
+                                        state["detail"] = json!("Browser companion disconnected; partial files kept");
+                                        state["updatedAt"] = json!(timestamp_ms());
+                                        let _ = save_native_job_state(&state).await;
+                                        break 'job;
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                state = load_native_job_state(&job_id, state).await;
+                                state["status"] = json!("Failed");
+                                state["error"] = json!(error.to_string());
+                                state["detail"] = json!("Download interrupted · partial files kept");
+                                state["targetPath"] = json!(target.to_string_lossy().to_string());
+                                state["updatedAt"] = json!(timestamp_ms());
+                                let _ = save_native_job_state(&state).await;
+                                let _ = tx.send(json!({"event": "download.error", "jobId": job_id, "error": error.to_string()}));
+                                match wait_native_job_control(&mut control_rx, &mut state, false).await {
+                                    Some(DownloadControl::Running) => {
+                                        state["status"] = json!("Downloading");
+                                        state["error"] = Value::Null;
+                                        state["detail"] = json!("Retrying with yt-dlp");
+                                        state["updatedAt"] = json!(timestamp_ms());
+                                        let _ = save_native_job_state(&state).await;
+                                        continue 'job;
+                                    }
+                                    Some(DownloadControl::Cancelled) => {
+                                        cleanup_native_partial(&target).await;
+                                        state["status"] = json!("Cancelled");
+                                        state["detail"] = json!("Cancelled · partial file removed");
+                                        state["targetPath"] = Value::Null;
+                                        state["updatedAt"] = json!(timestamp_ms());
+                                        let _ = save_native_job_state(&state).await;
+                                        let _ = tx.send(json!({"event": "download.cancelled", "jobId": job_id}));
+                                        break 'job;
+                                    }
+                                    Some(DownloadControl::Paused) => unreachable!(),
+                                    None => {
+                                        state["status"] = json!("Interrupted");
+                                        state["detail"] = json!("Browser companion disconnected; partial files kept");
                                         state["updatedAt"] = json!(timestamp_ms());
                                         let _ = save_native_job_state(&state).await;
                                         break 'job;

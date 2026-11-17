@@ -7,9 +7,10 @@
 use std::{collections::HashMap, path::{Path, PathBuf}, process::Command, sync::{Arc, Mutex, OnceLock}, time::{Duration, Instant}};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{Emitter, Manager};
-use thunderload_engine::{dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_resumable, download_url_resumable, grab_page_media as engine_grab_page_media, hls_work_dir, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, store_file_name, DownloadControl, DownloadOutcome, DownloadProgress, GlobalRateLimiter, JobKind, JobOrigin, JobRecord, JobState, JobStore, PageMediaList, SessionHeaders};
+use thunderload_engine::{check_ytdlp_update, dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_resumable, download_page, download_url_resumable, ensure_tool, grab_page_media as engine_grab_page_media, hls_work_dir, inspect_page, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, store_file_name, tool_status, tools_dir, DownloadControl, DownloadOutcome, DownloadProgress, GlobalRateLimiter, JobKind, JobOrigin, JobRecord, JobState, JobStore, PageMediaList, SessionHeaders, ToolDownloadProgress, ToolStatus, ToolsMissing, YtDlpTool};
 use tokio::{process::Command as TokioCommand, sync::{mpsc, watch}};
 
 /// Build a child-process command that never shows a console window on
@@ -134,6 +135,22 @@ async fn delete_desktop_resume_files(target: &Path) {
     let _ = tokio::fs::remove_dir_all(hls_work_dir(target)).await;
     let _ = tokio::fs::remove_dir_all(dash_work_dir(target)).await;
     let _ = tokio::fs::remove_file(target).await;
+    // yt-dlp partials: <stem>.part and <stem>.<format>.<ext>.part
+    // siblings of the reserved target. A paused yt-dlp job cancelled
+    // from the UI has no engine checkpoint — without this its .part
+    // files would survive the cancel. Harmless for other kinds: they
+    // never create such files.
+    if let (Some(parent), Some(stem)) = (target.parent(), target.file_stem().and_then(|stem| stem.to_str())) {
+        let prefix = format!("{stem}.");
+        if let Ok(mut entries) = tokio::fs::read_dir(parent).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with(&prefix) && name.ends_with(".part") {
+                    let _ = tokio::fs::remove_file(entry.path()).await;
+                }
+            }
+        }
+    }
 }
 
 /// Reports the final outcome of a desktop download task.
@@ -1266,6 +1283,223 @@ async fn start_dash_download(
     Ok(target.to_string_lossy().to_string())
 }
 
+// --- Slice 3: yt-dlp routing for YouTube/social pages (option b) ---
+// Neither tool is bundled with the installer: yt-dlp and Deno live in
+// %LOCALAPPDATA%\ThunderLoad\tools and are fetched on first use, only
+// after the user taps the direct download button — the tap is the
+// consent, never a silent background fetch — SHA256-verified against
+// the pinned sums in engine/src/ytdlp.rs. Licenses: yt-dlp is Unlicense
+// (public domain), Deno is MIT. Neither binary is shipped, so there is
+// no installer change and no license file to bundle; the facts are
+// recorded here and where the tools are resolved.
+
+#[derive(Serialize)]
+struct YtDlpInspectView {
+    title: Option<String>,
+    variants: Vec<thunderload_engine::VideoVariant>,
+    tools_missing: Option<String>,
+}
+
+/// Inspect a YouTube/social page with yt-dlp (desktop paste flow has no
+/// browser session, so no cookies are handed over). A missing tool is
+/// returned as data, not an error, so the UI can show the named
+/// download button instead of a bare failure.
+#[tauri::command]
+async fn inspect_ytdlp_url(url: String) -> Result<YtDlpInspectView, String> {
+    match inspect_page(&url, None).await {
+        Ok(inspected) => Ok(YtDlpInspectView {
+            title: inspected.title,
+            variants: inspected.variants,
+            tools_missing: None,
+        }),
+        Err(error) => {
+            if let Some(missing) = error.downcast_ref::<ToolsMissing>() {
+                // ToolsMissing carries a Vec<YtDlpTool> (there is no
+                // single `.tool` field). Inspect needs yt-dlp first;
+                // Deno is optional (YouTube falls back without it), so
+                // the first missing tool is the one the UI offers to
+                // download. The empty case cannot happen (the error is
+                // only built with at least one tool) but defaults
+                // defensively to yt-dlp.
+                Ok(YtDlpInspectView {
+                    title: None,
+                    variants: Vec::new(),
+                    tools_missing: Some(
+                        missing
+                            .tools
+                            .first()
+                            .map(|tool| tool.display_name())
+                            .unwrap_or("yt-dlp")
+                            .to_string(),
+                    ),
+                })
+            } else {
+                Err(error.to_string())
+            }
+        }
+    }
+}
+
+/// Start a yt-dlp download. Mirrors start_hls_download: same control
+/// channel, same durable record, same progress channel and finish path.
+/// The format selector is stored as the record's representation_id so a
+/// resume re-runs the identical yt-dlp command (yt-dlp resumes from its
+/// .part files natively). The produced file may carry a different
+/// extension than the reserved target (audio-only -> .m4a), so the
+/// finish path is told the produced path when there is one.
+#[tauri::command]
+async fn start_ytdlp_download(
+    job_id: String,
+    url: String,
+    format_selector: String,
+    filename: String,
+    target_path: Option<String>,
+    scheduled_at: Option<u64>,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err("Only HTTP and HTTPS page URLs are supported".into());
+    }
+    if format_selector.trim().is_empty() {
+        return Err("Pick a format first".into());
+    }
+    let name = safe_filename(&filename, "video.mp4");
+    // Resume reuses the paused job's target so yt-dlp finds its .part
+    // files; a fresh job reserves a new target, as before.
+    let target = match target_path {
+        Some(path) => PathBuf::from(path),
+        None => reserve_download_path(&default_download_dir().join(&name)).await.map_err(|error| error.to_string())?,
+    };
+    let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
+    {
+        let mut controls = job_controls().lock().map_err(|_| "Download control lock is unavailable")?;
+        controls.insert(job_id.clone(), control_tx);
+    }
+    let mut record = JobRecord::new_desktop(&job_id, &name, &url, JobKind::YtDlp, Some(&target));
+    record.scheduled_at_ms = scheduled_at;
+    record.representation_id = Some(format_selector.clone());
+    with_job_store(|store| {
+        let _ = store.start_job(record);
+    });
+    let transition_rx = control_rx.clone();
+    let job_for_task = job_id.clone();
+    let app_for_task = app.clone();
+    let task_target = target.clone();
+    tauri::async_runtime::spawn(async move {
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<DownloadProgress>();
+        let progress_app = app_for_task.clone();
+        let progress_id = job_for_task.clone();
+        tauri::async_runtime::spawn(async move {
+            while let Some(progress) = progress_rx.recv().await {
+                let (downloaded, total, percent) = (progress.downloaded, progress.total, progress.percent);
+                with_job_store(|store| {
+                    let _ = store.note_progress(&progress_id, downloaded, total, percent);
+                });
+                let _ = progress_app.emit("download-progress", json!({ "jobId": progress_id, "progress": progress }));
+            }
+        });
+        let result = download_page(&url, &format_selector, &task_target, None, control_rx, progress_tx).await;
+        let cancelled_while_finishing = *transition_rx.borrow() == DownloadControl::Cancelled;
+        match result {
+            Ok((outcome, produced)) => {
+                // On completion report the produced path; on pause/cancel
+                // there is none and the reserved target (whose stem names
+                // the .part files) is the right path.
+                let report_target = produced.unwrap_or_else(|| task_target.clone());
+                finish_desktop_download(&app_for_task, &job_for_task, &report_target, Ok(outcome), cancelled_while_finishing).await;
+            }
+            Err(error) => {
+                finish_desktop_download(&app_for_task, &job_for_task, &task_target, Err(error.to_string()), cancelled_while_finishing).await;
+            }
+        }
+    });
+    Ok(target.to_string_lossy().to_string())
+}
+
+#[derive(Serialize)]
+struct YtDlpToolsStatusView {
+    ytdlp: ToolStatus,
+    deno: ToolStatus,
+    tools_dir: String,
+}
+
+#[tauri::command]
+async fn get_ytdlp_tools_status() -> Result<YtDlpToolsStatusView, String> {
+    Ok(YtDlpToolsStatusView {
+        ytdlp: tool_status(YtDlpTool::YtDlp).await,
+        deno: tool_status(YtDlpTool::Deno).await,
+        tools_dir: tools_dir().to_string_lossy().to_string(),
+    })
+}
+
+/// Download one tool (yt-dlp or Deno) on demand. Called ONLY from the
+/// Settings download button — the tap is the consent. Progress is
+/// emitted as "ytdlp-tool-progress" events carrying the tool's display
+/// name so the UI can say "yt-dlp download ho raha hai — 45%".
+/// Routed through ensure_tool, not download_tool: a second tap when
+/// the tool is already present no-ops instead of re-downloading 23 MB
+/// / 41 MB (and on Windows renaming over a running binary fails).
+#[tauri::command]
+async fn ensure_ytdlp_tool(tool: String, app: tauri::AppHandle) -> Result<String, String> {
+    let tool = match tool.as_str() {
+        "ytdlp" => YtDlpTool::YtDlp,
+        "deno" => YtDlpTool::Deno,
+        _ => return Err("Unknown tool".into()),
+    };
+    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<ToolDownloadProgress>();
+    let progress_app = app.clone();
+    let tool_name = tool.display_name().to_string();
+    tauri::async_runtime::spawn(async move {
+        while let Some(progress) = progress_rx.recv().await {
+            let _ = progress_app.emit("ytdlp-tool-progress", json!({
+                "tool": tool_name,
+                "downloaded": progress.downloaded,
+                "total": progress.total,
+                "percent": progress.percent,
+            }));
+        }
+    });
+    let path = ensure_tool(tool, Some(progress_tx)).await.map_err(|error| error.to_string())?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+async fn check_ytdlp_update() -> Result<String, String> {
+    check_ytdlp_update().await.map_err(|error| error.to_string())
+}
+
+/// Open the official release page for one tool in the default browser.
+/// The manual alternative: the user downloads the file themselves and
+/// drops it in the tools folder, and ThunderLoad picks it up.
+#[tauri::command]
+async fn open_ytdlp_release_page(tool: String) -> Result<(), String> {
+    let url = match tool.as_str() {
+        "ytdlp" => "https://github.com/yt-dlp/yt-dlp/releases/tag/2026.10.26",
+        "deno" => "https://github.com/denoland/deno/releases/tag/v2.9.8",
+        _ => return Err("Unknown tool".into()),
+    };
+    #[cfg(target_os = "windows")]
+    let result = hidden_command("cmd").args(["/C", "start", "", url]).spawn();
+    #[cfg(target_os = "macos")]
+    let result = Command::new("open").arg(url).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let result = Command::new("xdg-open").arg(url).spawn();
+    result.map(|_| ()).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn open_tools_folder() -> Result<(), String> {
+    let folder = tools_dir();
+    std::fs::create_dir_all(&folder).map_err(|error| error.to_string())?;
+    #[cfg(target_os = "windows")]
+    let result = hidden_command("explorer").arg(&folder).spawn();
+    #[cfg(target_os = "macos")]
+    let result = Command::new("open").arg(&folder).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let result = Command::new("xdg-open").arg(&folder).spawn();
+    result.map(|_| ()).map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 async fn get_ffmpeg_path(app: tauri::AppHandle) -> Result<Option<String>, String> {
     let path = app.path().app_config_dir().map_err(|error| error.to_string())?.join("ffmpeg.path");
@@ -1757,7 +1991,7 @@ fn main() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![inspect_video_url, grab_page_media, start_download, pause_download, cancel_download, set_speed_limit, schedule_app_wake, cancel_app_wake, start_hls_download, start_dash_download, get_ffmpeg_path, set_ffmpeg_path, get_native_downloads, control_native_download, dismiss_native_download, register_native_host, check_native_host, open_download_folder, save_extension_file, get_jobs, sync_jobs, remove_job, cancel_queued_job])
+        .invoke_handler(tauri::generate_handler![inspect_video_url, grab_page_media, start_download, pause_download, cancel_download, set_speed_limit, schedule_app_wake, cancel_app_wake, start_hls_download, start_dash_download, inspect_ytdlp_url, start_ytdlp_download, get_ytdlp_tools_status, ensure_ytdlp_tool, check_ytdlp_update, open_ytdlp_release_page, open_tools_folder, get_ffmpeg_path, set_ffmpeg_path, get_native_downloads, control_native_download, dismiss_native_download, register_native_host, check_native_host, open_download_folder, save_extension_file, get_jobs, sync_jobs, remove_job, cancel_queued_job])
         .run(tauri::generate_context!())
         .expect("error while running ThunderLoad desktop app");
 }

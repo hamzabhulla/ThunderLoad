@@ -34,4 +34,24 @@ for (const [name,manifest] of [["Chromium",chromium],["Firefox",firefox]]) {
   if (!hook || !hook.js?.includes("hook.js") || hook.run_at !== "document_start" || hook.all_frames !== true) throw new Error(name+" must inject hook.js in the MAIN world at document_start (all frames)");
 }
 if (!firefox.browser_specific_settings?.gecko?.id) throw new Error("Firefox manifest needs a stable Gecko add-on ID");
+// Slice 3: yt-dlp routing contract. The background must handle the
+// new YTDLP message types; the panel and popup must show the tool by
+// name on the consent + progress steps ("yt-dlp download ho raha
+// hai" / "Deno download ho raha hai") and must never show a generic
+// "downloading tool" label. No manifest permission was added for
+// this slice (the tools run in the native host, not the extension).
+const background = await readFile(resolve(ext, "background.js"), "utf8");
+for (const type of ["YTDLP_INSPECT", "YTDLP_DOWNLOAD", "YTDLP_ENSURE_TOOL", "YTDLP_TOOLS_STATUS", "YTDLP_CHECK_UPDATE", "YTDLP_OPEN_MANUAL_PAGE"]) {
+  if (!background.includes('"' + type + '"')) throw new Error("background.js must handle " + type);
+}
+if (!background.includes("ytdlp.inspect") || !background.includes("ytdlp.download")) throw new Error("background.js must forward yt-dlp actions to the native host");
+const content = await readFile(resolve(ext, "content.js"), "utf8");
+const popup = await readFile(resolve(ext, "popup.js"), "utf8");
+for (const [name, text] of [["content.js", content], ["popup.js", popup]]) {
+  if (!text.includes("download ho raha hai")) throw new Error(name + " must name the tool in the download progress text");
+  if (/downloading tool/i.test(text)) throw new Error(name + " must not use a generic downloading-tool label");
+  if (!text.includes("or download it yourself")) throw new Error(name + " must offer the manual download alternative");
+}
+if (!content.includes("YTDLP_INSPECT") || !content.includes("YTDLP_DOWNLOAD")) throw new Error("content.js must run the yt-dlp panel flow");
+if (!popup.includes("YTDLP_INSPECT") || !popup.includes("YTDLP_DOWNLOAD")) throw new Error("popup.js must run the yt-dlp inspect flow");
 console.log("Extension manifests and required assets are valid.");
