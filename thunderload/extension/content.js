@@ -42,6 +42,13 @@
   let scanScheduled = false;
   let activeVideo = null;
   let hideTimer = null;
+  // Slice 1b: the pill auto-hides a few seconds after appearing.
+  // PILL_AUTO_HIDE_MS is the default (Hamza's number if he corrects).
+  const PILL_AUTO_HIDE_MS = 3000;
+  let autoHideTimer = null;
+  // Slice 1b: shown when the nativeMessaging permission cannot be
+  // requested or is denied — one short sentence, no raw errors.
+  const MANUAL_PERMISSION_STEPS = "Allow it manually: chrome://extensions → ThunderLoad → Details → Permissions → enable native messaging, then reload.";
   let buttonHost = null;
   let button = null;
   let status = null;
@@ -131,8 +138,16 @@
       'button.tl-btn:disabled{opacity:.55;cursor:wait}',
       '.message{display:none;position:absolute;top:38px;right:0;max-width:210px;padding:6px 8px;border:1px solid rgba(205,220,238,.2);border-radius:5px;background:rgba(17,25,35,.94);color:#e4edf8;font:10px/1.35 system-ui,-apple-system,"Segoe UI",sans-serif;white-space:normal;box-shadow:0 2px 10px rgba(0,0,0,.2)}',
       '.message.show{display:block}',
-      '.panel{display:none;position:absolute;top:38px;right:0;width:300px;max-width:calc(100vw - 16px);max-height:340px;overflow:auto;padding:12px;border:1px solid #1e293b;border-radius:10px;background:#0b1220;box-shadow:0 8px 24px rgba(0,0,0,.45);pointer-events:auto}',
-      '.panel.show{display:block}',
+      '.panel{display:none;position:absolute;top:38px;right:0;width:300px;max-width:calc(100vw - 16px);max-height:min(420px,calc(100vh - 24px));overflow:hidden;padding:12px;border:1px solid #1e293b;border-radius:10px;background:#0b1220;box-shadow:0 8px 24px rgba(0,0,0,.45);pointer-events:auto}',
+      '.panel.show{display:flex;flex-direction:column}',
+      '.p-head,.p-primary,.p-connect{flex:none}',
+      '.p-scroll{overflow-y:auto;min-height:0}',
+      '.p-q{pointer-events:none;flex:none;padding:2px 6px;border:1px solid #1e293b;border-radius:4px;background:#0b1220;color:#aebdce;font:600 10px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}',
+      '.p-connect{pointer-events:auto;display:block;width:100%;min-height:30px;margin-top:10px;padding:0 12px;border:1px solid #16a34a;border-radius:8px;background:transparent;color:#4ade80;font:600 12px/1.2 system-ui,-apple-system,"Segoe UI",sans-serif;cursor:pointer}',
+      '.p-connect:hover{background:rgba(22,163,74,.15)}',
+      '.p-connect:disabled{opacity:.5;cursor:wait}',
+      '.p-note{display:none;margin-top:8px;color:#aebdce;font:10px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}',
+      '.p-note.show{display:block}',
       '.p-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}',
       '.p-title{display:flex;align-items:center;gap:6px;color:#e8f1fc;font:600 12px/1.2 system-ui,-apple-system,"Segoe UI",sans-serif}',
       '.p-title svg{width:13px;height:13px;flex:none}',
@@ -175,7 +190,10 @@
       if (!target) { showStatus("Move your pointer over a video first."); return; }
       const candidates = candidateSources(target);
       if (!candidates.length) {
-        showStatus("No downloadable media URL is exposed by this player. DRM or protected streams may not be accessible.");
+        // Slice 1b: the panel still opens — with the reason plus the
+        // "Connect desktop app" button — so the permission prompt is
+        // reachable even when nothing is detected.
+        openEmptyPanel(target);
       } else {
         // Best-ranked source first (DASH, then HLS, then Direct media);
         // the rest go in the panel's collapsed other-media section.
@@ -187,8 +205,11 @@
     overlayRoot.append(style, wrap);
     document.documentElement.append(buttonHost);
     overlayRoot.wrap = wrap;
-    wrap.addEventListener("pointerenter", () => clearTimeout(hideTimer));
-    wrap.addEventListener("pointerleave", scheduleHide);
+    wrap.addEventListener("pointerenter", () => { clearTimeout(hideTimer); clearTimeout(autoHideTimer); });
+    // Leaving the pill restarts the auto-hide clock too: scheduleHide
+    // bails out for a playing video, so without this the pill would
+    // stay up forever after hovering it while the video plays.
+    wrap.addEventListener("pointerleave", () => { scheduleHide(); scheduleAutoHide(); });
   }
 
   // Panel state: the source the panel is showing, the other
@@ -199,6 +220,23 @@
   let panelTarget = null;
   let panelVariants = null;
 
+  // Slice 1b follow-up: the last connect result, re-applied whenever
+  // the connect fragment is rebuilt — so an in-flight inspect
+  // resolving after a click does not wipe the feedback.
+  let lastConnectNote = "";
+
+  // Pushes a connect result to the live note (if any) as well as
+  // remembering it: covers a re-render landing mid-click, when the
+  // note the handler closed over is already detached.
+  function applyConnectNote(text) {
+    lastConnectNote = text;
+    const live = panelEl()?.querySelector(".p-note");
+    if (live) {
+      live.textContent = text;
+      live.classList.add("show");
+    }
+  }
+
   function panelEl() {
     return overlayRoot?.querySelector(".panel") || null;
   }
@@ -208,8 +246,11 @@
     panelEl()?.classList.remove("show");
     status.textContent = message;
     status.classList.add("show");
+    // The message lives in the pill wrap: keep the pill up while it
+    // is shown, then restart the auto-hide clock.
+    clearTimeout(autoHideTimer);
     clearTimeout(showStatus.timer);
-    showStatus.timer = setTimeout(() => status?.classList.remove("show"), 3500);
+    showStatus.timer = setTimeout(() => { status?.classList.remove("show"); scheduleAutoHide(); }, 3500);
   }
 
   function rankKind(kind) {
@@ -229,13 +270,37 @@
     return variant?.quality || "Stream";
   }
 
+  // Slice 1b: a long (often gibberish) filename is shown short —
+  // truncated with … — never the full hash. The full name stays in
+  // the row's title attribute for hover.
+  const OTHER_NAME_MAX = 26;
   function otherLabel(source) {
     try {
       const parsed = new URL(source.url);
       const name = decodeURIComponent(parsed.pathname.split("/").pop() || "");
-      if (name) return name;
+      if (name) return name.length > OTHER_NAME_MAX ? name.slice(0, OTHER_NAME_MAX - 1) + "…" : name;
       return parsed.hostname;
     } catch (_) { return source.kind || "Media"; }
+  }
+  function otherFullName(source) {
+    try {
+      const parsed = new URL(source.url);
+      const name = decodeURIComponent(parsed.pathname.split("/").pop() || "");
+      return name || parsed.hostname;
+    } catch (_) { return source.kind || "Media"; }
+  }
+  // Quality slot for an "Other media" row: exactly what the source
+  // carries. A manifest source carries its format (DASH/HLS); a
+  // direct file carries only its container — never a guessed
+  // resolution.
+  function otherQuality(source) {
+    if (source.kind === "DASH manifest") return "DASH";
+    if (source.kind === "HLS playlist") return "HLS";
+    try {
+      const ext = new URL(source.url).pathname.split("/").pop()?.split(".").pop() || "";
+      if (/^[a-z0-9]{2,5}$/i.test(ext)) return ext.toUpperCase();
+    } catch (_) {}
+    return source.kind || "Media";
   }
 
   function variantRow(variant, target) {
@@ -253,10 +318,9 @@
     return row;
   }
 
-  function renderPanel() {
-    const panel = panelEl();
-    if (!panel || !panelPrimary) return;
-    panel.replaceChildren();
+  // Shared panel header (title + close). Closing the panel
+  // restarts the pill's auto-hide clock.
+  function panelHead() {
     const head = document.createElement("div");
     head.className = "p-head";
     const title = document.createElement("span");
@@ -267,9 +331,79 @@
     close.className = "p-close";
     close.textContent = "×";
     close.setAttribute("aria-label", "Close");
-    close.addEventListener("click", () => panel.classList.remove("show"));
+    close.addEventListener("click", () => {
+      panelEl()?.classList.remove("show");
+      scheduleAutoHide();
+    });
     head.append(title, close);
-    panel.append(head);
+    return head;
+  }
+
+  // Slice 1b: the permission action, reachable in both panel
+  // states (media found and no media found). The note below it
+  // reports the result — granted, denied, or the manual steps — and
+  // stays in the panel so the user can retry or follow the steps.
+  // Returns a fragment (button + note) for the caller to append.
+  function connectButton() {
+    const connect = document.createElement("button");
+    connect.type = "button";
+    connect.className = "p-connect";
+    connect.textContent = "Connect desktop app";
+    const note = document.createElement("div");
+    note.className = "p-note";
+    if (lastConnectNote) {
+      note.textContent = lastConnectNote;
+      note.classList.add("show");
+    }
+    connect.addEventListener("click", async () => {
+      connect.disabled = true;
+      note.classList.remove("show");
+      try {
+        const result = await chrome.runtime.sendMessage({ type: "REQUEST_NATIVE_PERMISSION" });
+        applyConnectNote(result?.granted
+          ? "Desktop app connected. You can download now."
+          : MANUAL_PERMISSION_STEPS);
+      } catch (_) {
+        applyConnectNote(MANUAL_PERMISSION_STEPS);
+      } finally {
+        note.classList.add("show");
+        connect.disabled = false;
+      }
+    });
+    const frag = document.createDocumentFragment();
+    frag.append(connect, note);
+    return frag;
+  }
+
+  // Slice 1b: the no-media panel. The pill click used to show only
+  // a status message here, which left the permission prompt
+  // unreachable — the popup has no Download button when nothing is
+  // detected, so the prompt could never appear. The panel opens
+  // instead, with the reason plus the connect button.
+  function openEmptyPanel(target) {
+    panelPrimary = null;
+    panelTarget = target;
+    panelOthers = [];
+    panelVariants = [];
+    const panel = panelEl();
+    if (!panel) return;
+    panel.replaceChildren();
+    panel.append(panelHead());
+    const empty = document.createElement("div");
+    empty.className = "p-empty";
+    empty.textContent = "No downloadable media URL is exposed by this player. DRM or protected streams may not be accessible.";
+    panel.append(empty);
+    panel.append(connectButton());
+    status?.classList.remove("show");
+    panel.classList.add("show");
+    clearTimeout(autoHideTimer);
+  }
+
+  function renderPanel() {
+    const panel = panelEl();
+    if (!panel || !panelPrimary) return;
+    panel.replaceChildren();
+    panel.append(panelHead());
     const primaryBtn = document.createElement("button");
     primaryBtn.type = "button";
     primaryBtn.className = "p-primary";
@@ -283,6 +417,11 @@
       else startDownload(panelPrimary, panelTarget);
     });
     panel.append(primaryBtn);
+    panel.append(connectButton());
+    // Slice 1b: header + primary + connect stay visible; only the
+    // lists scroll, inside the panel, so the panel fits one viewport.
+    const scroll = document.createElement("div");
+    scroll.className = "p-scroll";
     // Direct media has no qualities to list — the primary button is
     // the whole action. Manifest sources get one row per quality.
     if (panelPrimary.kind === "DASH manifest" || panelPrimary.kind === "HLS playlist") {
@@ -301,7 +440,7 @@
       } else {
         for (const variant of panelVariants) list.append(variantRow(variant, panelTarget));
       }
-      panel.append(list);
+      scroll.append(list);
     }
     if (panelOthers.length) {
       const details = document.createElement("details");
@@ -317,6 +456,10 @@
         const label = document.createElement("span");
         label.className = "p-label";
         label.textContent = otherLabel(source);
+        label.title = otherFullName(source);
+        const quality = document.createElement("span");
+        quality.className = "p-q";
+        quality.textContent = otherQuality(source);
         const download = document.createElement("button");
         download.type = "button";
         download.className = "p-dl";
@@ -327,14 +470,16 @@
           // Switching to another source re-opens the panel for it.
           openPanelFor(source, panelTarget, [panelPrimary, ...panelOthers.filter((item) => item !== source)]);
         });
-        row.append(label, download);
+        row.append(label, quality, download);
         otherList.append(row);
       }
       details.append(otherList);
-      panel.append(details);
+      scroll.append(details);
     }
+    if (scroll.childElementCount) panel.append(scroll);
     status?.classList.remove("show");
     panel.classList.add("show");
+    clearTimeout(autoHideTimer);
   }
 
   function openPanelFor(source, target, others) {
@@ -413,12 +558,30 @@
     overlayRoot.wrap.style.top = top + "px";
   }
 
+  function isPanelOpen() {
+    return !!panelEl()?.classList.contains("show");
+  }
+  // Slice 1b: the pill hides a few seconds after appearing and
+  // reappears on cursor-over-video; the clock restarts on mouse
+  // movement (show() and the pointermove handler both reschedule).
+  // The pill never hides while the download panel is open.
+  function scheduleAutoHide() {
+    clearTimeout(autoHideTimer);
+    autoHideTimer = setTimeout(() => {
+      if (isPanelOpen()) return;
+      if (overlayRoot?.wrap) overlayRoot.wrap.style.display = "none";
+      activeVideo = null;
+    }, PILL_AUTO_HIDE_MS);
+  }
+
   function scheduleHide() {
     clearTimeout(hideTimer);
     hideTimer = setTimeout(() => {
       // A playing video keeps its button: the control is for the
       // video being watched, not only for the hovered one.
       if (activeVideo && !activeVideo.paused) return;
+      // Slice 1b: never hide under an open panel.
+      if (isPanelOpen()) return;
       if (overlayRoot?.wrap) overlayRoot.wrap.style.display = "none";
       activeVideo = null;
     }, 140);
@@ -434,10 +597,11 @@
       ensureOverlay();
       clearTimeout(hideTimer);
       positionOverlay(video);
+      scheduleAutoHide();
     };
     video.addEventListener("pointerenter", show, { passive: true });
     video.addEventListener("pointermove", () => {
-      if (activeVideo === video) positionOverlay(video);
+      if (activeVideo === video) { positionOverlay(video); scheduleAutoHide(); }
       else if (video.matches(":hover")) show();
     }, { passive: true });
     video.addEventListener("loadedmetadata", () => {
@@ -562,6 +726,7 @@
         ensureOverlay();
         clearTimeout(hideTimer);
         positionOverlay(hovered);
+        scheduleAutoHide();
       }
     });
     resourceObserver.observe({ type: "resource", buffered: true });

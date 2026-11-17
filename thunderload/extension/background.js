@@ -302,6 +302,28 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
     requestNative(message.action, message.payload || {}).then(sendResponse);
     return true;
   }
+  // Slice 1b: the in-page panel's "Connect desktop app" button.
+  // The permission prompt is unreachable from the popup when no
+  // media is detected (no Download button to click) and the in-page
+  // Download never asks — so the panel asks explicitly. The request
+  // runs here: content scripts cannot call permissions.request
+  // themselves. MV3 may not carry the click's user gesture across
+  // the message round-trip, so a false/failed request is NOT an
+  // error — the panel shows the manual steps instead. The download
+  // path (requestNative) is untouched: it keeps failing clean,
+  // never prompting mid-download.
+  if (message?.type === "REQUEST_NATIVE_PERMISSION") {
+    (async () => {
+      try {
+        if (typeof api.permissions?.request !== "function") return sendResponse({ ok: true, granted: false });
+        const granted = await api.permissions.request({ permissions: ["nativeMessaging"] });
+        sendResponse({ ok: true, granted: !!granted });
+      } catch (error) {
+        sendResponse({ ok: true, granted: false, error: error?.message || String(error) });
+      }
+    })();
+    return true;
+  }
   if (message?.type === "INSPECT_MEDIA") {
     requestNative("video.inspect", { url: message.url, referer: message.pageUrl || "" }).then((result) => {
       sendResponse(result?.ok
