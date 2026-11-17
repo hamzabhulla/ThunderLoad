@@ -1456,7 +1456,7 @@ fn hidden_command<S: AsRef<std::ffi::OsStr>>(program: S) -> TokioCommand {
     TokioCommand::from(std_command)
 }
 
-async fn ffmpeg_available() -> bool {
+pub(crate) async fn ffmpeg_available() -> bool {
     let executable = std::env::var_os("THUNDERLOAD_FFMPEG").unwrap_or_else(|| "ffmpeg".into());
     hidden_command(executable).arg("-version").output().await
         .map(|output| output.status.success()).unwrap_or(false)

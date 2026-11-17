@@ -20,6 +20,19 @@
         && YOUTUBE_SERVICE_PATH.test(parsed.pathname);
     } catch (_) { return false; }
   }
+  // Slice 3: pages yt-dlp knows how to extract — same host list as
+  // background.js YTDLP_HOSTS. On these pages the pill prefers the
+  // yt-dlp panel over a bare sniffed manifest.
+  const YTDLP_HOSTS = ["youtube.com", "youtu.be", "instagram.com", "tiktok.com", "twitter.com", "x.com", "facebook.com", "fb.watch", "reddit.com", "twitch.tv", "vimeo.com"];
+  function isYtDlpPageUrl(url) {
+    try {
+      const host = new URL(url).hostname.toLowerCase();
+      return YTDLP_HOSTS.some((listed) => host === listed || host.endsWith("." + listed));
+    } catch (_) { return false; }
+  }
+  function ytdlpDisplayName(tool) {
+    return tool === "deno" ? "Deno" : "yt-dlp";
+  }
   // The grabber caps at 100 items per page (same cap as the engine);
   // `truncated` tells the popup the page held more.
   const MAX_FOUND = 100;
@@ -169,6 +182,7 @@
       '.p-other summary::before{content:"▸ ";color:#4ade80}',
       '.p-other[open] summary::before{content:"▾ "}',
       '.p-other-list{display:grid;gap:6px;margin-top:8px}',
+      '.p-link{pointer-events:auto;display:block;width:100%;margin-top:8px;padding:0;border:0;background:transparent;color:#4ade80;font:500 11px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif;cursor:pointer;text-align:left;text-decoration:underline}',
       '@media(prefers-reduced-motion:reduce){button.tl-btn{transition:none}}'
     ].join("\n");
     const wrap = document.createElement("div");
@@ -189,6 +203,16 @@
       const target = activeVideo;
       if (!target) { showStatus("Move your pointer over a video first."); return; }
       const candidates = candidateSources(target);
+      // Slice 3: on a YouTube/social page the sniffed DASH manifest
+      // alone is not a usable result — yt-dlp formats are the primary
+      // path, the manifest is only the fallback. Any other candidate
+      // (a direct file on Instagram/TikTok, a real .mpd elsewhere)
+      // still opens the normal panel.
+      const hasRealCandidate = candidates.some((item) => !YOUTUBE_DASH_MANIFEST.test(item.url));
+      if (isYtDlpPageUrl(location.href) && !hasRealCandidate) {
+        openYtDlpPanel(target);
+        return;
+      }
       if (!candidates.length) {
         // Slice 1b: the panel still opens — with the reason plus the
         // "Connect desktop app" button — so the permission prompt is
@@ -397,6 +421,209 @@
     status?.classList.remove("show");
     panel.classList.add("show");
     clearTimeout(autoHideTimer);
+  }
+
+  // Slice 3: yt-dlp panel state. null = inspect in flight;
+  // { variants, title } after a successful inspect;
+  // { toolsMissing } when yt-dlp/Deno is not installed yet;
+  // { error } when the inspect failed.
+  let panelYtDlp = null;
+  let ytdlpDenoMissing = false;
+  let ytdlpToolProgressText = "";
+
+  function ytdlpVariantRow(variant, target) {
+    const row = document.createElement("div");
+    row.className = "p-row";
+    const label = document.createElement("span");
+    label.className = "p-label";
+    label.textContent = qualityLabel(variant);
+    const download = document.createElement("button");
+    download.type = "button";
+    download.className = "p-dl";
+    download.textContent = "Download";
+    download.addEventListener("click", () => startYtDlpDownload(variant, target));
+    row.append(label, download);
+    return row;
+  }
+
+  // One named tool-download button (consent + progress, FINAL
+  // requirement): the button names the tool ("Download yt-dlp" /
+  // "Download Deno"), the progress line names it too ("yt-dlp
+  // download ho raha hai — 45%") — never a generic label
+  // label anywhere. The tap itself is the consent: nothing is
+  // fetched until the user presses this button. The manual link
+  // below it is only the backup.
+  function ytdlpToolDownloadFragment(tool, onDone) {
+    const frag = document.createDocumentFragment();
+    const name = ytdlpDisplayName(tool);
+    const downloadBtn = document.createElement("button");
+    downloadBtn.type = "button";
+    downloadBtn.className = "p-connect";
+    downloadBtn.textContent = "Download " + name;
+    const progress = document.createElement("div");
+    progress.className = "p-note p-tool-progress";
+    if (ytdlpToolProgressText) {
+      progress.textContent = ytdlpToolProgressText;
+      progress.classList.add("show");
+    }
+    const note = document.createElement("div");
+    note.className = "p-note";
+    downloadBtn.addEventListener("click", async () => {
+      downloadBtn.disabled = true;
+      note.classList.remove("show");
+      try {
+        const result = await chrome.runtime.sendMessage({ type: "YTDLP_ENSURE_TOOL", tool });
+        if (result?.ok) {
+          if (typeof onDone === "function") onDone();
+        } else {
+          note.textContent = result?.error || "Download failed.";
+          note.classList.add("show");
+          downloadBtn.disabled = false;
+        }
+      } catch (error) {
+        note.textContent = error?.message || String(error);
+        note.classList.add("show");
+        downloadBtn.disabled = false;
+      }
+    });
+    const manual = document.createElement("button");
+    manual.type = "button";
+    manual.className = "p-link";
+    manual.textContent = "or download it yourself";
+    manual.addEventListener("click", () => {
+      chrome.runtime.sendMessage({ type: "YTDLP_OPEN_MANUAL_PAGE", tool }).catch(() => {});
+    });
+    frag.append(downloadBtn, progress, note, manual);
+    return frag;
+  }
+
+  function renderYtDlpPanel() {
+    const panel = panelEl();
+    if (!panel) return;
+    panel.replaceChildren();
+    panel.append(panelHead());
+    if (panelYtDlp === null) {
+      const loading = document.createElement("div");
+      loading.className = "p-empty";
+      loading.textContent = "Getting formats…";
+      panel.append(loading);
+    } else if (panelYtDlp.toolsMissing) {
+      const name = ytdlpDisplayName(panelYtDlp.toolsMissing);
+      const empty = document.createElement("div");
+      empty.className = "p-empty";
+      empty.textContent = name + " is not installed yet. Download it to get formats from this page.";
+      panel.append(empty);
+      panel.append(ytdlpToolDownloadFragment(panelYtDlp.toolsMissing, () => {
+        if (panelTarget) openYtDlpPanel(panelTarget);
+      }));
+    } else if (panelYtDlp.error) {
+      const empty = document.createElement("div");
+      empty.className = "p-empty";
+      empty.textContent = panelYtDlp.error;
+      panel.append(empty);
+      panel.append(connectButton());
+    } else {
+      const variants = panelYtDlp.variants || [];
+      if (variants.length) {
+        const primaryBtn = document.createElement("button");
+        primaryBtn.type = "button";
+        primaryBtn.className = "p-primary";
+        primaryBtn.textContent = "Download this video · " + qualityLabel(variants[0]);
+        primaryBtn.addEventListener("click", () => startYtDlpDownload(variants[0], panelTarget));
+        panel.append(primaryBtn);
+      } else {
+        const empty = document.createElement("div");
+        empty.className = "p-empty";
+        empty.textContent = "No downloadable formats found for this page.";
+        panel.append(empty);
+      }
+      panel.append(connectButton());
+      const scroll = document.createElement("div");
+      scroll.className = "p-scroll";
+      if (variants.length > 1) {
+        const list = document.createElement("div");
+        list.className = "p-qualities";
+        for (const variant of variants) list.append(ytdlpVariantRow(variant, panelTarget));
+        scroll.append(list);
+      }
+      if (ytdlpDenoMissing) {
+        const note = document.createElement("div");
+        note.className = "p-empty";
+        note.textContent = "Deno is not installed — YouTube shows fewer formats without it.";
+        scroll.append(note);
+        scroll.append(ytdlpToolDownloadFragment("deno", () => {
+          ytdlpDenoMissing = false;
+          renderYtDlpPanel();
+        }));
+      }
+      if (scroll.childElementCount) panel.append(scroll);
+    }
+    status?.classList.remove("show");
+    panel.classList.add("show");
+    clearTimeout(autoHideTimer);
+  }
+
+  function openYtDlpPanel(target) {
+    panelPrimary = null;
+    panelTarget = target;
+    panelOthers = [];
+    panelVariants = null;
+    panelYtDlp = null;
+    ytdlpDenoMissing = false;
+    ytdlpToolProgressText = "";
+    renderYtDlpPanel();
+    (async () => {
+      try {
+        const result = await chrome.runtime.sendMessage({ type: "YTDLP_INSPECT", pageUrl: location.href });
+        if (panelTarget !== target || !panelEl()?.classList.contains("show")) return;
+        if (!result?.ok) {
+          panelYtDlp = result?.toolsMissing
+            ? { toolsMissing: result.toolsMissing }
+            : { error: result?.error || "Could not inspect this page." };
+        } else {
+          const variants = (result.variants || []).filter((item) => item?.downloadable && item?.url);
+          variants.sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bandwidth || 0) - (a.bandwidth || 0));
+          panelYtDlp = { variants, title: result.title || "" };
+          // Deno check: after a successful inspect, a missing Deno
+          // means YouTube fell back to fewer formats — offer the
+          // download right here instead of failing silently.
+          try {
+            const toolStatus = await chrome.runtime.sendMessage({ type: "YTDLP_TOOLS_STATUS" });
+            if (toolStatus?.ok && toolStatus.deno && toolStatus.deno.present === false) ytdlpDenoMissing = true;
+          } catch (_) { /* Tools status is best-effort here. */ }
+        }
+        if (panelEl()?.classList.contains("show")) renderYtDlpPanel();
+      } catch (_) {
+        if (panelTarget !== target) return;
+        panelYtDlp = { error: "Could not inspect this page." };
+        if (panelEl()?.classList.contains("show")) renderYtDlpPanel();
+      }
+    })();
+  }
+
+  async function startYtDlpDownload(variant, target) {
+    if (!variant || !target || !button) return;
+    panelEl()?.classList.remove("show");
+    button.disabled = true;
+    showStatus("Preparing download…");
+    try {
+      const formatSelector = variant.audioRepresentationId
+        ? variant.representationId + "+" + variant.audioRepresentationId
+        : variant.representationId;
+      const filename = panelYtDlp?.title ? panelYtDlp.title + ".mp4" : "video.mp4";
+      const result = await chrome.runtime.sendMessage({
+        type: "YTDLP_DOWNLOAD",
+        pageUrl: location.href,
+        formatSelector,
+        filename
+      });
+      if (!result?.ok) throw new Error(result?.error || "Could not start the download.");
+      showStatus(result.message || "Download added.");
+    } catch (error) {
+      showStatus(error?.message || String(error));
+    } finally {
+      button.disabled = false;
+    }
   }
 
   function renderPanel() {
@@ -702,6 +929,21 @@
       sendResponse({ sources: Array.from(found.values()), truncated });
       return false;
     }
+    // Slice 3: tool-download progress forwarded by the background
+    // (NATIVE_EVENT from the native host's ytdlp.tool_progress).
+    // The line names the tool, per the FINAL requirement.
+    if (message?.type === "NATIVE_EVENT" && message.event?.event === "ytdlp.tool_progress") {
+      const tool = ytdlpDisplayName(message.event.tool === "deno" ? "deno" : "ytdlp");
+      const percent = message.event.percent;
+      ytdlpToolProgressText = tool + " download ho raha hai"
+        + (typeof percent === "number" ? " — " + Math.round(percent) + "%" : "…");
+      const live = panelEl()?.querySelector(".p-tool-progress");
+      if (live) {
+        live.textContent = ytdlpToolProgressText;
+        live.classList.add("show");
+      }
+      return false;
+    }
     return false;
   });
 
@@ -753,6 +995,22 @@
   // become sources.
   let hookToken = null;
   let hookHelloReceived = false;
+  // Slice 3 MINOR (a): the HELLO must echo the nonce of the latest
+  // PING. The first HELLO no longer wins unconditionally — a hostile
+  // page that answers the first PING before the real hook is undone
+  // by the next re-PING, when the real hook echoes the fresh nonce
+  // and the bridge re-latches. This cannot authenticate the hook
+  // (postMessage traffic is readable by the page), so it bounds the
+  // denial-of-service to a page that actively races every re-PING;
+  // findings are still re-classified here and downloads still go
+  // through the native host's inspect, so a spoofed finding can only
+  // plant a fake list entry, never a download.
+  let hookNonce = null;
+  function newHookNonce() {
+    return (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function")
+      ? globalThis.crypto.randomUUID()
+      : "tl-n-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+  }
   // Evidence-only state for blob: players (never a source list):
   // blob URL -> { mediaSourceId, mimeTypes, duration, segments,
   // bytes }. It proves a blob player exists and is streaming; the
@@ -761,7 +1019,14 @@
   const blobMedia = new Map();
   const BLOB_MEDIA_MAX = 20;
   function hookPost(type) {
-    try { window.postMessage({ __thunderLoadHook: true, type }, "*"); } catch (_) {}
+    try {
+      if (type === "THUNDERLOAD_HOOK_PING") {
+        hookNonce = newHookNonce();
+        window.postMessage({ __thunderLoadHook: true, type, nonce: hookNonce }, "*");
+      } else {
+        window.postMessage({ __thunderLoadHook: true, type }, "*");
+      }
+    } catch (_) {}
   }
   function handleHookMessage(event) {
     try {
@@ -769,8 +1034,8 @@
       const data = event.data;
       if (!data || data.__thunderLoadHook !== true) return;
       if (data.type === "THUNDERLOAD_HOOK_HELLO") {
-        if (hookHelloReceived) return;
         if (typeof data.token !== "string" || !data.token) return;
+        if (data.nonce !== hookNonce) return;
         hookToken = data.token;
         hookHelloReceived = true;
         return;
@@ -820,10 +1085,13 @@
   }
   window.addEventListener("message", handleHookMessage);
   // Ping the hook for its token; one retry covers a late hook
-  // install. Without a HELLO the bridge stays silent and detection
-  // degrades to the DOM scan + webRequest paths.
+  // install, and a 30 s re-PING re-latches on the real hook's HELLO
+  // if a hostile page ever won the first race (Slice 3 MINOR (a)).
+  // Without a HELLO the bridge stays silent and detection degrades
+  // to the DOM scan + webRequest paths.
   hookPost("THUNDERLOAD_HOOK_PING");
   setTimeout(() => { if (!hookHelloReceived) hookPost("THUNDERLOAD_HOOK_PING"); }, 1000);
+  setInterval(() => { hookPost("THUNDERLOAD_HOOK_PING"); }, 30000);
 
   scan();
 })();

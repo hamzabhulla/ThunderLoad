@@ -7,6 +7,47 @@ const sourcesByTab = new Map();
 const truncatedByTab = new Map();
 const MAX_SOURCES_PER_TAB = 100;
 
+// Slice 3: yt-dlp routing for YouTube/social pages (option b —
+// neither tool is bundled; both download on first use from Settings).
+// The extension never downloads YouTube itself: it sends the PAGE URL
+// to the native host, which runs yt-dlp and returns formats. The
+// per-page cache stops a panel re-open from re-spawning yt-dlp
+// (inspect takes 2–10 s); ytdlpByTab remembers which tab an inspect
+// belongs to so GET_ACTIVE_SOURCES can suppress the raw googlevideo
+// rows once yt-dlp formats exist.
+const YTDLP_HOSTS = ["youtube.com", "youtu.be", "instagram.com", "tiktok.com", "twitter.com", "x.com", "facebook.com", "fb.watch", "reddit.com", "twitch.tv", "vimeo.com"];
+const YTDLP_CACHE_TTL_MS = 5 * 60 * 1000;
+const YTDLP_CACHE_MAX = 50;
+const ytdlpCache = new Map();
+const ytdlpByTab = new Map();
+// The cache is bounded: stale entries are dropped and the oldest
+// entries are evicted past the cap, on every write. A hit-only check
+// would let dead entries pile up forever in a long-lived worker.
+function pruneYtdlpCache() {
+  const now = Date.now();
+  for (const [key, entry] of ytdlpCache) {
+    if (now - entry.at >= YTDLP_CACHE_TTL_MS) ytdlpCache.delete(key);
+  }
+  while (ytdlpCache.size > YTDLP_CACHE_MAX) {
+    const oldest = ytdlpCache.keys().next().value;
+    if (oldest === undefined) break;
+    ytdlpCache.delete(oldest);
+  }
+}
+function isYtDlpPageUrl(url) {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return YTDLP_HOSTS.some((listed) => host === listed || host.endsWith("." + listed));
+  } catch (_) { return false; }
+}
+function isGoogleVideoRow(item) {
+  try { return /\.googlevideo\.com$/i.test(new URL(item?.url || "").hostname); } catch (_) { return false; }
+}
+const YTDLP_RELEASE_PAGES = {
+  ytdlp: "https://github.com/yt-dlp/yt-dlp/releases/tag/2026.10.26",
+  deno: "https://github.com/denoland/deno/releases/tag/v2.9.8"
+};
+
 // Fix 3: the ThunderLoad app / native host is required for Direct
 // media. A googlevideo segment downloaded by the browser is one
 // audio/video chunk, not the video, so there is no silent browser
@@ -76,7 +117,7 @@ function ensureNativePort() {
   });
   return nativePort;
 }
-async function requestNative(action, payload = {}) {
+async function requestNative(action, payload = {}, timeoutMs = 30000) {
   if (!(await hasNativePermission())) return { ok: false, error: "Optional desktop-engine permission has not been granted" };
   // Cookie/header handoff (Slice 6): a browser-started download carries
   // the session its own URL needs — the browser's cookies for that URL
@@ -85,8 +126,8 @@ async function requestNative(action, payload = {}) {
   // validates the bundle against the download URL and the engine
   // re-checks the origin on every request, so the session never leaves
   // the user's machine and is never sent to any other origin. Only the
-  // four download/inspect actions get a session.
-  if (["download.start", "video.download", "dash.download", "video.inspect"].includes(action) && payload?.url) {
+  // six download/inspect actions get a session.
+  if (["download.start", "video.download", "dash.download", "video.inspect", "ytdlp.inspect", "ytdlp.download"].includes(action) && payload?.url) {
     payload = { ...payload, session: await sessionForUrl(payload.url) };
   }
   return new Promise((resolve) => {
@@ -95,9 +136,11 @@ async function requestNative(action, payload = {}) {
       const port = ensureNativePort();
       pendingRequests.set(id, resolve);
       port.postMessage({ id, action, ...payload });
+      // Slice 3: tool downloads (22 MB yt-dlp + 41 MB Deno) outlast
+      // the 30 s default, so ensure_tool passes a 10-minute timeout.
       setTimeout(() => {
         if (pendingRequests.has(id)) { pendingRequests.delete(id); resolve({ id, ok: false, error: "Native host timed out" }); }
-      }, 30000);
+      }, timeoutMs);
     } catch (error) {
       resolve({ id, ok: false, error: error?.message || String(error) });
     }
@@ -283,7 +326,7 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
         // match this tab's page — exact Referer first, initiator
         // origin as fallback. Runs after the live scan so the flag
         // below can include the merge-overflow signal.
-        const unassignedTruncated = mergeUnassignedForTab(tab.id, tab.url || "");
+        const unassignedTruncated = await mergeUnassignedForTab(tab.id, tab.url || "");
         // The scan results are authoritative for this scan (R1
         // follow-up): they overwrite the flag after the settle wait,
         // so a mid-scan notify from add() that disagreed with the
@@ -298,7 +341,21 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
         if (scanResult?.truncated || mergedTruncated || rehydratedTruncated || unassignedTruncated) truncatedByTab.set(tab.id, true);
         else truncatedByTab.delete(tab.id);
         await persistTabSources(tab.id, tab.url || "");
-        sendResponse({ ok: true, tabId: tab.id, sources: sortSources(sourcesByTab.get(tab.id) || []), pageUrl: tab.url || "", truncated: !!truncatedByTab.get(tab.id) });
+        // Slice 3: yt-dlp formats replace the raw sniffed rows. Once
+        // they exist for this tab's page, the googlevideo segments and
+        // the DASH manifest are suppressed — they are fragments and a
+        // manifest for the same video, not extra downloads. When yt-dlp
+        // returned nothing, the sniffed manifest stays as the fallback
+        // row (it is only suppressed when formats exist).
+        const ytdlpEntry = ytdlpByTab.get(tab.id);
+        const ytdlpForPage = ytdlpEntry && ytdlpEntry.pageUrl === (tab.url || "") ? ytdlpEntry : null;
+        const hasYtDlpFormats = !!(ytdlpForPage && Array.isArray(ytdlpForPage.variants) && ytdlpForPage.variants.length);
+        let sources = sortSources(sourcesByTab.get(tab.id) || []);
+        if (hasYtDlpFormats) {
+          sources = sources.filter((item) => !isGoogleVideoRow(item) && !item.isYouTubeDash);
+        }
+        sendResponse({ ok: true, tabId: tab.id, sources, pageUrl: tab.url || "", truncated: !!truncatedByTab.get(tab.id),
+          ytdlp: ytdlpForPage ? { variants: ytdlpForPage.variants, title: ytdlpForPage.title } : null });
       } catch (error) {
         sendResponse({ ok: false, error: error?.message || "This page does not allow extension scanning" });
       }
@@ -339,6 +396,79 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
     });
     return true;
   }
+  // Slice 3: yt-dlp routing. The page URL (never a sniffed media
+  // URL) goes to the native host, which runs `yt-dlp -j` with the
+  // session handoff and returns formats mapped onto VideoVariant.
+  if (message?.type === "YTDLP_INSPECT") {
+    (async () => {
+      const pageUrl = message.pageUrl || "";
+      const tabId = sender.tab?.id;
+      const cached = ytdlpCache.get(pageUrl);
+      if (cached && Date.now() - cached.at < YTDLP_CACHE_TTL_MS) {
+        if (typeof tabId === "number") ytdlpByTab.set(tabId, { pageUrl, variants: cached.variants, title: cached.title });
+        sendResponse({ ok: true, variants: cached.variants, title: cached.title, cached: true });
+        return;
+      }
+      // 65 s: the engine allows 60 s for a slow inspect; the default
+      // 30 s requestNative timeout would cut a 30–60 s inspect off in
+      // the extension even though the engine would succeed.
+      const result = await requestNative("ytdlp.inspect", { url: pageUrl }, 65000);
+      if (!result?.ok) {
+        sendResponse({ ok: false, error: result?.error || "yt-dlp could not inspect this page.", toolsMissing: result?.toolsMissing || null });
+        return;
+      }
+      const variants = Array.isArray(result.data?.variants) ? result.data.variants : [];
+      const title = result.data?.title || "";
+      ytdlpCache.set(pageUrl, { variants, title, at: Date.now() });
+      pruneYtdlpCache();
+      if (typeof tabId === "number") ytdlpByTab.set(tabId, { pageUrl, variants, title });
+      sendResponse({ ok: true, variants, title, cached: false });
+    })();
+    return true;
+  }
+  if (message?.type === "YTDLP_DOWNLOAD") {
+    requestNative("ytdlp.download", { url: message.pageUrl, formatSelector: message.formatSelector, filename: message.filename }).then((result) => {
+      sendResponse(result?.ok
+        ? { ok: true, message: result.message || "Download started in ThunderLoad." }
+        : { ok: false, error: nativeErrorMessage(result?.error || "ThunderLoad could not start this download.") });
+    });
+    return true;
+  }
+  // Slice 3: on-demand tool download. Called ONLY from the direct
+  // download button in the panel/popup/Settings — the tap is the
+  // consent; nothing here ever fetches a tool silently. The 10-minute
+  // timeout covers both the 22 MB yt-dlp and the 41 MB Deno zip.
+  // Progress arrives as NATIVE_EVENTs (ytdlp.tool_progress) forwarded
+  // by ensureNativePort, not through this response.
+  if (message?.type === "YTDLP_ENSURE_TOOL") {
+    requestNative("ytdlp.ensure_tool", { tool: message.tool }, 600000).then((result) => {
+      sendResponse(result?.ok
+        ? { ok: true, path: result.path || "" }
+        : { ok: false, error: result?.error || "The tool could not be downloaded." });
+    });
+    return true;
+  }
+  if (message?.type === "YTDLP_TOOLS_STATUS") {
+    requestNative("ytdlp.tools_status", {}).then((result) => {
+      sendResponse(result?.ok ? { ok: true, ...(result.data || {}) } : { ok: false, error: result?.error || "Could not read the tool status." });
+    });
+    return true;
+  }
+  if (message?.type === "YTDLP_CHECK_UPDATE") {
+    requestNative("ytdlp.check_update", {}).then((result) => {
+      sendResponse(result?.ok ? { ok: true, message: result.message || "" } : { ok: false, error: result?.error || "Could not check for updates." });
+    });
+    return true;
+  }
+  // Slice 3: manual alternative (backup only) — open the official
+  // release page so the user can download the tool themselves; the
+  // app picks it up from the tools dir.
+  if (message?.type === "YTDLP_OPEN_MANUAL_PAGE") {
+    const url = YTDLP_RELEASE_PAGES[message.tool] || YTDLP_RELEASE_PAGES.ytdlp;
+    if (typeof api.tabs?.create === "function") api.tabs.create({ url }).catch(() => {});
+    sendResponse({ ok: true });
+    return false;
+  }
   if (message?.type === "QUICK_DOWNLOAD_MEDIA") {
     quickDownloadMedia(message).then(sendResponse).catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
     return true;
@@ -350,7 +480,7 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return false;
 });
 
-api.tabs.onRemoved.addListener((tabId) => { sourcesByTab.delete(tabId); truncatedByTab.delete(tabId); removePersistedTabSources(tabId); });
+api.tabs.onRemoved.addListener((tabId) => { sourcesByTab.delete(tabId); truncatedByTab.delete(tabId); ytdlpByTab.delete(tabId); removePersistedTabSources(tabId); });
 
 // IDM-style network backstop: catch media the DOM scan cannot see
 // (fetch/XHR-loaded streams, cross-origin iframes). Observation only —
@@ -645,10 +775,33 @@ function recordUnassignedSource(url, kind, referer, initiator) {
 }
 // Returns mergeTabSources' truncation result (true when the merged
 // list is truncated), or false when nothing matched.
-function mergeUnassignedForTab(tabId, pageUrl) {
+// Slice 3 MINOR (c): the 5-minute TTL is checked HERE too, not only
+// when a new entry is recorded — a stale entry no longer merges on a
+// later popup open in a quiet system; it is dropped instead.
+// Slice 3 MINOR (b): the origin-only fallback applies only when
+// exactly one tab of that origin is open. With two same-origin tabs
+// the entry could belong to either, so it stays unassigned (the exact
+// Referer path is unaffected — it is always correct).
+async function mergeUnassignedForTab(tabId, pageUrl) {
   if (typeof tabId !== "number" || !pageUrl) return false;
   let pageOrigin = "";
   try { pageOrigin = new URL(pageUrl).origin; } catch (_) { return false; }
+  const now = Date.now();
+  const live = unassignedSources.filter((item) => now - item.discoveredAt <= UNASSIGNED_TTL_MS);
+  unassignedSources.length = 0;
+  unassignedSources.push(...live);
+  let sameOriginTabCount = 0;
+  try {
+    const tabs = await api.tabs.query({});
+    for (const tab of tabs || []) {
+      try { if (tab?.url && new URL(tab.url).origin === pageOrigin) sameOriginTabCount++; } catch (_) {}
+    }
+  } catch (_) {
+    // Tabs lookup failed: fail closed — origin-only matching is off,
+    // exact-Referer matching still works.
+    sameOriginTabCount = 2;
+  }
+  const originFallbackAllowed = sameOriginTabCount === 1;
   const matched = [];
   const remaining = [];
   for (const item of unassignedSources) {
@@ -657,7 +810,8 @@ function mergeUnassignedForTab(tabId, pageUrl) {
     const exact = !!refererUrl && refererUrl === pageUrl;
     let origin = "";
     try { origin = item.initiator ? new URL(item.initiator).origin : ""; } catch (_) {}
-    if (exact || (origin && origin === pageOrigin)) {
+    const originMatch = originFallbackAllowed && origin && origin === pageOrigin;
+    if (exact || originMatch) {
       matched.push(item);
       // Origin-only matches stay: another same-origin tab may own
       // them. Exact-Referer matches belong to exactly this page.
@@ -690,7 +844,7 @@ if (api.webRequest?.onHeadersReceived) {
     }
   }, { urls: ["<all_urls>"], types: ["xmlhttprequest", "media", "other"] }, ["responseHeaders"]);
 }
-api.tabs.onUpdated.addListener((tabId, changeInfo) => { if (changeInfo.status === "loading") { sourcesByTab.delete(tabId); truncatedByTab.delete(tabId); removePersistedTabSources(tabId); } });
+api.tabs.onUpdated.addListener((tabId, changeInfo) => { if (changeInfo.status === "loading") { sourcesByTab.delete(tabId); truncatedByTab.delete(tabId); ytdlpByTab.delete(tabId); removePersistedTabSources(tabId); } });
 api.commands?.onCommand.addListener(async (command) => {
   if (command !== "scan-media") return;
   const [tab] = await api.tabs.query({ active: true, currentWindow: true });

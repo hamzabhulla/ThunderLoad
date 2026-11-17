@@ -10,6 +10,23 @@ let sources = [];
 // automatically on scan — no "Other qualities" click needed.
 let primarySource = null;
 let primaryVariants = null;
+// Slice 3: yt-dlp formats for this tab's page. null = no inspect has
+// run (or it returned nothing usable yet); an array (possibly empty)
+// means an inspect ran. The popup auto-inspects a YouTube/social
+// page; the background cache stops a re-open from re-spawning yt-dlp.
+let ytdlpVariants = null;
+let ytdlpTitle = "";
+let ytdlpInspecting = false;
+let ytdlpToolsMissing = null;
+let ytdlpDenoMissing = false;
+let ytdlpToolProgressText = "";
+const YTDLP_HOSTS = ["youtube.com", "youtu.be", "instagram.com", "tiktok.com", "twitter.com", "x.com", "facebook.com", "fb.watch", "reddit.com", "twitch.tv", "vimeo.com"];
+function isYtDlpPageUrl(url) {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return YTDLP_HOSTS.some((listed) => host === listed || host.endsWith("." + listed));
+  } catch (_) { return false; }
+}
 
 const INTERCEPT_SETTING_KEY = "interceptBrowserDownloads";
 
@@ -119,6 +136,17 @@ function render() {
   sourceList.replaceChildren();
   primarySource = null;
   primaryVariants = null;
+  // Slice 3: a yt-dlp page gets the yt-dlp card as its primary —
+  // loading, consent, or formats — with the sniffed sources below
+  // it (already suppressed by the background when formats exist;
+  // the sniffed manifest stays as the fallback when they do not).
+  if (ytdlpInspecting || ytdlpVariants !== null || ytdlpToolsMissing) {
+    renderYtDlpCard();
+    const others = sources.filter((source) => source !== primarySource);
+    const otherSection = renderOtherMedia(others);
+    if (otherSection) sourceList.append(otherSection);
+    return;
+  }
   if (!sources.length) {
     sourceList.append(el("div", "empty", "No media found on this page."));
     return;
@@ -137,6 +165,133 @@ function render() {
   sourceList.append(card);
   const otherSection = renderOtherMedia(others);
   if (otherSection) sourceList.append(otherSection);
+}
+function renderYtDlpCard() {
+  const card = el("section", "primary-card");
+  if (ytdlpInspecting) {
+    card.append(el("div", "quality-empty", "Getting formats…"));
+    sourceList.append(card);
+    return;
+  }
+  if (ytdlpToolsMissing) {
+    const name = ytdlpToolsMissing === "deno" ? "Deno" : "yt-dlp";
+    card.append(el("div", "ytdlp-note", name + " is not installed yet. Download it to get formats from this page."));
+    card.append(ytdlpToolDownloadButton(ytdlpToolsMissing, () => { void inspectYtDlpPage(); }));
+    sourceList.append(card);
+    return;
+  }
+  if (!ytdlpVariants?.length) {
+    card.append(el("div", "quality-empty", "No downloadable formats found for this page."));
+    sourceList.append(card);
+    return;
+  }
+  const primaryBtn = el("button", "primary primary-btn", "Download this video · " + qualityLabel(ytdlpVariants[0]));
+  primaryBtn.addEventListener("click", async () => {
+    primaryBtn.disabled = true;
+    try {
+      const result = await startYtDlpVariant(ytdlpVariants[0]);
+      showToast(result.message || "Download started in ThunderLoad.");
+    } catch (error) { showToast(nativeErrorMessage(error)); }
+    finally { primaryBtn.disabled = false; }
+  });
+  card.append(primaryBtn);
+  const list = el("div", "quality-list");
+  renderYtDlpQualityRows(list, ytdlpVariants);
+  card.append(list);
+  if (ytdlpDenoMissing) {
+    card.append(el("div", "ytdlp-note", "Deno is not installed — YouTube shows fewer formats without it."));
+    card.append(ytdlpToolDownloadButton("deno", () => { ytdlpDenoMissing = false; render(); }));
+  }
+  sourceList.append(card);
+}
+function renderYtDlpQualityRows(list, variants) {
+  list.replaceChildren();
+  for (const variant of variants) {
+    const row = el("div", "quality");
+    row.append(el("strong", "", qualityLabel(variant)));
+    const download = el("button", "download-btn", "Download");
+    download.addEventListener("click", async () => {
+      download.disabled = true;
+      try {
+        const result = await startYtDlpVariant(variant);
+        showToast(result.message || "Download started in ThunderLoad.");
+      } catch (error) { showToast(nativeErrorMessage(error)); }
+      finally { download.disabled = false; }
+    });
+    row.append(download);
+    list.append(row);
+  }
+}
+// One named tool-download button (consent + progress, FINAL
+// requirement): the button names the tool ("Download yt-dlp" /
+// "Download Deno"), the progress line names it too ("yt-dlp download
+// ho raha hai — 45%") — never a generic label
+// anywhere. The tap itself is the consent: nothing is fetched until
+// the user presses this button. The manual link is only the backup.
+function ytdlpToolDownloadButton(tool, onDone) {
+  const wrap = el("div", "ytdlp-consent");
+  const name = tool === "deno" ? "Deno" : "yt-dlp";
+  const button = el("button", "secondary-btn", "Download " + name);
+  const progress = el("div", "ytdlp-progress" + (ytdlpToolProgressText ? "" : " hidden"), ytdlpToolProgressText);
+  const manual = el("button", "ytdlp-manual", "or download it yourself");
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    try {
+      const result = await api.runtime.sendMessage({ type: "YTDLP_ENSURE_TOOL", tool });
+      if (!result?.ok) throw new Error(result?.error || "Download failed.");
+      if (typeof onDone === "function") onDone();
+    } catch (error) {
+      showToast(nativeErrorMessage(error));
+      button.disabled = false;
+    }
+  });
+  manual.addEventListener("click", () => {
+    api.runtime.sendMessage({ type: "YTDLP_OPEN_MANUAL_PAGE", tool }).catch(() => {});
+  });
+  wrap.append(button, progress, manual);
+  return wrap;
+}
+async function startYtDlpVariant(variant) {
+  const formatSelector = variant.audioRepresentationId
+    ? variant.representationId + "+" + variant.audioRepresentationId
+    : variant.representationId;
+  const filename = ytdlpTitle ? ytdlpTitle + ".mp4" : "video.mp4";
+  const result = await api.runtime.sendMessage({ type: "YTDLP_DOWNLOAD", pageUrl, formatSelector, filename });
+  if (!result?.ok) throw new Error(nativeErrorMessage(result?.error || "Could not start this download."));
+  return { ok: true, message: result.message || "Download started in ThunderLoad." };
+}
+async function inspectYtDlpPage() {
+  ytdlpInspecting = true;
+  try {
+    const result = await api.runtime.sendMessage({ type: "YTDLP_INSPECT", pageUrl });
+    if (!result?.ok) {
+      ytdlpToolsMissing = result?.toolsMissing || null;
+      if (!ytdlpToolsMissing) showToast(result?.error || "Could not inspect this page.");
+      ytdlpVariants = null;
+    } else {
+      const variants = (result.variants || []).filter((item) => item?.downloadable && item?.url);
+      variants.sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bandwidth || 0) - (a.bandwidth || 0));
+      ytdlpVariants = variants;
+      ytdlpTitle = result.title || "";
+      ytdlpToolsMissing = null;
+      void checkYtDlpDeno();
+    }
+  } catch (error) {
+    showToast(nativeErrorMessage(error));
+    ytdlpVariants = null;
+  } finally {
+    ytdlpInspecting = false;
+    render();
+  }
+}
+async function checkYtDlpDeno() {
+  try {
+    const status = await api.runtime.sendMessage({ type: "YTDLP_TOOLS_STATUS" });
+    if (status?.ok && status.deno && status.deno.present === false) {
+      ytdlpDenoMissing = true;
+      render();
+    }
+  } catch (_) { /* Tools status is best-effort here. */ }
 }
 function updatePrimaryCard() {
   const card = sourceList.querySelector(".primary-card");
@@ -236,8 +391,30 @@ async function scanActiveTab() {
     if (!result?.ok) throw new Error(result?.error || "Cannot scan this page");
     pageUrl = result.pageUrl || "";
     sources = result.sources || [];
-    render();
-    autoInspectPrimary();
+    if (result.ytdlp) {
+      // An inspect already ran for this tab (this popup session or
+      // the cached background entry): show its formats, no re-spawn.
+      ytdlpVariants = result.ytdlp.variants || [];
+      ytdlpTitle = result.ytdlp.title || "";
+      ytdlpInspecting = false;
+      ytdlpToolsMissing = null;
+      render();
+      void checkYtDlpDeno();
+    } else if (isYtDlpPageUrl(pageUrl)) {
+      // First open on a YouTube/social page: inspect it (loading
+      // state first — inspect takes 2–10 s; the background cache
+      // stops a re-open from re-spawning yt-dlp).
+      ytdlpInspecting = true;
+      ytdlpVariants = null;
+      render();
+      await inspectYtDlpPage();
+    } else {
+      ytdlpVariants = null;
+      ytdlpInspecting = false;
+      ytdlpToolsMissing = null;
+      render();
+      autoInspectPrimary();
+    }
   } catch (error) {
     sources = []; render();
     showToast(error.message || String(error));
@@ -263,6 +440,16 @@ api.runtime.onMessage.addListener((message) => {
     const event = message.event;
     if (event?.event === "download.complete") showToast("Download complete: " + event.path);
     if (event?.event === "download.error") showToast("Download failed: " + event.error);
+    // Slice 3: tool-download progress — the line names the tool.
+    if (event?.event === "ytdlp.tool_progress") {
+      const tool = event.tool === "deno" ? "Deno" : "yt-dlp";
+      ytdlpToolProgressText = tool + " download ho raha hai"
+        + (typeof event.percent === "number" ? " — " + Math.round(event.percent) + "%" : "…");
+      for (const node of sourceList.querySelectorAll(".ytdlp-progress")) {
+        node.textContent = ytdlpToolProgressText;
+        node.classList.remove("hidden");
+      }
+    }
   }
   if (message?.type === "NATIVE_DISCONNECTED") showToast("Engine disconnected");
   if (message?.type === "CONTEXT_DOWNLOAD_RESULT" && !message.result?.ok) showToast(message.result?.error || "Download failed");

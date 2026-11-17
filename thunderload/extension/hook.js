@@ -87,14 +87,17 @@
   }
 
   // Handshake: the isolated content script pings for the token; the
-  // hook answers with HELLO. The hook also announces itself once at
-  // startup (in case a listener is already attached).
+  // hook answers with HELLO, echoing the PING's nonce (Slice 3
+  // MINOR (a)) so the content script can tell a fresh HELLO from a
+  // replayed one. The hook also announces itself once at startup
+  // (in case a listener is already attached) — that HELLO carries
+  // no nonce and is ignored until a PING is answered.
   window.addEventListener("message", (event) => {
     try {
       if (event.source !== window) return;
       const data = event.data;
       if (!data || data.__thunderLoadHook !== true || data.type !== "THUNDERLOAD_HOOK_PING") return;
-      post("THUNDERLOAD_HOOK_HELLO", {});
+      post("THUNDERLOAD_HOOK_HELLO", { nonce: data.nonce });
     } catch (_) {}
   });
   post("THUNDERLOAD_HOOK_HELLO", {});
