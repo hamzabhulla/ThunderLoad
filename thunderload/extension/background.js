@@ -221,7 +221,10 @@ async function quickDownloadMedia({ url, kind, pageUrl, filename, selectedVarian
     audioRepresentationId: selected.audioRepresentationId || ""
   });
   if (result?.ok) {
-    return { ok: true, message: selected.quality && variants.length > 1
+    // jobId lets the panel show live progress for this download
+    // (Slice 5): the native host reports download.progress events
+    // with the same jobId, and the panel matches them to this start.
+    return { ok: true, jobId: result.data?.jobId || null, message: selected.quality && variants.length > 1
       ? "Downloading " + selected.quality + " in ThunderLoad."
       : "Download started in ThunderLoad." };
   }
@@ -416,7 +419,11 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // 65 s: the engine allows 60 s for a slow inspect; the default
       // 30 s requestNative timeout would cut a 30–60 s inspect off in
       // the extension even though the engine would succeed.
-      const result = await requestNative("ytdlp.inspect", { url: pageUrl }, 65000);
+      // Slice 5: the page URL is also the referer — yt-dlp passes it
+      // to the site, so a login-walled video inspects with the session
+      // instead of 403ing. (Cookies + UA were already attached by
+      // requestNative; only the referer was missing here.)
+      const result = await requestNative("ytdlp.inspect", { url: pageUrl, referer: pageUrl }, 65000);
       if (!result?.ok) {
         sendResponse({ ok: false, error: result?.error || "yt-dlp could not inspect this page.", toolsMissing: result?.toolsMissing || null });
         return;
@@ -431,9 +438,13 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message?.type === "YTDLP_DOWNLOAD") {
-    requestNative("ytdlp.download", { url: message.pageUrl, formatSelector: message.formatSelector, filename: message.filename }).then((result) => {
+    // Slice 5: same referer as the inspect — the download must carry
+    // the same session, or a gated video fails after the inspect
+    // succeeded. jobId is passed through so the panel can show live
+    // progress for this download.
+    requestNative("ytdlp.download", { url: message.pageUrl, formatSelector: message.formatSelector, filename: message.filename, referer: message.pageUrl }).then((result) => {
       sendResponse(result?.ok
-        ? { ok: true, message: result.message || "Download started in ThunderLoad." }
+        ? { ok: true, jobId: result.data?.jobId || null, message: result.message || "Download started in ThunderLoad." }
         : { ok: false, error: nativeErrorMessage(result?.error || "ThunderLoad could not start this download.") });
     });
     return true;

@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ThunderLoad panel mockup</title>
+<style>
+  body{margin:0;min-height:100vh;background:#0f172a;display:flex;align-items:flex-start;justify-content:center;gap:32px;padding:48px 16px;box-sizing:border-box;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
+  .panel{width:300px;max-width:calc(100vw - 16px);max-height:min(420px,calc(100vh - 24px));overflow:hidden;padding:12px;border:1px solid #1e293b;border-radius:10px;background:#0b1220;box-shadow:0 8px 24px rgba(0,0,0,.45);display:flex;flex-direction:column}
+  .p-head,.p-progress{flex:none}
+  .p-scroll{overflow-y:auto;min-height:0}
+  .p-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:10px}
+  .p-title{display:flex;align-items:center;gap:6px;min-width:0;color:#e8f1fc;font:600 12px/1.2 system-ui,-apple-system,"Segoe UI",sans-serif}
+  .p-title svg{width:13px;height:13px;flex:none}
+  .p-title-text{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .p-close{flex:none;width:22px;height:22px;padding:0;border:0;border-radius:5px;background:transparent;color:#8b9eb2;font:16px/1 system-ui,-apple-system,"Segoe UI",sans-serif;cursor:pointer}
+  .p-close:hover{background:#1e293b;color:#e8f1fc}
+  .p-qualities{display:grid;gap:6px}
+  .p-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;border:1px solid #1e293b;border-radius:6px;background:#111c2e}
+  .p-row.best{border-color:#16a34a}
+  .p-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#e4edf8;font:500 11px/1.3 system-ui,-apple-system,"Segoe UI",sans-serif}
+  .p-best{flex:none;padding:1px 5px;border:1px solid #16a34a;border-radius:4px;color:#4ade80;font:600 9px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}
+  .p-dl{flex:none;min-height:24px;padding:0 9px;border:1px solid #16a34a;border-radius:5px;background:transparent;color:#4ade80;font:600 10px/1 system-ui,-apple-system,"Segoe UI",sans-serif;cursor:pointer}
+  .p-dl:hover{background:rgba(22,163,74,.15)}
+  .p-connect{display:block;width:100%;min-height:30px;margin-top:10px;padding:0 12px;border:1px solid #16a34a;border-radius:8px;background:transparent;color:#4ade80;font:600 12px/1.2 system-ui,-apple-system,"Segoe UI",sans-serif;cursor:pointer}
+  .p-connect:hover{background:rgba(22,163,74,.15)}
+  .p-other{margin-top:10px;border-top:1px solid #1e293b;padding-top:8px}
+  .p-other summary{list-style:none;color:#aebdce;font:600 11px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif;cursor:pointer}
+  .p-other summary::-webkit-details-marker{display:none}
+  .p-other summary::before{content:"▸ ";color:#4ade80}
+  .p-other[open] summary::before{content:"▾ "}
+  .p-other-list{display:grid;gap:6px;margin-top:8px}
+  .p-q{flex:none;padding:2px 6px;border:1px solid #1e293b;border-radius:4px;background:#0b1220;color:#aebdce;font:600 10px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}
+  .p-progress{margin-bottom:10px;padding:10px;border:1px solid #1e293b;border-radius:6px;background:#111c2e}
+  .p-progress-title{color:#e4edf8;font:600 11px/1.3 system-ui,-apple-system,"Segoe UI",sans-serif;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .p-progress-bar{height:6px;margin-top:8px;border-radius:3px;background:#1e293b;overflow:hidden}
+  .p-progress-fill{height:100%;background:#16a34a}
+  .p-progress-text{margin-top:6px;color:#aebdce;font:10px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}
+</style>
+</head>
+<body>
+  <div class="panel">
+    <div class="p-head">
+      <span class="p-title"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2 3 14h7l-1 7 10-12h-7l1-7z" fill="#22c55e"/></svg><span class="p-title-text">Big Buck Bunny — Blender Foundation</span></span>
+      <button class="p-close" type="button" aria-label="Close">×</button>
+    </div>
+    <div class="p-scroll">
+      <div class="p-qualities">
+        <div class="p-row best"><span class="p-label">1080p HD</span><span class="p-best">Best</span><button class="p-dl" type="button">Download</button></div>
+        <div class="p-row"><span class="p-label">720p HD</span><button class="p-dl" type="button">Download</button></div>
+        <div class="p-row"><span class="p-label">480p</span><button class="p-dl" type="button">Download</button></div>
+        <div class="p-row"><span class="p-label">Audio</span><button class="p-dl" type="button">Download</button></div>
+      </div>
+      <details class="p-other">
+        <summary>Other media on this page (3)</summary>
+        <div class="p-other-list">
+          <div class="p-row"><span class="p-label" title="teaser-trailer-2026-final-cut.mp4">teaser-trailer-2026-final…</span><span class="p-q">MP4</span><button class="p-dl" type="button">Download</button></div>
+          <div class="p-row"><span class="p-label" title="behind-the-scenes.mp4">behind-the-scenes.mp4</span><span class="p-q">MP4</span><button class="p-dl" type="button">Download</button></div>
+          <div class="p-row"><span class="p-label" title="poster.jpg">poster.jpg</span><span class="p-q">JPG</span><button class="p-dl" type="button">Download</button></div>
+        </div>
+      </details>
+    </div>
+    <button class="p-connect" type="button">Connect desktop app</button>
+  </div>
+  <div class="panel">
+    <div class="p-head">
+      <span class="p-title"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2 3 14h7l-1 7 10-12h-7l1-7z" fill="#22c55e"/></svg><span class="p-title-text">Big Buck Bunny — Blender Foundation</span></span>
+      <button class="p-close" type="button" aria-label="Close">×</button>
+    </div>
+    <div class="p-progress">
+      <div class="p-progress-title">1080p HD</div>
+      <div class="p-progress-bar"><div class="p-progress-fill" style="width:46%"></div></div>
+      <div class="p-progress-text">46% · 12.4 MB of 26.9 MB · Downloading…</div>
+    </div>
+    <div class="p-scroll">
+      <div class="p-qualities">
+        <div class="p-row best"><span class="p-label">1080p HD</span><span class="p-best">Best</span><button class="p-dl" type="button">Download</button></div>
+        <div class="p-row"><span class="p-label">720p HD</span><button class="p-dl" type="button">Download</button></div>
+        <div class="p-row"><span class="p-label">480p</span><button class="p-dl" type="button">Download</button></div>
+        <div class="p-row"><span class="p-label">Audio</span><button class="p-dl" type="button">Download</button></div>
+      </div>
+    </div>
+    <button class="p-connect" type="button">Connect desktop app</button>
+  </div>
+</body>
+</html>

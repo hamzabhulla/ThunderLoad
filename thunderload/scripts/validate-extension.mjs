@@ -54,4 +54,15 @@ for (const [name, text] of [["content.js", content], ["popup.js", popup]]) {
 }
 if (!content.includes("YTDLP_INSPECT") || !content.includes("YTDLP_DOWNLOAD")) throw new Error("content.js must run the yt-dlp panel flow");
 if (!popup.includes("YTDLP_INSPECT") || !popup.includes("YTDLP_DOWNLOAD")) throw new Error("popup.js must run the yt-dlp inspect flow");
+// Slice 5: auth forwarding + IDM-style panel contract. yt-dlp
+// inspect and download must carry the page URL as the referer, so a
+// login-walled video inspects and downloads with the session instead
+// of 403ing (cookies + UA were already attached by requestNative).
+// The panel must show live progress for a download started from it:
+// the background passes the native jobId through, and content.js
+// renders the progress section and tracks download.* events.
+if (!background.includes("referer: pageUrl") || !background.includes("referer: message.pageUrl")) throw new Error("background.js must forward the page URL as the referer for yt-dlp inspect and download");
+if (!background.includes("jobId")) throw new Error("background.js must pass the native jobId through to the panel");
+if (!content.includes("p-progress") || !content.includes("download.progress")) throw new Error("content.js must show live download progress in the panel");
+if (!content.includes("p-title-text")) throw new Error("content.js must show the video/page title at the top of the panel");
 console.log("Extension manifests and required assets are valid.");

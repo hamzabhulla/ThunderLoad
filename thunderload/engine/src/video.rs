@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use crate::session::{apply_session, SessionHeaders};
+use crate::session::{apply_session, auth_failure_label, map_auth_error, SessionHeaders};
 use aes::Aes128;
 use cbc::{cipher::{generic_array::{typenum::U16, GenericArray}, BlockDecryptMut, KeyIvInit}, Decryptor};
 use reqwest::Client;
@@ -133,10 +133,20 @@ pub async fn inspect_video(url: &str, session: Option<&SessionHeaders>) -> Resul
         Ok(response) if response.status().is_success() => response,
         _ => {
             let probe = apply_session(session, client.get(url).header(reqwest::header::RANGE, "bytes=0-0"), url);
-            probe.send().await
+            let probed = probe.send().await
                 .context("Could not inspect the URL response headers with HEAD or a one-byte GET")?
                 .error_for_status()
-                .context("The server rejected both media inspection requests")?
+                .context("The server rejected both media inspection requests");
+            // A 401/403 from the probe is the login wall, not a
+            // generic inspection failure — show the label alone
+            // (Slice 5); anything else keeps its context.
+            match probed {
+                Ok(response) => response,
+                Err(error) => match auth_failure_label(&error) {
+                    Some(label) => return Err(anyhow::Error::msg(label)),
+                    None => return Err(error),
+                },
+            }
         }
     };
     let content_type = response.headers()
@@ -1796,7 +1806,12 @@ fn parse_hls_iv(value: &str) -> Result<[u8; 16]> {
 
 async fn fetch_text_with(client: &Client, url: &str, session: Option<&SessionHeaders>) -> Result<String> {
     let request = apply_session(session, client.get(url), url);
-    Ok(request.send().await?.error_for_status()?.text().await?)
+    // A 401/403 here is an auth failure, not a fetch failure: the
+    // manifest fetch is the first request that meets the login wall,
+    // so relabel it before it reaches the panel (Slice 5).
+    let response = request.send().await.map_err(map_auth_error)?;
+    let response = response.error_for_status().map_err(map_auth_error)?;
+    Ok(response.text().await?)
 }
 
 /// Fetches the playlist (master first, then the chosen media playlist and
@@ -5693,9 +5708,10 @@ mod tests {
 mod hls_download_tests {
     use super::{
         download_hls_resumable, ffmpeg_available, hidden_command, hls_output_extension, hls_work_dir,
-        partial_download_metadata_path, validate_hls_content_range,
+        inspect_video, partial_download_metadata_path, validate_hls_content_range,
         DownloadControl, DownloadOutcome, GlobalRateLimiter, HlsSelection, SessionHeaders,
     };
+    use crate::session::AUTH_REQUIRED_MESSAGE;
     use crate::download::reserve_download_path;
     use std::{
         collections::{HashMap, HashSet},
@@ -6247,6 +6263,43 @@ mod hls_download_tests {
         }
         stop_server(shutdown, server);
         tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    /// Slice 5: a 401/403 from inspect is the login wall, not a bare
+    /// status — the panel must show the login label. Covers both
+    /// inspect paths: the manifest fetch (fetch_text_with) and the
+    /// HEAD/one-byte-GET probe for extensionless URLs.
+    #[tokio::test]
+    async fn inspect_video_labels_a_403_as_a_login_problem() {
+        let (mut routes, _bodies) = segment_routes(2, 64);
+        routes.insert("/media.m3u8".into(), media_playlist(2).into_bytes());
+        routes.insert("/clip".into(), b"fake-media-bytes".to_vec());
+        let options = HlsServerOptions {
+            require_cookie: Some("sessionid=abc123".to_string()),
+            ..Default::default()
+        };
+        let (base, _counts, _range_206, shutdown, server) =
+            spawn_hls_server(routes, Duration::ZERO, options);
+        let session = SessionHeaders {
+            cookies: Some("sessionid=abc123".to_string()),
+            referer: None,
+            user_agent: None,
+            origin: SessionHeaders::origin_of(&format!("{base}/media.m3u8")),
+        };
+        // Manifest fetch without the session: the login label, not "HTTP 403".
+        let error = inspect_video(&format!("{base}/media.m3u8"), None).await.unwrap_err();
+        assert_eq!(error.to_string(), AUTH_REQUIRED_MESSAGE);
+        // Extensionless probe without the session: the same label.
+        let error = inspect_video(&format!("{base}/clip"), None).await.unwrap_err();
+        assert_eq!(error.to_string(), AUTH_REQUIRED_MESSAGE);
+        // With the session the manifest path works; the extensionless
+        // probe gets past auth too (it then fails only because the
+        // fixture sends no media Content-Type).
+        let variants = inspect_video(&format!("{base}/media.m3u8"), Some(&session)).await.unwrap();
+        assert!(!variants.is_empty());
+        let error = inspect_video(&format!("{base}/clip"), Some(&session)).await.unwrap_err();
+        assert!(error.to_string().contains("webpage"), "probe passed auth, failed on content type: {error}");
+        stop_server(shutdown, server);
     }
 
     #[tokio::test]

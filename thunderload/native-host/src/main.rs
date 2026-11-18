@@ -10,7 +10,7 @@ use anyhow::{anyhow, Result};
 use std::{collections::HashMap, sync::{Arc, Mutex, OnceLock}};
 use serde_json::{json, Value};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::{mpsc, watch}};
-use thunderload_engine::{check_ytdlp_update, dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_resumable, download_page, download_url_resumable, ensure_tool, hls_output_extension, hls_work_dir, inspect_page, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, tool_status, tools_dir, DownloadControl, DownloadOutcome, GlobalRateLimiter, HlsSelection, SessionHeaders, ToolDownloadProgress, ToolsMissing, YtDlpTool};
+use thunderload_engine::{check_ytdlp_update, dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_resumable, download_page, download_url_resumable, ensure_tool, error_text, hls_output_extension, hls_work_dir, inspect_page, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, tool_status, tools_dir, DownloadControl, DownloadOutcome, GlobalRateLimiter, HlsSelection, SessionHeaders, ToolDownloadProgress, ToolsMissing, YtDlpTool};
 
 const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 
@@ -485,12 +485,12 @@ async fn main() -> Result<()> {
                             Err(error) => {
                                 state = load_native_job_state(&job_id, state).await;
                                 state["status"] = json!("Failed");
-                                state["error"] = json!(error.to_string());
+                                state["error"] = json!(error_text(&error));
                                 state["detail"] = json!("Transfer interrupted · partial checkpoint kept");
                                 state["targetPath"] = json!(target.to_string_lossy().to_string());
                                 state["updatedAt"] = json!(timestamp_ms());
                                 let _ = save_native_job_state(&state).await;
-                                let _ = tx.send(json!({"event": "download.error", "jobId": job_id, "error": error.to_string()}));
+                                let _ = tx.send(json!({"event": "download.error", "jobId": job_id, "error": error_text(&error)}));
                                 // Retain the native control channel so the desktop
                                 // queue can ask this browser job to Resume its checkpoint.
                                 match wait_native_job_control(&mut control_rx, &mut state, false).await {
@@ -697,12 +697,12 @@ async fn main() -> Result<()> {
                             Err(error) => {
                                 state = load_native_job_state(&job_id, state).await;
                                 state["status"] = json!("Failed");
-                                state["error"] = json!(error.to_string());
+                                state["error"] = json!(error_text(&error));
                                 state["detail"] = json!("Video download interrupted · partial checkpoint kept");
                                 state["targetPath"] = json!(target.to_string_lossy().to_string());
                                 state["updatedAt"] = json!(timestamp_ms());
                                 let _ = save_native_job_state(&state).await;
-                                let _ = tx.send(json!({"event": "download.error", "jobId": job_id, "error": error.to_string()}));
+                                let _ = tx.send(json!({"event": "download.error", "jobId": job_id, "error": error_text(&error)}));
                                 // Retain the native control channel so the desktop
                                 // queue can ask this browser job to Resume its checkpoint.
                                 match wait_native_job_control(&mut control_rx, &mut state, false).await {
@@ -890,12 +890,12 @@ async fn main() -> Result<()> {
                             Err(error) => {
                                 state = load_native_job_state(&job_id, state).await;
                                 state["status"] = json!("Failed");
-                                state["error"] = json!(error.to_string());
+                                state["error"] = json!(error_text(&error));
                                 state["detail"] = json!("DASH download interrupted · partial checkpoint kept");
                                 state["targetPath"] = json!(target.to_string_lossy().to_string());
                                 state["updatedAt"] = json!(timestamp_ms());
                                 let _ = save_native_job_state(&state).await;
-                                let _ = tx.send(json!({"event": "download.error", "jobId": job_id, "error": error.to_string()}));
+                                let _ = tx.send(json!({"event": "download.error", "jobId": job_id, "error": error_text(&error)}));
                                 // Retain the native control channel so the desktop
                                 // queue can ask this browser job to Resume its checkpoint.
                                 match wait_native_job_control(&mut control_rx, &mut state, false).await {
@@ -1162,12 +1162,12 @@ async fn main() -> Result<()> {
                             Err(error) => {
                                 state = load_native_job_state(&job_id, state).await;
                                 state["status"] = json!("Failed");
-                                state["error"] = json!(error.to_string());
+                                state["error"] = json!(error_text(&error));
                                 state["detail"] = json!("Download interrupted · partial files kept");
                                 state["targetPath"] = json!(target.to_string_lossy().to_string());
                                 state["updatedAt"] = json!(timestamp_ms());
                                 let _ = save_native_job_state(&state).await;
-                                let _ = tx.send(json!({"event": "download.error", "jobId": job_id, "error": error.to_string()}));
+                                let _ = tx.send(json!({"event": "download.error", "jobId": job_id, "error": error_text(&error)}));
                                 match wait_native_job_control(&mut control_rx, &mut state, false).await {
                                     Some(DownloadControl::Running) => {
                                         state["status"] = json!("Downloading");
@@ -1215,7 +1215,9 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod config_dir_tests {
     use super::desktop_config_dir_from;
+    use anyhow::anyhow;
     use std::path::{Path, PathBuf};
+    use thunderload_engine::error_text;
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -1259,5 +1261,17 @@ mod config_dir_tests {
             ))
         );
         assert_eq!(desktop_config_dir_from(None, None, None), None);
+    }
+
+    /// Slice 5: a non-auth failure keeps its own message (the 403
+    /// relabelling is covered by the engine tests of
+    /// `auth_failure_label`, which this helper calls).
+    #[test]
+    fn error_text_keeps_non_auth_errors_unchanged() {
+        assert_eq!(error_text(&anyhow!("boom")), "boom");
+        assert_eq!(
+            error_text(&anyhow!("Download server returned HTTP 500")),
+            "Download server returned HTTP 500"
+        );
     }
 }

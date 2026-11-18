@@ -153,7 +153,7 @@
       '.message.show{display:block}',
       '.panel{display:none;position:absolute;top:38px;right:0;width:300px;max-width:calc(100vw - 16px);max-height:min(420px,calc(100vh - 24px));overflow:hidden;padding:12px;border:1px solid #1e293b;border-radius:10px;background:#0b1220;box-shadow:0 8px 24px rgba(0,0,0,.45);pointer-events:auto}',
       '.panel.show{display:flex;flex-direction:column}',
-      '.p-head,.p-primary,.p-connect{flex:none}',
+      '.p-head,.p-progress,.p-connect{flex:none}',
       '.p-scroll{overflow-y:auto;min-height:0}',
       '.p-q{pointer-events:none;flex:none;padding:2px 6px;border:1px solid #1e293b;border-radius:4px;background:#0b1220;color:#aebdce;font:600 10px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}',
       '.p-connect{pointer-events:auto;display:block;width:100%;min-height:30px;margin-top:10px;padding:0 12px;border:1px solid #16a34a;border-radius:8px;background:transparent;color:#4ade80;font:600 12px/1.2 system-ui,-apple-system,"Segoe UI",sans-serif;cursor:pointer}',
@@ -161,20 +161,25 @@
       '.p-connect:disabled{opacity:.5;cursor:wait}',
       '.p-note{display:none;margin-top:8px;color:#aebdce;font:10px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}',
       '.p-note.show{display:block}',
-      '.p-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}',
-      '.p-title{display:flex;align-items:center;gap:6px;color:#e8f1fc;font:600 12px/1.2 system-ui,-apple-system,"Segoe UI",sans-serif}',
+      '.p-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:10px}',
+      '.p-title{display:flex;align-items:center;gap:6px;min-width:0;color:#e8f1fc;font:600 12px/1.2 system-ui,-apple-system,"Segoe UI",sans-serif}',
       '.p-title svg{width:13px;height:13px;flex:none}',
-      '.p-close{pointer-events:auto;width:22px;height:22px;padding:0;border:0;border-radius:5px;background:transparent;color:#8b9eb2;font:16px/1 system-ui,-apple-system,"Segoe UI",sans-serif;cursor:pointer}',
+      '.p-title-text{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+      '.p-close{pointer-events:auto;flex:none;width:22px;height:22px;padding:0;border:0;border-radius:5px;background:transparent;color:#8b9eb2;font:16px/1 system-ui,-apple-system,"Segoe UI",sans-serif;cursor:pointer}',
       '.p-close:hover{background:#1e293b;color:#e8f1fc}',
-      '.p-primary{pointer-events:auto;display:block;width:100%;min-height:34px;padding:0 12px;border:0;border-radius:8px;background:#16a34a;color:#fff;font:600 12px/1.2 system-ui,-apple-system,"Segoe UI",sans-serif;cursor:pointer}',
-      '.p-primary:hover{background:#22c55e}',
-      '.p-primary:disabled{opacity:.55;cursor:wait}',
-      '.p-qualities{display:grid;gap:6px;margin-top:10px}',
+      '.p-qualities{display:grid;gap:6px}',
       '.p-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;border:1px solid #1e293b;border-radius:6px;background:#111c2e}',
+      '.p-row.best{border-color:#16a34a}',
+      '.p-best{flex:none;padding:1px 5px;border:1px solid #16a34a;border-radius:4px;color:#4ade80;font:600 9px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}',
       '.p-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#e4edf8;font:500 11px/1.3 system-ui,-apple-system,"Segoe UI",sans-serif}',
       '.p-dl{pointer-events:auto;flex:none;min-height:24px;padding:0 9px;border:1px solid #16a34a;border-radius:5px;background:transparent;color:#4ade80;font:600 10px/1 system-ui,-apple-system,"Segoe UI",sans-serif;cursor:pointer}',
       '.p-dl:hover{background:rgba(22,163,74,.15)}',
       '.p-dl:disabled{opacity:.5;cursor:wait}',
+      '.p-progress{margin-bottom:10px;padding:10px;border:1px solid #1e293b;border-radius:6px;background:#111c2e}',
+      '.p-progress-title{color:#e4edf8;font:600 11px/1.3 system-ui,-apple-system,"Segoe UI",sans-serif;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+      '.p-progress-bar{height:6px;margin-top:8px;border-radius:3px;background:#1e293b;overflow:hidden}',
+      '.p-progress-fill{height:100%;background:#16a34a}',
+      '.p-progress-text{margin-top:6px;color:#aebdce;font:10px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}',
       '.p-empty{padding:8px;color:#8b9eb2;font:10px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}',
       '.p-other{margin-top:10px;border-top:1px solid #1e293b;padding-top:8px}',
       '.p-other summary{list-style:none;color:#aebdce;font:600 11px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif;cursor:pointer}',
@@ -239,10 +244,15 @@
   // Panel state: the source the panel is showing, the other
   // candidates on the page, and its inspected variants (null while
   // the inspect is in flight, [] when nothing downloadable exists).
+  // panelInspectError carries the inspect failure text (e.g. the
+  // login label for a gated manifest) so the panel can show it
+  // instead of the generic empty text — Slice 5 fix: the panel used
+  // to swallow the error and go dead-end.
   let panelPrimary = null;
   let panelOthers = [];
   let panelTarget = null;
   let panelVariants = null;
+  let panelInspectError = null;
 
   // Slice 1b follow-up: the last connect result, re-applied whenever
   // the connect fragment is rebuilt — so an in-flight inspect
@@ -327,9 +337,9 @@
     return source.kind || "Media";
   }
 
-  function variantRow(variant, target) {
+  function variantRow(variant, target, isBest) {
     const row = document.createElement("div");
-    row.className = "p-row";
+    row.className = "p-row" + (isBest ? " best" : "");
     const label = document.createElement("span");
     label.className = "p-label";
     label.textContent = qualityLabel(variant);
@@ -338,18 +348,58 @@
     download.className = "p-dl";
     download.textContent = "Download";
     download.addEventListener("click", () => startDownload({ ...panelPrimary, selectedVariant: variant }, target));
-    row.append(label, download);
+    row.append(label);
+    if (isBest) {
+      const best = document.createElement("span");
+      best.className = "p-best";
+      best.textContent = "Best";
+      row.append(best);
+    }
+    row.append(download);
     return row;
   }
 
-  // Shared panel header (title + close). Closing the panel
-  // restarts the pill's auto-hide clock.
-  function panelHead() {
+  // Direct media has no qualities to list — one row for the file
+  // itself: its short name, its container, and a Download button.
+  function directRow(source, target) {
+    const row = document.createElement("div");
+    row.className = "p-row";
+    const label = document.createElement("span");
+    label.className = "p-label";
+    label.textContent = otherLabel(source);
+    label.title = otherFullName(source);
+    const quality = document.createElement("span");
+    quality.className = "p-q";
+    quality.textContent = otherQuality(source);
+    const download = document.createElement("button");
+    download.type = "button";
+    download.className = "p-dl";
+    download.textContent = "Download";
+    download.addEventListener("click", () => startDownload(source, target));
+    row.append(label, quality, download);
+    return row;
+  }
+
+  // Shared panel header: the video/page title at the top (Slice 5,
+  // IDM-style) + a clean close control. The title truncates with an
+  // ellipsis — long page titles never push the panel wider. Closing
+  // the panel restarts the pill's auto-hide clock.
+  function pageTitle() {
+    const title = (document.title || "").trim();
+    return title || "Download this video";
+  }
+
+  function panelHead(titleText) {
     const head = document.createElement("div");
     head.className = "p-head";
     const title = document.createElement("span");
     title.className = "p-title";
-    title.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2 3 14h7l-1 7 10-12h-7l1-7z" fill="#22c55e"/></svg>Download this video';
+    const bolt = document.createElement("span");
+    bolt.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2 3 14h7l-1 7 10-12h-7l1-7z" fill="#22c55e"/></svg>';
+    const text = document.createElement("span");
+    text.className = "p-title-text";
+    text.textContent = titleText || pageTitle();
+    title.append(bolt, text);
     const close = document.createElement("button");
     close.type = "button";
     close.className = "p-close";
@@ -357,10 +407,105 @@
     close.setAttribute("aria-label", "Close");
     close.addEventListener("click", () => {
       panelEl()?.classList.remove("show");
+      // Slice 5 fix: a finished download's state never survives the
+      // panel being closed — reopening starts clean.
+      if (panelDownloadState?.phase === "complete" || panelDownloadState?.phase === "error") {
+        panelDownloadState = null;
+        panelDownloadJobId = null;
+        panelDownloadSource = null;
+      }
       scheduleAutoHide();
     });
     head.append(title, close);
     return head;
+  }
+
+  // Slice 5: live in-panel progress for a download started from
+  // this panel. The background returns the native jobId at start;
+  // the native host then reports download.progress/complete/error
+  // events with the same jobId, forwarded as NATIVE_EVENTs. The
+  // panel only ever tracks its own download.
+  let panelDownloadJobId = null;
+  let panelDownloadState = null; // { label, percent, downloaded, total, phase, text } | null
+  let panelDownloadSource = null; // URL of the download the panel is tracking, or null
+
+  // Slice 5 fix: progress state belongs to one download on one
+  // source. A terminal state (complete/error) never carries over to
+  // the next panel open, and an in-flight download's progress never
+  // follows the panel to a different video — reopening the panel for
+  // the same source keeps its live progress.
+  function resetPanelDownloadStateFor(sourceUrl) {
+    if (!panelDownloadState) {
+      panelDownloadJobId = null;
+      panelDownloadSource = null;
+      return;
+    }
+    const terminal = panelDownloadState.phase === "complete" || panelDownloadState.phase === "error";
+    if (terminal || panelDownloadSource !== sourceUrl) {
+      panelDownloadState = null;
+      panelDownloadJobId = null;
+      panelDownloadSource = null;
+    }
+  }
+
+  function formatBytes(bytes) {
+    if (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes < 0) return "";
+    if (bytes < 1024) return bytes + " B";
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+    if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+    return (bytes / (1024 * 1024 * 1024)).toFixed(1) + " GB";
+  }
+
+  function progressText(state) {
+    if (state.phase === "error") return state.text || "Download failed.";
+    if (state.phase === "complete") return "Download complete";
+    if (state.phase === "preparing") return "Preparing download…";
+    const percent = typeof state.percent === "number" ? Math.max(0, Math.min(100, Math.round(state.percent))) : null;
+    const downloaded = formatBytes(state.downloaded);
+    const total = formatBytes(state.total);
+    if (percent !== null && downloaded && total) return percent + "% · " + downloaded + " of " + total + " · Downloading…";
+    if (percent !== null && downloaded) return percent + "% · " + downloaded + " · Downloading…";
+    if (percent !== null) return percent + "% · Downloading…";
+    return "Downloading…";
+  }
+
+  // Creates (or updates, or removes) the progress section directly
+  // under the panel header. Called after every render — renderPanel
+  // and renderYtDlpPanel both replaceChildren() — and on every
+  // download event, so the bar stays live without rebuilding the
+  // whole panel. Returns the section, or null when no download is
+  // in flight for this panel.
+  function progressSection() {
+    const panel = panelEl();
+    if (!panel) return null;
+    let section = panel.querySelector(".p-progress");
+    if (!panelDownloadState) {
+      if (section) section.remove();
+      return null;
+    }
+    if (!section) {
+      section = document.createElement("div");
+      section.className = "p-progress";
+      const title = document.createElement("div");
+      title.className = "p-progress-title";
+      const bar = document.createElement("div");
+      bar.className = "p-progress-bar";
+      const fill = document.createElement("div");
+      fill.className = "p-progress-fill";
+      bar.append(fill);
+      const text = document.createElement("div");
+      text.className = "p-progress-text";
+      section.append(title, bar, text);
+      const head = panel.querySelector(".p-head");
+      if (head && head.nextSibling) panel.insertBefore(section, head.nextSibling);
+      else panel.append(section);
+    }
+    section.querySelector(".p-progress-title").textContent = panelDownloadState.label || "Download";
+    const percent = typeof panelDownloadState.percent === "number"
+      ? Math.max(0, Math.min(100, Math.round(panelDownloadState.percent))) : 0;
+    section.querySelector(".p-progress-fill").style.width = percent + "%";
+    section.querySelector(".p-progress-text").textContent = progressText(panelDownloadState);
+    return section;
   }
 
   // Slice 1b: the permission action, reachable in both panel
@@ -409,6 +554,8 @@
     panelTarget = target;
     panelOthers = [];
     panelVariants = [];
+    panelInspectError = null;
+    resetPanelDownloadStateFor(null);
     const panel = panelEl();
     if (!panel) return;
     panel.replaceChildren();
@@ -431,9 +578,9 @@
   let ytdlpDenoMissing = false;
   let ytdlpToolProgressText = "";
 
-  function ytdlpVariantRow(variant, target) {
+  function ytdlpVariantRow(variant, target, isBest) {
     const row = document.createElement("div");
-    row.className = "p-row";
+    row.className = "p-row" + (isBest ? " best" : "");
     const label = document.createElement("span");
     label.className = "p-label";
     label.textContent = qualityLabel(variant);
@@ -442,7 +589,14 @@
     download.className = "p-dl";
     download.textContent = "Download";
     download.addEventListener("click", () => startYtDlpDownload(variant, target));
-    row.append(label, download);
+    row.append(label);
+    if (isBest) {
+      const best = document.createElement("span");
+      best.className = "p-best";
+      best.textContent = "Best";
+      row.append(best);
+    }
+    row.append(download);
     return row;
   }
 
@@ -501,7 +655,12 @@
     const panel = panelEl();
     if (!panel) return;
     panel.replaceChildren();
-    panel.append(panelHead());
+    // Slice 5: the video title at the top, the quality list as the
+    // primary rows (best first, one Download per row), live progress
+    // under the header, Connect at the bottom. The layout matches
+    // thunderload/extension/panel-mockup.html.
+    panel.append(panelHead(panelYtDlp?.title || undefined));
+    progressSection();
     if (panelYtDlp === null) {
       const loading = document.createElement("div");
       loading.className = "p-empty";
@@ -524,27 +683,18 @@
       panel.append(connectButton());
     } else {
       const variants = panelYtDlp.variants || [];
+      const scroll = document.createElement("div");
+      scroll.className = "p-scroll";
       if (variants.length) {
-        const primaryBtn = document.createElement("button");
-        primaryBtn.type = "button";
-        primaryBtn.className = "p-primary";
-        primaryBtn.textContent = "Download this video · " + qualityLabel(variants[0]);
-        primaryBtn.addEventListener("click", () => startYtDlpDownload(variants[0], panelTarget));
-        panel.append(primaryBtn);
+        const list = document.createElement("div");
+        list.className = "p-qualities";
+        for (const [index, variant] of variants.entries()) list.append(ytdlpVariantRow(variant, panelTarget, index === 0));
+        scroll.append(list);
       } else {
         const empty = document.createElement("div");
         empty.className = "p-empty";
         empty.textContent = "No downloadable formats found for this page.";
-        panel.append(empty);
-      }
-      panel.append(connectButton());
-      const scroll = document.createElement("div");
-      scroll.className = "p-scroll";
-      if (variants.length > 1) {
-        const list = document.createElement("div");
-        list.className = "p-qualities";
-        for (const variant of variants) list.append(ytdlpVariantRow(variant, panelTarget));
-        scroll.append(list);
+        scroll.append(empty);
       }
       if (ytdlpDenoMissing) {
         const note = document.createElement("div");
@@ -557,6 +707,7 @@
         }));
       }
       if (scroll.childElementCount) panel.append(scroll);
+      panel.append(connectButton());
     }
     status?.classList.remove("show");
     panel.classList.add("show");
@@ -568,6 +719,8 @@
     panelTarget = target;
     panelOthers = [];
     panelVariants = null;
+    panelInspectError = null;
+    resetPanelDownloadStateFor(location.href);
     panelYtDlp = null;
     ytdlpDenoMissing = false;
     ytdlpToolProgressText = "";
@@ -603,9 +756,15 @@
 
   async function startYtDlpDownload(variant, target) {
     if (!variant || !target || !button) return;
-    panelEl()?.classList.remove("show");
+    // Slice 5: the panel stays open with live progress instead of
+    // closing to a status toast. The start response carries the
+    // native jobId; download.progress/complete/error events for that
+    // jobId update the section (see the NATIVE_EVENT handler).
+    panelDownloadJobId = null;
+    panelDownloadState = { label: qualityLabel(variant), percent: 0, phase: "preparing" };
+    panelDownloadSource = location.href;
+    progressSection();
     button.disabled = true;
-    showStatus("Preparing download…");
     try {
       const formatSelector = variant.audioRepresentationId
         ? variant.representationId + "+" + variant.audioRepresentationId
@@ -618,9 +777,17 @@
         filename
       });
       if (!result?.ok) throw new Error(result?.error || "Could not start the download.");
-      showStatus(result.message || "Download added.");
+      panelDownloadJobId = result.jobId || null;
+      if (!panelDownloadJobId) {
+        // No jobId to track (older host): fall back to the toast.
+        panelDownloadState = null;
+        progressSection();
+        showStatus(result.message || "Download added.");
+      }
     } catch (error) {
-      showStatus(error?.message || String(error));
+      panelDownloadState = { label: qualityLabel(variant), phase: "error", text: error?.message || String(error) };
+      if (isPanelOpen()) progressSection();
+      else showStatus(error?.message || String(error));
     } finally {
       button.disabled = false;
     }
@@ -630,27 +797,16 @@
     const panel = panelEl();
     if (!panel || !panelPrimary) return;
     panel.replaceChildren();
+    // Slice 5: the video/page title at the top, the quality list as
+    // the primary rows (best first, one Download per row), live
+    // progress under the header, Connect at the bottom. Header +
+    // progress + connect stay visible; only the lists scroll, inside
+    // the panel, so the panel fits one viewport. The layout matches
+    // thunderload/extension/panel-mockup.html.
     panel.append(panelHead());
-    const primaryBtn = document.createElement("button");
-    primaryBtn.type = "button";
-    primaryBtn.className = "p-primary";
-    primaryBtn.textContent = panelVariants?.length
-      ? "Download this video · " + qualityLabel(panelVariants[0])
-      : "Download this video";
-    primaryBtn.addEventListener("click", () => {
-      // With inspected variants the best one is pre-selected; without
-      // them the download path inspects again and picks the best.
-      if (panelVariants?.length) startDownload({ ...panelPrimary, selectedVariant: panelVariants[0] }, panelTarget);
-      else startDownload(panelPrimary, panelTarget);
-    });
-    panel.append(primaryBtn);
-    panel.append(connectButton());
-    // Slice 1b: header + primary + connect stay visible; only the
-    // lists scroll, inside the panel, so the panel fits one viewport.
+    progressSection();
     const scroll = document.createElement("div");
     scroll.className = "p-scroll";
-    // Direct media has no qualities to list — the primary button is
-    // the whole action. Manifest sources get one row per quality.
     if (panelPrimary.kind === "DASH manifest" || panelPrimary.kind === "HLS playlist") {
       const list = document.createElement("div");
       list.className = "p-qualities";
@@ -660,13 +816,33 @@
         loading.textContent = "Checking qualities…";
         list.append(loading);
       } else if (!panelVariants.length) {
+        // Slice 5 fix: this manifest WAS detected — a failed or
+        // empty inspect is not "no media". Show the inspect error
+        // (e.g. the login label for a gated manifest) and offer
+        // "Download anyway": the old primary's fallback, starting
+        // the detected stream directly. The download path inspects
+        // again, and a failure there surfaces via the panel's error
+        // event, which already shows the label.
         const empty = document.createElement("div");
         empty.className = "p-empty";
-        empty.textContent = "No downloadable qualities are exposed.";
+        empty.textContent = panelInspectError || "No downloadable qualities are exposed.";
         list.append(empty);
+        const fallback = document.createElement("button");
+        fallback.type = "button";
+        fallback.className = "p-connect";
+        fallback.textContent = "Download anyway";
+        fallback.addEventListener("click", () => startDownload(panelPrimary, panelTarget));
+        list.append(fallback);
       } else {
-        for (const variant of panelVariants) list.append(variantRow(variant, panelTarget));
+        for (const [index, variant] of panelVariants.entries()) list.append(variantRow(variant, panelTarget, index === 0));
       }
+      scroll.append(list);
+    } else {
+      // Direct media has no qualities to list — one row for the file
+      // itself: its short name, its container, and a Download button.
+      const list = document.createElement("div");
+      list.className = "p-qualities";
+      list.append(directRow(panelPrimary, panelTarget));
       scroll.append(list);
     }
     if (panelOthers.length) {
@@ -704,6 +880,7 @@
       scroll.append(details);
     }
     if (scroll.childElementCount) panel.append(scroll);
+    panel.append(connectButton());
     status?.classList.remove("show");
     panel.classList.add("show");
     clearTimeout(autoHideTimer);
@@ -714,6 +891,8 @@
     panelTarget = target;
     panelOthers = others || [];
     panelVariants = null;
+    panelInspectError = null;
+    resetPanelDownloadStateFor(source.url);
     renderPanel();
     if (source.kind === "Direct media") return;
     inspectPanelVariants(source, target);
@@ -730,28 +909,40 @@
       if (panelPrimary !== source) return;
       const variants = (result?.variants || []).filter((item) => item?.downloadable && item?.url);
       if (!result?.ok || !variants.length) {
-        // The primary button still works: it starts the detected
-        // stream directly, and the download path inspects again.
+        // Slice 5 fix: the inspect failed (or returned no usable
+        // qualities) for a manifest we DID detect. Keep the error
+        // text so renderPanel can show it with the "Download
+        // anyway" fallback instead of the generic empty text.
         // Do not re-open the panel if the user already closed it.
         panelVariants = [];
+        panelInspectError = !result?.ok ? (result?.error || "Could not inspect this stream.") : null;
         if (panelEl()?.classList.contains("show")) renderPanel();
         return;
       }
+      panelInspectError = null;
       variants.sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bandwidth || 0) - (a.bandwidth || 0));
       panelVariants = variants;
       if (panelEl()?.classList.contains("show")) renderPanel();
     } catch (error) {
       if (panelPrimary !== source) return;
       panelVariants = [];
+      panelInspectError = error?.message || "Could not inspect this stream.";
       if (panelEl()?.classList.contains("show")) renderPanel();
     }
   }
 
   async function startDownload(source, target) {
     if (!source || !target || !button) return;
-    panelEl()?.classList.remove("show");
+    // Slice 5: the panel stays open with live progress instead of
+    // closing to a status toast (same shape as startYtDlpDownload).
+    const label = source.selectedVariant
+      ? qualityLabel(source.selectedVariant)
+      : source.kind === "Direct media" ? otherLabel(source) : source.kind || "Download";
+    panelDownloadJobId = null;
+    panelDownloadState = { label, percent: 0, phase: "preparing" };
+    panelDownloadSource = source.url;
+    progressSection();
     button.disabled = true;
-    showStatus("Preparing download…");
     try {
       const result = await chrome.runtime.sendMessage({
         type: "QUICK_DOWNLOAD_MEDIA",
@@ -762,9 +953,17 @@
         filename: target.getAttribute("data-filename") || ""
       });
       if (!result?.ok) throw new Error(result?.error || "Could not start the download.");
-      showStatus(result.message || "Download added.");
+      panelDownloadJobId = result.jobId || null;
+      if (!panelDownloadJobId) {
+        // No jobId to track (older host): fall back to the toast.
+        panelDownloadState = null;
+        progressSection();
+        showStatus(result.message || "Download added.");
+      }
     } catch (error) {
-      showStatus(error?.message || String(error));
+      panelDownloadState = { label, phase: "error", text: error?.message || String(error) };
+      if (isPanelOpen()) progressSection();
+      else showStatus(error?.message || String(error));
     } finally {
       button.disabled = false;
     }
@@ -941,6 +1140,34 @@
       if (live) {
         live.textContent = ytdlpToolProgressText;
         live.classList.add("show");
+      }
+      return false;
+    }
+    // Slice 5: live in-panel progress for a download started from
+    // this panel. The host reports download.progress/complete/error
+    // with the native jobId; only the matching download updates
+    // this panel, and only while it is open. A completed or failed
+    // download stops tracking so a later download starts clean.
+    if (message?.type === "NATIVE_EVENT" && panelDownloadJobId && message.event?.jobId === panelDownloadJobId) {
+      const event = message.event;
+      if (event.event === "download.progress" && event.progress) {
+        const progress = event.progress;
+        panelDownloadState = {
+          label: panelDownloadState?.label || "Download",
+          percent: typeof progress.percent === "number" ? progress.percent : null,
+          downloaded: typeof progress.downloaded === "number" ? progress.downloaded : null,
+          total: typeof progress.total === "number" ? progress.total : null,
+          phase: "downloading"
+        };
+        if (isPanelOpen()) progressSection();
+      } else if (event.event === "download.complete") {
+        panelDownloadState = { ...(panelDownloadState || { label: "Download" }), phase: "complete", percent: 100 };
+        if (isPanelOpen()) progressSection();
+        panelDownloadJobId = null;
+      } else if (event.event === "download.error") {
+        panelDownloadState = { ...(panelDownloadState || { label: "Download" }), phase: "error", text: event.error || "Download failed." };
+        if (isPanelOpen()) progressSection();
+        panelDownloadJobId = null;
       }
       return false;
     }

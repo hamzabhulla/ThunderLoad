@@ -194,6 +194,61 @@ pub fn apply_session(
     }
 }
 
+/// What the user sees when a server answers 401/403 to a download
+/// request (Slice 5): a bare "HTTP 403" tells them nothing they can
+/// act on. The fix is almost always on their side — open the page in
+/// the browser while logged in, then try again — so say that instead
+/// of the status code. This is a label, not a diagnosis: a 403 can
+/// also mean an expired signed URL or a geo-block, and the retry
+/// paths (manifest re-fetch, signed-URL refresh) still run before
+/// this label ever surfaces.
+pub const AUTH_REQUIRED_MESSAGE: &str =
+    "This video needs you to be logged in. Open it in the browser while logged in, then try again.";
+
+/// Map a request error to the login label when the server answered
+/// 401/403, else `None`. Walks the anyhow chain for the reqwest error
+/// (preserved by `?` and `.context()`), so callers that already
+/// wrapped the error still get the label. Errors that carry the
+/// status only as formatted text (e.g. `anyhow!("... HTTP 403")`)
+/// are NOT matched here — those sites map the status directly where
+/// they know it.
+pub fn auth_failure_label(error: &anyhow::Error) -> Option<&'static str> {
+    for cause in error.chain() {
+        if let Some(request_error) = cause.downcast_ref::<reqwest::Error>() {
+            if let Some(status) = request_error.status() {
+                if status == reqwest::StatusCode::UNAUTHORIZED
+                    || status == reqwest::StatusCode::FORBIDDEN
+                {
+                    return Some(AUTH_REQUIRED_MESSAGE);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Map a reqwest error to an anyhow error, relabelling 401/403 as the
+/// login message. For the `send().await` / `error_for_status()` sites
+/// in the fetch helpers, where the error has not been wrapped yet.
+pub fn map_auth_error(error: reqwest::Error) -> anyhow::Error {
+    let wrapped = anyhow::Error::new(error);
+    match auth_failure_label(&wrapped) {
+        Some(label) => anyhow::Error::msg(label),
+        None => wrapped,
+    }
+}
+
+/// User-facing text for a failed engine call: a 401/403 anywhere in
+/// the error chain becomes the login label, anything else keeps its
+/// own message. The desktop and the native host both funnel their job
+/// failures through this one function, so a gated download reads the
+/// same in the app whether it started in the browser or on the desktop.
+pub fn error_text(error: &anyhow::Error) -> String {
+    auth_failure_label(error)
+        .map(str::to_string)
+        .unwrap_or_else(|| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,5 +355,76 @@ mod tests {
             ..Default::default()
         };
         assert!(!no_cookies.cookies_apply_to("https://example.com/x"));
+    }
+
+    /// One-shot local server answering a fixed status, so the tests
+    /// can hold a real reqwest error with that status.
+    async fn status_error(status: u16) -> reqwest::Error {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serve = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            // Read the request head first: answering before the client
+            // has sent its request races with the socket close and
+            // hyper reports the response as cancelled.
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                match stream.read(&mut buffer).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(count) => {
+                        request.extend_from_slice(&buffer[..count]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                }
+            }
+            let _ = stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {status} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await;
+        });
+        let error = reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap_err();
+        let _ = serve.await;
+        error
+    }
+
+    #[tokio::test]
+    async fn auth_failure_label_maps_401_and_403_only() {
+        let forbidden = anyhow::Error::new(status_error(403).await);
+        assert_eq!(auth_failure_label(&forbidden), Some(AUTH_REQUIRED_MESSAGE));
+        let unauthorized = anyhow::Error::new(status_error(401).await);
+        assert_eq!(auth_failure_label(&unauthorized), Some(AUTH_REQUIRED_MESSAGE));
+        let not_found = anyhow::Error::new(status_error(404).await);
+        assert_eq!(auth_failure_label(&not_found), None);
+        let plain = anyhow::anyhow!("Download server returned HTTP 403");
+        assert_eq!(auth_failure_label(&plain), None);
+    }
+
+    #[tokio::test]
+    async fn auth_failure_label_survives_context_wrapping() {
+        let wrapped = anyhow::Error::new(status_error(403).await)
+            .context("The server rejected both media inspection requests");
+        assert_eq!(auth_failure_label(&wrapped), Some(AUTH_REQUIRED_MESSAGE));
+    }
+
+    #[tokio::test]
+    async fn map_auth_error_relabels_403_and_keeps_other_statuses() {
+        let relabelled = map_auth_error(status_error(403).await);
+        assert_eq!(relabelled.to_string(), AUTH_REQUIRED_MESSAGE);
+        let kept = map_auth_error(status_error(500).await);
+        assert!(kept.to_string().contains("500"));
     }
 }
