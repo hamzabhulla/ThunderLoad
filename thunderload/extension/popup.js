@@ -5,6 +5,10 @@ const rescanBtn = document.getElementById("rescanBtn");
 const interceptToggle = document.getElementById("interceptToggle");
 let pageUrl = "";
 let sources = [];
+// Slice 7c (Gemini claim 8): the background caps the list at
+// MAX_SOURCES_PER_TAB and reports it as `truncated` — the popup must
+// say so instead of silently showing a partial list.
+let sourcesTruncated = false;
 // The first DASH/HLS source on the page (or the first source of any
 // kind when the page has no manifest). Its qualities are inspected
 // automatically on scan — no "Other qualities" click needed.
@@ -73,6 +77,22 @@ function filenameFromUrl(url, fallback) {
     const name = decodeURIComponent(new URL(url).pathname.split("/").pop() || fallback);
     return name.replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_").slice(0, 180) || fallback;
   } catch (_) { return fallback; }
+}
+
+// Slice 7c (Gemini claim 9): only a KNOWN media/subtitle extension is
+// replaced — the old `filename.replace(/\.[^.]+$/, "")` stripped
+// whatever followed the last dot, so "my.video" became "my.mp4". A name
+// with no extension, or one ending in something that is not a media
+// extension, keeps its full name and gains the extension
+// ("my.video.mp4"). Mirrored in background.js (same helper, same cases).
+const KNOWN_FILE_EXTENSIONS = new Set(["mp4", "mkv", "webm", "mov", "avi", "m4v", "ts", "m2ts", "mp3", "m4a", "aac", "opus", "flac", "wav", "ogg", "oga", "wmv", "flv", "3gp", "m3u8", "mpd", "vtt", "srt", "ass", "ssa"]);
+function withExtension(name, extension) {
+  const trimmed = name.replace(/\.+$/, "");
+  const dot = trimmed.lastIndexOf(".");
+  if (dot > 0 && KNOWN_FILE_EXTENSIONS.has(trimmed.slice(dot + 1).toLowerCase())) {
+    return trimmed.slice(0, dot) + "." + extension;
+  }
+  return trimmed + "." + extension;
 }
 // Quality label from a real variant only: "{height}p" (+ " HD" at
 // 720p and up), "Audio" for audio-only streams, otherwise the
@@ -144,6 +164,11 @@ function appendInterceptNote() {
       ? "1 download is waiting for the desktop app."
       : pendingIntercepts.length + " downloads are waiting for the desktop app."));
 }
+function appendTruncatedNote() {
+  if (!sourcesTruncated || !sources.length) return;
+  sourceList.append(el("div", "truncated-note",
+    "Showing the first " + sources.length + " of more media on this page."));
+}
 function otherLabel(source) {
   const name = filenameFromUrl(source.url, "");
   if (name) return name;
@@ -207,6 +232,7 @@ function render() {
     const otherSection = renderOtherMedia(others);
     if (otherSection) sourceList.append(otherSection);
     appendInterceptNote();
+    appendTruncatedNote();
     return;
   }
   if (!sources.length) {
@@ -229,6 +255,7 @@ function render() {
   const otherSection = renderOtherMedia(others);
   if (otherSection) sourceList.append(otherSection);
   appendInterceptNote();
+  appendTruncatedNote();
 }
 function renderYtDlpCard() {
   const card = el("section", "primary-card");
@@ -438,7 +465,7 @@ async function startVariant(variant, source, action, askPermission = false) {
     // media playlist alone (which drops the audio track).
     masterUrl: source.url,
     referer: pageUrl,
-    filename: variant.kind === "hls" || variant.kind === "dash" ? (filename.replace(/\.[^.]+$/, "") + ".mp4") : filename,
+    filename: variant.kind === "hls" || variant.kind === "dash" ? withExtension(filename, "mp4") : filename,
     representationId: variant.representationId,
     audioRepresentationId: variant.audioRepresentationId || "",
     // Slice 6: a live row records the stream as it arrives.
@@ -470,6 +497,7 @@ async function scanActiveTab() {
     if (!result?.ok) throw new Error(result?.error || "Cannot scan this page");
     pageUrl = result.pageUrl || "";
     sources = result.sources || [];
+    sourcesTruncated = result.truncated === true;
     // Slice 6: downloads intercepted while the desktop app was down.
     pendingIntercepts = Array.isArray(result.pendingIntercepts) ? result.pendingIntercepts : [];
     if (result.ytdlp) {
@@ -505,7 +533,7 @@ async function scanActiveTab() {
       if (!sources.length) void inspectGenericPage(++genericInspectRun);
     }
   } catch (error) {
-    sources = []; render();
+    sources = []; sourcesTruncated = false; render();
     showToast(error.message || String(error));
   }
 }

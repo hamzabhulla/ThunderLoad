@@ -475,11 +475,58 @@ pub fn safe_filename(input: &str, fallback: &str) -> String {
     if cleaned.is_empty() { fallback.to_string() } else { cleaned.to_string() }
 }
 
+/// Extensions that count as a real file extension for naming purposes
+/// (lowercased, without the dot). Playlist extensions count too: a
+/// playlist stem is named after the assembled file ("master.m3u8" ->
+/// "master.mp4"). Anything else after the last dot is part of the
+/// name, not an extension.
+const KNOWN_FILE_EXTENSIONS: &[&str] = &[
+    "mp4", "mkv", "webm", "mov", "avi", "m4v", "ts", "m2ts", "mp3", "m4a", "aac", "opus", "flac",
+    "wav", "ogg", "oga", "wmv", "flv", "3gp", "m3u8", "mpd", "vtt", "srt", "ass", "ssa",
+];
+
+/// The filename `name` with its extension replaced by `extension` — but
+/// only when the name already ends in a known media/subtitle extension.
+/// A name with no extension, or one ending in something that is not a
+/// media extension, keeps its full name and gains the extension:
+/// "dash" -> "dash.mp4", "my.video" -> "my.video.mp4",
+/// "clip.mp4" -> "clip.mp4", "a.b.c.mkv" -> "a.b.c.mp4".
+/// (Gemini claim 9: the old code replaced whatever followed the last
+/// dot, so "my.video" became "my.mp4".)
+pub fn with_extension(name: &str, extension: &str) -> String {
+    let trimmed = name.trim_end_matches('.');
+    match trimmed.rfind('.') {
+        Some(dot) if dot > 0
+            && KNOWN_FILE_EXTENSIONS.contains(&trimmed[dot + 1..].to_ascii_lowercase().as_str()) =>
+        {
+            format!("{}.{}", &trimmed[..dot], extension)
+        }
+        _ => format!("{trimmed}.{extension}"),
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
     use super::{next_available_path, safe_filename, validate_content_range};
     use uuid::Uuid;
+
+    #[test]
+    fn with_extension_replaces_only_known_extensions() {
+        // Gemini claim 9: only a known media/subtitle extension is
+        // replaced; anything else after the last dot is part of the
+        // name and is kept.
+        assert_eq!(super::with_extension("dash", "mp4"), "dash.mp4");
+        assert_eq!(super::with_extension("my.video", "mp4"), "my.video.mp4");
+        assert_eq!(super::with_extension("clip.mp4", "mp4"), "clip.mp4");
+        assert_eq!(super::with_extension("a.b.c.mkv", "mp4"), "a.b.c.mp4");
+        assert_eq!(super::with_extension("CLIP.MKV", "mp4"), "CLIP.mp4");
+        assert_eq!(super::with_extension("master.m3u8", "mp4"), "master.mp4");
+        assert_eq!(super::with_extension("manifest.mpd", "mp4"), "manifest.mp4");
+        assert_eq!(super::with_extension("subtitles.srt", "vtt"), "subtitles.vtt");
+        assert_eq!(super::with_extension("recording", "ts"), "recording.ts");
+        assert_eq!(super::with_extension("my.video", "ts"), "my.video.ts");
+    }
 
     #[test]
     fn byte_range_header_must_match_exact_requested_range() {

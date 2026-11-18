@@ -10,7 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{Emitter, Manager};
-use thunderload_engine::{check_ytdlp_update as engine_check_ytdlp_update, dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_live, download_hls_resumable, download_hls_subtitles, download_page, download_url_resumable_with_connections, ensure_tool, error_text, grab_page_media as engine_grab_page_media, hls_work_dir, inspect_page, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, store_file_name, tool_status, tools_dir, DownloadControl, DownloadOutcome, DownloadProgress, GlobalRateLimiter, HlsSelection, JobKind, JobOrigin, JobRecord, JobState, JobStore, PageMediaList, SessionHeaders, ToolDownloadProgress, ToolStatus, ToolsMissing, YtDlpTool};
+use thunderload_engine::{check_ytdlp_update as engine_check_ytdlp_update, dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_live, download_hls_resumable, download_hls_subtitles, download_page, download_url_resumable_with_connections, ensure_tool, error_text, grab_page_media as engine_grab_page_media, hls_output_extension, hls_work_dir, inspect_page, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, store_file_name, tool_status, tools_dir, with_extension, DownloadControl, DownloadOutcome, DownloadProgress, GlobalRateLimiter, HlsSelection, JobKind, JobOrigin, JobRecord, JobState, JobStore, PageMediaList, SessionHeaders, ToolDownloadProgress, ToolStatus, ToolsMissing, YtDlpTool};
 use tokio::{process::Command as TokioCommand, sync::{mpsc, watch}};
 
 /// Build a child-process command that never shows a console window on
@@ -744,15 +744,32 @@ async fn start_hls_download(
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err("Only HTTP and HTTPS playlist URLs are supported".into());
     }
-    let name = safe_filename(&filename, "video.mp4");
     // Slice 4 (Gemini claim 4): the HLS selection travels with the job.
     // `url` is the MASTER playlist URL (the frontend passes videoUrl);
     // the chosen variant's identity is its media playlist URL, which the
     // frontend stores in representationId — HLS variants carry no
     // representation id of their own. Empty strings mean "no choice".
+    // Built here, before the Slice 7c extension probe below, because
+    // the probe needs it (Rust locals are not hoisted — E0425 if used
+    // before this definition).
     let selection = HlsSelection {
         media_url: representation_id.clone().filter(|value| !value.trim().is_empty()),
         audio_group: audio_representation_id.clone().filter(|value| !value.trim().is_empty()),
+    };
+    // Slice 7c (Gemini claim 6): resolve the container extension first
+    // (ts for plain TS playlists, mp4 for fMP4) so the reserved target
+    // gets the right name — reserving from the caller's filename alone
+    // misnamed every TS stream as .mp4. Mirrors start_dash_download
+    // and the native host's video.download path. The session is loaded
+    // up front because the fresh-job extension probe needs it.
+    let session = job_session(&job_id);
+    let name = match target_path {
+        Some(_) => safe_filename(&filename, "video.mp4"),
+        None => {
+            let extension = hls_output_extension(&url, &selection, session.as_ref()).await
+                .map_err(|error| error.to_string())?;
+            with_extension(&safe_filename(&filename, "video.mp4"), &extension)
+        }
     };
     // Resume reuses the paused job's target so the on-disk HLS checkpoint
     // is found; a fresh job reserves a new target, as before. The
@@ -778,8 +795,9 @@ async fn start_hls_download(
     with_job_store(|store| {
         let _ = store.start_job(record);
     });
-    // Stored browser handoff for a desktop resume (None for desktop jobs).
-    let session = job_session(&job_id);
+    // The session was loaded up front for the extension probe above;
+    // it is the stored browser handoff for a desktop resume (None for
+    // desktop jobs).
     // Keep a second receiver alive in the task until the outcome is
     // reported: a cancel that arrives while the download is finishing
     // still reaches a live receiver, so `cancel_download` never falls into
@@ -834,10 +852,9 @@ async fn start_hls_live_download(
         return Err("Only HTTP and HTTPS playlist URLs are supported".into());
     }
     let raw = safe_filename(&filename, "video.ts");
-    let name = match raw.rsplit_once('.') {
-        Some((stem, _)) if !stem.is_empty() => format!("{stem}.ts"),
-        _ => raw,
-    };
+    // Slice 7c (Gemini claim 9): only a known media extension is
+    // replaced, so "my.video" keeps its name ("my.video.ts").
+    let name = with_extension(&raw, "ts");
     let selection = HlsSelection {
         media_url: representation_id.clone().filter(|value| !value.trim().is_empty()),
         audio_group: audio_representation_id.clone().filter(|value| !value.trim().is_empty()),
@@ -941,10 +958,9 @@ async fn download_subtitles(playlist_url: String, filename: String) -> Result<St
         return Err("Only HTTP and HTTPS subtitle URLs are supported".into());
     }
     let raw = safe_filename(&filename, "subtitles.vtt");
-    let name = match raw.rsplit_once('.') {
-        Some((stem, _)) if !stem.is_empty() => format!("{stem}.vtt"),
-        _ => raw,
-    };
+    // Slice 7c (Gemini claim 9): only a known extension is replaced,
+    // so "my.video" keeps its name ("my.video.vtt").
+    let name = with_extension(&raw, "vtt");
     let target = reserve_download_path(&default_download_dir().join(&name)).await.map_err(|error| error.to_string())?;
     let saved = download_hls_subtitles(&playlist_url, &target, None, rate_limiter()).await.map_err(|error| error_text(&error))?;
     Ok(saved.to_string_lossy().to_string())
@@ -961,10 +977,12 @@ enum NativeBrowserFamily {
 
 fn native_browser_family(browser: &str) -> Option<NativeBrowserFamily> {
     match browser {
-        // No "opera" arm: Opera has no manifest directory in either
-        // native_manifest_dir below, so it is rejected here instead of
-        // failing later with a confusing message.
-        "chrome" | "chromium" | "edge" | "brave" => Some(NativeBrowserFamily::Chromium),
+        // Slice 7c (Gemini claim 11): Opera is a Chromium browser —
+        // the extension ZIP is Chromium-compatible and the install
+        // script already registers its native-messaging key — so it
+        // maps to the Chromium family with its own manifest dir /
+        // registry path below, instead of being rejected here.
+        "chrome" | "chromium" | "edge" | "brave" | "opera" => Some(NativeBrowserFamily::Chromium),
         "firefox" => Some(NativeBrowserFamily::Firefox),
         _ => None,
     }
@@ -1030,6 +1048,7 @@ fn native_manifest_dir(browser: &str, home: &Path) -> Option<PathBuf> {
         "chromium" => home.join(".config/chromium/NativeMessagingHosts"),
         "edge" => home.join(".config/microsoft-edge/NativeMessagingHosts"),
         "brave" => home.join(".config/BraveSoftware/Brave-Browser/NativeMessagingHosts"),
+        "opera" => home.join(".config/opera/NativeMessagingHosts"),
         "firefox" => home.join(".mozilla/native-messaging-hosts"),
         _ => return None,
     };
@@ -1045,6 +1064,7 @@ fn native_manifest_dir(browser: &str, home: &Path) -> Option<PathBuf> {
         "chromium" => support.join("Chromium/NativeMessagingHosts"),
         "edge" => support.join("Microsoft Edge/NativeMessagingHosts"),
         "brave" => support.join("BraveSoftware/Brave-Browser/NativeMessagingHosts"),
+        "opera" => support.join("com.operasoftware.Opera/NativeMessagingHosts"),
         "firefox" => support.join("Mozilla/NativeMessagingHosts"),
         _ => return None,
     };
@@ -1062,6 +1082,7 @@ fn windows_native_registry_path(browser: &str) -> Option<&'static str> {
         "brave" => Some(
             r"HKCU\Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.thunderload.host",
         ),
+        "opera" => Some(r"HKCU\Software\Opera Software\NativeMessagingHosts\com.thunderload.host"),
         "firefox" => Some(r"HKCU\Software\Mozilla\NativeMessagingHosts\com.thunderload.host"),
         _ => None,
     }
@@ -2376,8 +2397,13 @@ mod native_host_tests {
             Some(NativeBrowserFamily::Firefox)
         );
         assert_eq!(native_browser_family("safari"), None);
-        // Opera maps to no family: no manifest directory is known for it.
-        assert_eq!(native_browser_family("opera"), None);
+        // Slice 7c (Gemini claim 11): Opera is Chromium — the
+        // extension ZIP and the native-messaging manifest format are
+        // the same as Chrome's.
+        assert_eq!(
+            native_browser_family("opera"),
+            Some(NativeBrowserFamily::Chromium)
+        );
         assert_eq!(native_browser_family(""), None);
     }
 
@@ -2634,6 +2660,10 @@ mod native_host_tests {
             PathBuf::from("/home/u/.config/BraveSoftware/Brave-Browser/NativeMessagingHosts")
         );
         assert_eq!(
+            native_manifest_dir("opera", home).unwrap(),
+            PathBuf::from("/home/u/.config/opera/NativeMessagingHosts")
+        );
+        assert_eq!(
             native_manifest_dir("firefox", home).unwrap(),
             PathBuf::from("/home/u/.mozilla/native-messaging-hosts")
         );
@@ -2654,6 +2684,10 @@ mod native_host_tests {
         assert_eq!(
             native_manifest_dir("firefox", home).unwrap(),
             PathBuf::from("/Users/u/Library/Application Support/Mozilla/NativeMessagingHosts")
+        );
+        assert_eq!(
+            native_manifest_dir("opera", home).unwrap(),
+            PathBuf::from("/Users/u/Library/Application Support/com.operasoftware.Opera/NativeMessagingHosts")
         );
         assert_eq!(native_manifest_dir("safari", home), None);
     }

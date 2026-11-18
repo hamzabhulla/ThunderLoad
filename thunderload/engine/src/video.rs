@@ -6677,7 +6677,7 @@ mod hls_download_tests {
         DEFAULT_RESUMABLE_CONNECTIONS,
     };
     use crate::session::AUTH_REQUIRED_MESSAGE;
-    use crate::download::reserve_download_path;
+    use crate::download::{reserve_download_path, with_extension};
     use std::{
         collections::{HashMap, HashSet},
         io::{Read, Write},
@@ -7145,6 +7145,29 @@ mod hls_download_tests {
             spawn_hls_server(routes, Duration::ZERO, HlsServerOptions::default());
         assert_eq!(hls_output_extension(&format!("{base}/ts.m3u8"), &HlsSelection::none(), None).await.unwrap(), "ts");
         assert_eq!(hls_output_extension(&format!("{base}/fmp4.m3u8"), &HlsSelection::none(), None).await.unwrap(), "mp4");
+        stop_server(shutdown, server);
+    }
+
+    #[tokio::test]
+    async fn hls_target_name_uses_resolved_container_extension() {
+        // Gemini claim 6: a TS HLS download gets a .ts name and an
+        // fMP4 one gets .mp4 — the desktop path reserves the target
+        // from the resolved extension, not from the caller's filename
+        // alone (which misnamed every TS stream as .mp4).
+        let (mut routes, _bodies) = segment_routes(2, 64);
+        routes.insert("/ts.m3u8".into(), media_playlist(2).into_bytes());
+        routes.insert("/init.mp4".into(), b"fake-init".to_vec());
+        routes.insert("/seg0.m4s".into(), b"fake-fragment-0".to_vec());
+        routes.insert("/seg1.m4s".into(), b"fake-fragment-1".to_vec());
+        routes.insert("/fmp4.m3u8".into(), fmp4_media_playlist("init.mp4", &["seg0.m4s".to_string(), "seg1.m4s".to_string()]).into_bytes());
+        let (base, _counts, _range_206, shutdown, server) =
+            spawn_hls_server(routes, Duration::ZERO, HlsServerOptions::default());
+        let ts = hls_output_extension(&format!("{base}/ts.m3u8"), &HlsSelection::none(), None).await.unwrap();
+        assert_eq!(with_extension("Big Buck Bunny", &ts), "Big Buck Bunny.ts");
+        assert_eq!(with_extension("clip.mp4", &ts), "clip.ts");
+        let mp4 = hls_output_extension(&format!("{base}/fmp4.m3u8"), &HlsSelection::none(), None).await.unwrap();
+        assert_eq!(with_extension("Big Buck Bunny", &mp4), "Big Buck Bunny.mp4");
+        assert_eq!(with_extension("my.video", &mp4), "my.video.mp4");
         stop_server(shutdown, server);
     }
 
