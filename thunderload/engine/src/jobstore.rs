@@ -100,6 +100,12 @@ pub struct JobRecord {
     pub name: String,
     pub url: String,
     pub kind: JobKind,
+    /// A live HLS recording (Slice 6): the partial file IS the
+    /// recording, there is no checkpoint and no resume — pause is
+    /// terminal, cancel never deletes the target, and a restart never
+    /// re-records over it. False for every other kind, and for rows
+    /// written before this flag existed.
+    pub live: bool,
     pub origin: JobOrigin,
     pub state: JobState,
     /// Bytes downloaded so far (0 when unknown).
@@ -152,6 +158,7 @@ impl Default for JobRecord {
             name: String::new(),
             url: String::new(),
             kind: JobKind::Direct,
+            live: false,
             origin: JobOrigin::Desktop,
             state: JobState::Queued,
             downloaded: 0,
@@ -574,6 +581,7 @@ impl JobStore {
                 name: JobRecord::name_for_target(&target),
                 url: String::new(),
                 kind: JobKind::Direct,
+                live: false,
                 origin: JobOrigin::Desktop,
                 state: JobState::Interrupted,
                 downloaded,
@@ -645,6 +653,7 @@ impl JobStore {
                 name,
                 url,
                 kind,
+                live: false,
                 origin: JobOrigin::Desktop,
                 state: JobState::Interrupted,
                 downloaded: 0,
@@ -673,6 +682,7 @@ impl JobStore {
                 name,
                 url,
                 kind: JobKind::Direct,
+                live: false,
                 origin: JobOrigin::Desktop,
                 state: JobState::Interrupted,
                 downloaded,
@@ -728,6 +738,7 @@ mod tests {
             name: "archive.zip".to_string(),
             url: "https://example.com/archive.zip".to_string(),
             kind: JobKind::Direct,
+            live: false,
             origin: JobOrigin::Desktop,
             state: JobState::Downloading,
             downloaded: 1234,
@@ -763,6 +774,29 @@ mod tests {
         expected.updated_at_ms = row.updated_at_ms;
         assert_eq!(row, &expected);
         assert!(row.updated_at_ms >= record.updated_at_ms);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_flag_round_trips_and_old_rows_default_to_not_live() {
+        // Slice 6 fix (MAJOR, fix 1): the `live` flag on the durable
+        // job record must survive a load, and a row written by an older
+        // build (no `live` field) must parse as not live. Written
+        // through JSON so the test itself compiles before the field
+        // exists: without the field the `live` key is dropped on parse
+        // and the round-trip assertion fails.
+        let dir = test_dir("live-flag");
+        let path = dir.join("jobs.json");
+        let text = r#"{"version":1,"jobs":[{"id":"live-1","name":"live.ts","url":"https://example.test/live.m3u8","kind":"hls","origin":"desktop","state":"Paused","downloaded":123,"detail":"Paused · partial recording kept","createdAtMs":1700000000000,"updatedAtMs":1700000000000,"live":true},{"id":"old-1","name":"archive.zip","url":"https://example.com/archive.zip","kind":"direct","origin":"desktop","state":"Paused","downloaded":5,"detail":"Paused","createdAtMs":1700000000000,"updatedAtMs":1700000000000}]}"#;
+        fs::write(&path, text).unwrap();
+        let (store, note) = JobStore::load(&path, Duration::from_secs(0));
+        assert!(note.is_none(), "rows with and without live must both parse: {note:?}");
+        let live_row = store.get("live-1").expect("live row must load");
+        let live_json = serde_json::to_value(live_row).unwrap();
+        assert_eq!(live_json.get("live"), Some(&serde_json::Value::Bool(true)), "a live row must keep its flag through load");
+        let old_row = store.get("old-1").expect("old row must load");
+        let old_json = serde_json::to_value(old_row).unwrap();
+        assert_ne!(old_json.get("live"), Some(&serde_json::Value::Bool(true)), "a row written without live must not come back live");
         let _ = fs::remove_dir_all(&dir);
     }
 

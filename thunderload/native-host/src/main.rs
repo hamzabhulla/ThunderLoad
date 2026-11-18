@@ -10,7 +10,7 @@ use anyhow::{anyhow, Result};
 use std::{collections::HashMap, sync::{Arc, Mutex, OnceLock}};
 use serde_json::{json, Value};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::{mpsc, watch}};
-use thunderload_engine::{check_ytdlp_update, dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_resumable, download_page, download_url_resumable, ensure_tool, error_text, hls_output_extension, hls_work_dir, inspect_page, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, tool_status, tools_dir, DownloadControl, DownloadOutcome, GlobalRateLimiter, HlsSelection, SessionHeaders, ToolDownloadProgress, ToolsMissing, YtDlpTool};
+use thunderload_engine::{check_ytdlp_update, dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_live, download_hls_resumable, download_hls_subtitles, download_page, download_url_resumable, ensure_tool, error_text, hls_output_extension, hls_work_dir, inspect_page_with, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, tool_status, tools_dir, DownloadControl, DownloadOutcome, GlobalRateLimiter, HlsSelection, SessionHeaders, ToolDownloadProgress, ToolsMissing, YtDlpTool};
 
 const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 
@@ -552,6 +552,13 @@ async fn main() -> Result<()> {
                 };
                 let session = message_session(&message, &master_url, referer);
                 let filename = output_name(message.get("filename"), "video");
+                // Slice 6: a live recording. The engine polls the live
+                // playlist and appends segments as they arrive; the
+                // target is always .ts (live fMP4 is refused by the
+                // engine) and there is no checkpoint to resume from, so
+                // pause/cancel stop the recording and keep the partial
+                // file — it is a valid recording of what arrived.
+                let live = message.get("live").and_then(Value::as_bool).unwrap_or(false);
                 if !(master_url.starts_with("http://") || master_url.starts_with("https://")) {
                     let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": "Only HTTP and HTTPS playlist URLs are supported"}));
                     continue;
@@ -560,12 +567,17 @@ async fn main() -> Result<()> {
                 // the right extension (ts for plain TS playlists, mp4 for
                 // fMP4) — the one-shot download did this, and reserving
                 // from the caller's filename alone would misname a TS
-                // stream as .mp4.
-                let extension = match hls_output_extension(&master_url, &selection, session.as_ref()).await {
-                    Ok(extension) => extension,
-                    Err(error) => {
-                        let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": error.to_string()}));
-                        continue;
+                // stream as .mp4. Skipped for live: the resolver rejects
+                // live playlists, and a live recording is always .ts.
+                let extension = if live {
+                    "ts".to_string()
+                } else {
+                    match hls_output_extension(&master_url, &selection, session.as_ref()).await {
+                        Ok(extension) => extension,
+                        Err(error) => {
+                            let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": error.to_string()}));
+                            continue;
+                        }
                     }
                 };
                 let stem = std::path::Path::new(&filename).file_stem().and_then(|value| value.to_str()).unwrap_or("video");
@@ -593,6 +605,9 @@ async fn main() -> Result<()> {
                 // instead of falling back to the first variant.
                 let mut state = native_job_state(&job_id, &filename, &master_url, "hls");
                 state["targetPath"] = json!(target.to_string_lossy().to_string());
+                if live {
+                    state["live"] = json!(true);
+                }
                 if let Some(media_url) = &selection.media_url {
                     state["representationId"] = json!(media_url);
                 }
@@ -630,10 +645,17 @@ async fn main() -> Result<()> {
                             }
                         });
 
-                        let result = download_hls_resumable(
-                            &master_url, &selection, &target, session.as_ref(), control_rx.clone(),
-                            progress_tx, rate_limiter()
-                        ).await;
+                        let result = if live {
+                            download_hls_live(
+                                &master_url, &selection, &target, session.as_ref(), control_rx.clone(),
+                                progress_tx, rate_limiter()
+                            ).await
+                        } else {
+                            download_hls_resumable(
+                                &master_url, &selection, &target, session.as_ref(), control_rx.clone(),
+                                progress_tx, rate_limiter()
+                            ).await
+                        };
                         let _ = progress_handle.await;
 
                         match result {
@@ -651,8 +673,12 @@ async fn main() -> Result<()> {
                             Ok(DownloadOutcome::Cancelled) => {
                                 state = load_native_job_state(&job_id, state).await;
                                 state["status"] = json!("Cancelled");
-                                state["detail"] = json!("Cancelled · partial file removed");
-                                state["targetPath"] = Value::Null;
+                                // Live: cancelling stops the recording and
+                                // KEEPS the partial file — it is a valid
+                                // recording of what arrived. VOD cancels
+                                // remove the partial (the engine did that).
+                                state["detail"] = json!(if live { "Recording stopped · partial file kept" } else { "Cancelled · partial file removed" });
+                                state["targetPath"] = if live { json!(target.to_string_lossy().to_string()) } else { Value::Null };
                                 state["updatedAt"] = json!(timestamp_ms());
                                 let _ = save_native_job_state(&state).await;
                                 let _ = tx.send(json!({"event": "download.cancelled", "jobId": job_id}));
@@ -661,11 +687,19 @@ async fn main() -> Result<()> {
                             Ok(DownloadOutcome::Paused) => {
                                 state = load_native_job_state(&job_id, state).await;
                                 state["status"] = json!("Paused");
-                                state["detail"] = json!("Paused · partial checkpoint saved");
+                                state["detail"] = json!(if live { "Paused · partial recording kept" } else { "Paused · partial checkpoint saved" });
                                 state["targetPath"] = json!(target.to_string_lossy().to_string());
                                 state["updatedAt"] = json!(timestamp_ms());
                                 let _ = save_native_job_state(&state).await;
                                 let _ = tx.send(json!({"event": "download.paused", "jobId": job_id}));
+                                // Live: a paused recording has no
+                                // checkpoint to resume from, and resuming
+                                // would truncate the partial and start a
+                                // new recording over it — so pause is
+                                // terminal here, and the partial is kept.
+                                if live {
+                                    break 'job;
+                                }
                                 match wait_native_job_control(&mut control_rx, &mut state, true).await {
                                     Some(DownloadControl::Running) => {
                                         state["status"] = json!("Downloading");
@@ -703,6 +737,13 @@ async fn main() -> Result<()> {
                                 state["updatedAt"] = json!(timestamp_ms());
                                 let _ = save_native_job_state(&state).await;
                                 let _ = tx.send(json!({"event": "download.error", "jobId": job_id, "error": error_text(&error)}));
+                                // Live: there is no checkpoint to retry
+                                // from — a failed recording just fails,
+                                // and the partial file stays where it is.
+                                // Retrying would mean a new recording.
+                                if live {
+                                    break 'job;
+                                }
                                 // Retain the native control channel so the desktop
                                 // queue can ask this browser job to Resume its checkpoint.
                                 match wait_native_job_control(&mut control_rx, &mut state, false).await {
@@ -738,6 +779,40 @@ async fn main() -> Result<()> {
                     }
                     if let Ok(mut controls) = native_controls().lock() {
                         controls.remove(&job_id);
+                    }
+                });
+            }
+            // Slice 6: one-shot subtitle download for an HLS subtitle
+            // media playlist (format "m3u8"). Single-file subtitles
+            // (vtt/ttml/srt) never reach the host — the extension
+            // downloads those directly. Errors go through the same
+            // error_text funnel as every other job failure.
+            "hls.subtitles.download" => {
+                let url = message.get("playlistUrl").or_else(|| message.get("url")).and_then(Value::as_str).unwrap_or("").to_string();
+                let referer = message.get("referer").and_then(Value::as_str).map(str::to_string);
+                let session = message_session(&message, &url, referer);
+                let filename = output_name(message.get("filename"), "subtitles.vtt");
+                if !(url.starts_with("http://") || url.starts_with("https://")) {
+                    let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": "Only HTTP and HTTPS subtitle playlist URLs are supported"}));
+                    continue;
+                }
+                let stem = std::path::Path::new(&filename).file_stem().and_then(|value| value.to_str()).unwrap_or("subtitles");
+                let target = match reserve_download_path(&default_download_dir().join(format!("{stem}.vtt"))).await {
+                    Ok(path) => path,
+                    Err(error) => {
+                        let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": error.to_string()}));
+                        continue;
+                    }
+                };
+                let tx = outgoing_tx.clone();
+                tokio::spawn(async move {
+                    match download_hls_subtitles(&url, &target, session.as_ref(), rate_limiter()).await {
+                        Ok(path) => {
+                            let _ = tx.send(json!({"id": id, "ok": true, "data": {"path": path.to_string_lossy()}}));
+                        }
+                        Err(error) => {
+                            let _ = tx.send(json!({"id": id, "ok": false, "error": error_text(&error)}));
+                        }
                     }
                 });
             }
@@ -944,12 +1019,18 @@ async fn main() -> Result<()> {
             "ytdlp.inspect" => {
                 let url = message.get("url").and_then(Value::as_str).unwrap_or("").to_string();
                 let referer = message.get("referer").and_then(Value::as_str).map(str::to_string);
+                // Slice 6: `generic` asks yt-dlp for its generic
+                // extractor — the fallback when sniffing and the normal
+                // inspect found nothing usable for the page. The result
+                // carries `generic: true` so the caller never lets it
+                // overwrite a real inspect.
+                let generic = message.get("generic").and_then(Value::as_bool).unwrap_or(false);
                 let session = message_session(&message, &url, referer);
                 let tx = outgoing_tx.clone();
                 tokio::spawn(async move {
-                    match inspect_page(&url, session.as_ref()).await {
+                    match inspect_page_with(&url, session.as_ref(), generic).await {
                         Ok(inspected) => {
-                            let _ = tx.send(json!({"id": id, "ok": true, "data": {"title": inspected.title, "variants": inspected.variants}}));
+                            let _ = tx.send(json!({"id": id, "ok": true, "data": {"title": inspected.title, "variants": inspected.variants, "generic": inspected.generic}}));
                         }
                         Err(error) => {
                             if let Some(missing) = error.downcast_ref::<ToolsMissing>() {

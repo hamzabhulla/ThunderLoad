@@ -46,6 +46,21 @@ fn url_identity(url: &str) -> String {
     }
 }
 
+/// One subtitle track as the source carries it: the language tag, the
+/// display name, the URL, and the container — "vtt" for a direct
+/// WebVTT file, "m3u8" for an HLS subtitle media playlist whose
+/// segments are assembled into one .vtt, "ttml" for a DASH TTML file.
+/// Never invented: a track appears here only when the playlist or the
+/// yt-dlp info dict actually lists it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtitleVariant {
+    pub language: String,
+    pub name: String,
+    pub url: String,
+    pub format: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VideoVariant {
@@ -65,6 +80,20 @@ pub struct VideoVariant {
     pub audio_only: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requires_ffmpeg: Option<bool>,
+    /// True when the playlist is a live/event stream (HLS without
+    /// #EXT-X-ENDLIST, dynamic DASH, yt-dlp is_live). The UI shows a
+    /// "Live" label from this flag, never from a guessed quality.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_live: Option<bool>,
+    /// Frame rate as the source carries it (HLS FRAME-RATE, DASH
+    /// @frameRate, yt-dlp fps). Shown only when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fps: Option<f64>,
+    /// Subtitle tracks listed by this stream's playlist (HLS
+    /// #EXT-X-MEDIA TYPE=SUBTITLES, DASH text AdaptationSets, yt-dlp
+    /// subtitles dict). Absent means the source lists none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitles: Option<Vec<SubtitleVariant>>,
 }
 
 fn client() -> Result<Client> {
@@ -83,25 +112,11 @@ pub async fn inspect_video(url: &str, session: Option<&SessionHeaders>) -> Resul
 
     if lower.ends_with(".m3u8") {
         let body = fetch_text(url, session).await?;
-        let mut variants = parse_hls_master(&body, &parsed)?;
+        let variants = parse_hls_master(&body, &parsed)?;
         if !variants.is_empty() {
-            annotate_hls_variants(&mut variants, session).await;
-            annotate_hls_audio(&mut variants).await;
-            if let Some(reason) = unsupported_hls_master_reason(&body) {
-                for variant in &mut variants {
-                    variant.downloadable = false;
-                    variant.note = Some(reason.clone());
-                }
-            }
-            return Ok(variants);
+            return Ok(finish_hls_master(variants, &body, &parsed, session).await);
         }
-        let reason = unsupported_hls_reason(&body);
-        return Ok(vec![VideoVariant {
-            kind: "hls".into(), quality: "Adaptive playlist".into(), width: None, height: None,
-            bandwidth: None, url: url.to_string(), downloadable: reason.is_none(),
-            note: reason.or_else(|| Some("Unencrypted HLS playlist".into())),
-            representation_id: None, audio_representation_id: None, audio_only: None, requires_ffmpeg: None,
-        }]);
+        return Ok(vec![hls_single_variant(url, &body)]);
     }
     if lower.ends_with(".mpd") {
         let body = fetch_text(url, session).await?;
@@ -113,6 +128,7 @@ pub async fn inspect_video(url: &str, session: Option<&SessionHeaders>) -> Resul
                 height: None, bandwidth: None, url: url.into(), downloadable: false,
                 note: Some("DASH manifest detected, but no supported static segment layout was found".into()),
                 representation_id: None, audio_representation_id: None, audio_only: None, requires_ffmpeg: None,
+                is_live: None, fps: None, subtitles: None,
             }]);
         }
         return Ok(reps);
@@ -157,25 +173,11 @@ pub async fn inspect_video(url: &str, session: Option<&SessionHeaders>) -> Resul
 
     if content_type.contains("mpegurl") || content_type.contains("vnd.apple.mpegurl") {
         let body = fetch_text(url, session).await?;
-        let mut variants = parse_hls_master(&body, &parsed)?;
+        let variants = parse_hls_master(&body, &parsed)?;
         if !variants.is_empty() {
-            annotate_hls_variants(&mut variants, session).await;
-            annotate_hls_audio(&mut variants).await;
-            if let Some(reason) = unsupported_hls_master_reason(&body) {
-                for variant in &mut variants {
-                    variant.downloadable = false;
-                    variant.note = Some(reason.clone());
-                }
-            }
-            return Ok(variants);
+            return Ok(finish_hls_master(variants, &body, &parsed, session).await);
         }
-        let reason = unsupported_hls_reason(&body);
-        return Ok(vec![VideoVariant {
-            kind: "hls".into(), quality: "Adaptive playlist".into(), width: None, height: None,
-            bandwidth: None, url: url.to_string(), downloadable: reason.is_none(),
-            note: reason.or_else(|| Some("Unencrypted HLS playlist".into())),
-            representation_id: None, audio_representation_id: None, audio_only: None, requires_ffmpeg: None,
-        }]);
+        return Ok(vec![hls_single_variant(url, &body)]);
     }
     if content_type.contains("dash+xml") {
         let body = fetch_text(url, session).await?;
@@ -223,7 +225,11 @@ fn unsupported_hls_master_reason(body: &str) -> Option<String> {
     None
 }
 
-fn unsupported_hls_reason(body: &str) -> Option<String> {
+/// The encryption half of unsupported_hls_reason, split out so live
+/// handling can run first: a live playlist is not an error, it is a
+/// different kind of stream — but an encrypted live playlist is still
+/// protected content and stays refused.
+fn hls_encryption_reason(body: &str) -> Option<String> {
     for line in body.lines().map(str::trim) {
         if let Some(attributes) = line.strip_prefix("#EXT-X-KEY:") {
             let method = attr(attributes, "METHOD").unwrap_or_default();
@@ -236,16 +242,107 @@ fn unsupported_hls_reason(body: &str) -> Option<String> {
             }
         }
     }
+    None
+}
+
+fn unsupported_hls_reason(body: &str) -> Option<String> {
+    if let Some(reason) = hls_encryption_reason(body) {
+        return Some(reason);
+    }
     if !is_complete_vod_playlist(body) {
         return Some("This is a live or unfinished HLS playlist. Only completed VOD playlists can be downloaded".into());
     }
     None
 }
 
+/// Shared tail of both HLS master inspect paths (by extension and by
+/// Content-Type): per-variant annotation (live + encryption), the
+/// separate-audio FFmpeg gate, then the audio-only row. Subtitles ride
+/// on the variants already (parse_hls_master attaches them).
+async fn finish_hls_master(
+    variants: Vec<VideoVariant>,
+    body: &str,
+    base: &Url,
+    session: Option<&SessionHeaders>,
+) -> Vec<VideoVariant> {
+    let mut variants = variants;
+    // The FFmpeg gate runs first so a VOD variant with separate audio
+    // stays gated; annotate_hls_variants then overrides it for LIVE
+    // variants — live recording appends the video track's raw TS
+    // segments and never muxes, so no FFmpeg is needed there, and the
+    // audio-only row below is still offered separately.
+    annotate_hls_audio(&mut variants).await;
+    annotate_hls_variants(&mut variants, session).await;
+    if let Some(reason) = unsupported_hls_master_reason(body) {
+        for variant in &mut variants {
+            variant.downloadable = false;
+            variant.note = Some(reason.clone());
+        }
+    }
+    // The audio-only row sorts last (no height) and never disturbs
+    // the best-first order of the video rows.
+    if let Some(audio_row) = hls_audio_only_variant(body, base) {
+        variants.push(audio_row);
+    }
+    variants
+}
+
+/// The one row for a bare HLS media playlist (no master): the playlist
+/// itself. Live playlists are labelled Live — MPEG-TS records as it
+/// streams, fMP4 (EXT-X-MAP present) refuses honestly — and anything
+/// else keeps the old unsupported reason.
+fn hls_single_variant(url: &str, body: &str) -> VideoVariant {
+    let mut variant = VideoVariant {
+        kind: "hls".into(), quality: "Adaptive playlist".into(), width: None, height: None,
+        bandwidth: None, url: url.to_string(), downloadable: true,
+        note: Some("Unencrypted HLS playlist".into()),
+        representation_id: None, audio_representation_id: None, audio_only: None, requires_ffmpeg: None,
+        is_live: None, fps: None, subtitles: None,
+    };
+    if let Some(reason) = hls_encryption_reason(body) {
+        variant.downloadable = false;
+        variant.note = Some(reason);
+        return variant;
+    }
+    if !is_complete_vod_playlist(body) {
+        variant.is_live = Some(true);
+        variant.quality = "Live".into();
+        if body.contains("#EXT-X-MAP:") {
+            variant.downloadable = false;
+            variant.note = Some("Live stream in this format can't be recorded yet.".into());
+        } else {
+            variant.note = Some("Live — records the stream as it arrives (.ts file). Stop the download to keep what was recorded.".into());
+        }
+    }
+    variant
+}
+
 async fn annotate_hls_variants(variants: &mut [VideoVariant], session: Option<&SessionHeaders>) {
     for variant in variants.iter_mut().filter(|item| item.kind == "hls") {
         match fetch_text(&variant.url, session).await {
             Ok(body) => {
+                // Encryption first: an encrypted live playlist is still
+                // protected content, never a recording candidate.
+                if let Some(reason) = hls_encryption_reason(&body) {
+                    variant.downloadable = false;
+                    variant.note = Some(reason);
+                    continue;
+                }
+                // Live second: a live media playlist is not an error.
+                // MPEG-TS records as it streams; fMP4 (EXT-X-MAP)
+                // cannot be appended to a playable file, so it refuses
+                // honestly instead of faking a download.
+                if !is_complete_vod_playlist(&body) {
+                    variant.is_live = Some(true);
+                    if body.contains("#EXT-X-MAP:") {
+                        variant.downloadable = false;
+                        variant.note = Some("Live stream in this format can't be recorded yet.".into());
+                    } else {
+                        variant.downloadable = true;
+                        variant.note = Some("Live — records the stream as it arrives (.ts file). Stop the download to keep what was recorded.".into());
+                    }
+                    continue;
+                }
                 if let Some(reason) = unsupported_hls_reason(&body) {
                     variant.downloadable = false;
                     variant.note = Some(reason);
@@ -265,6 +362,7 @@ fn direct_variant(url: &str) -> VideoVariant {
         bandwidth: None, url: url.into(), downloadable: true,
         note: Some("Direct media or file URL".into()),
         representation_id: None, audio_representation_id: None, audio_only: None, requires_ffmpeg: None,
+        is_live: None, fps: None, subtitles: None,
     }
 }
 
@@ -296,7 +394,7 @@ mod inspect_tests {
 
 fn parse_hls_master(body: &str, base: &Url) -> Result<Vec<VideoVariant>> {
     let mut out = Vec::new();
-    let mut pending: Option<(Option<u32>, Option<u32>, Option<u64>, Option<String>)> = None;
+    let mut pending: Option<(Option<u32>, Option<u32>, Option<u64>, Option<String>, Option<f64>)> = None;
     for line in body.lines().map(str::trim).filter(|l| !l.is_empty()) {
         if let Some(attrs) = line.strip_prefix("#EXT-X-STREAM-INF:") {
             let resolution = attr(attrs, "RESOLUTION").and_then(|s| {
@@ -305,19 +403,73 @@ fn parse_hls_master(body: &str, base: &Url) -> Result<Vec<VideoVariant>> {
             });
             let bandwidth = attr(attrs, "AVERAGE-BANDWIDTH").or_else(|| attr(attrs, "BANDWIDTH"))
                 .and_then(|s| s.parse().ok());
-            pending = Some((resolution.map(|r| r.0), resolution.map(|r| r.1), bandwidth, attr(attrs, "AUDIO")));
+            // FRAME-RATE is the source's own frame rate — carried as
+            // fps, shown only when present, never guessed.
+            let fps = attr(attrs, "FRAME-RATE").and_then(|s| s.parse().ok());
+            pending = Some((resolution.map(|r| r.0), resolution.map(|r| r.1), bandwidth, attr(attrs, "AUDIO"), fps));
         } else if !line.starts_with('#') {
-            if let Some((width, height, bandwidth, audio_group)) = pending.take() {
+            if let Some((width, height, bandwidth, audio_group, fps)) = pending.take() {
                 let resolved = base.join(line)?.to_string();
                 let quality = height.map(|h| format!("{h}p")).unwrap_or_else(|| "Adaptive".into());
-                out.push(VideoVariant { kind: "hls".into(), quality, width, height, bandwidth,
+                out.push(VideoVariant { kind: "hls".into(), quality, width, height, bandwidth, fps,
                     url: resolved, downloadable: true, note: Some("HLS variant".into()),
-                    representation_id: None, audio_representation_id: audio_group, audio_only: None, requires_ffmpeg: None });
+                    representation_id: None, audio_representation_id: audio_group, audio_only: None, requires_ffmpeg: None,
+                    is_live: None, subtitles: None });
             }
         }
     }
     out.sort_by(|a, b| b.height.unwrap_or(0).cmp(&a.height.unwrap_or(0)));
+    // Subtitle renditions are master-level, not per-variant: the same
+    // list rides on every variant so the panel can read it from the
+    // first row. Absent when the master lists none.
+    let subtitles = parse_hls_subtitle_renditions(body, base);
+    if !subtitles.is_empty() {
+        for variant in &mut out {
+            variant.subtitles = Some(subtitles.clone());
+        }
+    }
     Ok(out)
+}
+
+fn parse_hls_subtitle_renditions(body: &str, base: &Url) -> Vec<SubtitleVariant> {
+    let mut out = Vec::new();
+    for line in body.lines().map(str::trim) {
+        let Some(attributes) = line.strip_prefix("#EXT-X-MEDIA:") else { continue; };
+        if !attr(attributes, "TYPE").is_some_and(|kind| kind.eq_ignore_ascii_case("SUBTITLES")) { continue; }
+        let Some(uri) = attr(attributes, "URI") else { continue; };
+        let Ok(resolved) = base.join(&uri) else { continue; };
+        let language = attr(attributes, "LANGUAGE").unwrap_or_else(|| "und".into());
+        let name = attr(attributes, "NAME").unwrap_or_else(|| language.clone());
+        out.push(SubtitleVariant {
+            language,
+            name,
+            url: resolved.to_string(),
+            // An HLS subtitle rendition is a media playlist of WebVTT
+            // segments; the downloader assembles it into one .vtt.
+            format: "m3u8".into(),
+        });
+    }
+    out
+}
+
+/// The audio-only row for an HLS master: the DEFAULT audio rendition
+/// (else the first), as its own downloadable variant. Its URL is the
+/// audio media playlist itself, so the normal HLS download path treats
+/// it as a bare media playlist — no video track is ever mixed in.
+/// The GROUP-ID rides as representation_id for identification only;
+/// the download path keys off the URL.
+fn hls_audio_only_variant(body: &str, base: &Url) -> Option<VideoVariant> {
+    let renditions = parse_hls_audio_renditions(body, base);
+    let rendition = renditions.iter().find(|rendition| rendition.is_default)
+        .or_else(|| renditions.first())?;
+    Some(VideoVariant {
+        kind: "hls".into(), quality: "Audio".into(), width: None, height: None,
+        bandwidth: None, url: rendition.uri.clone(), downloadable: true,
+        note: Some("Audio-only track".into()),
+        representation_id: Some(rendition.group_id.clone()),
+        audio_representation_id: None, audio_only: Some(true), requires_ffmpeg: None,
+        is_live: None, fps: None, subtitles: None,
+    })
 }
 
 /// An `#EXT-X-MEDIA:TYPE=AUDIO` rendition from a master playlist. Only the
@@ -1291,6 +1443,66 @@ fn is_audio_adaptation(adaptation: &DashAdaptation) -> bool {
         || adaptation.representations.iter().any(|rep| rep.mime_type.to_ascii_lowercase().starts_with("audio/"))
 }
 
+fn is_text_adaptation(adaptation: &DashAdaptation) -> bool {
+    adaptation.content_type.eq_ignore_ascii_case("text")
+        || adaptation.mime_type.to_ascii_lowercase().starts_with("text/")
+        || adaptation.mime_type.eq_ignore_ascii_case("application/ttml+xml")
+        || adaptation.representations.iter().any(|rep| {
+            rep.mime_type.to_ascii_lowercase().starts_with("text/")
+                || rep.mime_type.eq_ignore_ascii_case("application/ttml+xml")
+        })
+}
+
+/// Subtitle variants from a static DASH manifest's text AdaptationSets.
+/// Only single-file subtitles are offered: a representation whose URL
+/// resolves to one file (BaseURL, no SegmentTemplate/SegmentList/
+/// SegmentBase anywhere in scope). Template-based subtitle segments are
+/// skipped — no row is faked for them. The format comes from the mime
+/// type or the file extension; a representation whose format cannot be
+/// identified is skipped. The language is the representation id — the
+/// parser carries no lang attribute — so it is what the manifest
+/// itself calls the track.
+fn dash_subtitle_variants(document: &DashDocument, manifest_url: &str) -> Vec<SubtitleVariant> {
+    let Some(first_period) = document.periods.first() else { return Vec::new(); };
+    let mut out = Vec::new();
+    for adaptation in &first_period.adaptations {
+        if !is_text_adaptation(adaptation) { continue; }
+        for representation in &adaptation.representations {
+            let templated = representation.template.is_some() || adaptation.template.is_some()
+                || first_period.template.is_some() || document.template.is_some()
+                || representation.segment_list.is_some() || adaptation.segment_list.is_some()
+                || first_period.segment_list.is_some() || document.segment_list.is_some()
+                || representation.segment_base.is_some() || adaptation.segment_base.is_some()
+                || first_period.segment_base.is_some() || document.segment_base.is_some();
+            if templated { continue; }
+            // merge_dash_base_url falls back to the manifest URL itself
+            // when no BaseURL exists anywhere — a text representation
+            // with no BaseURL has no file to download, so skip it
+            // rather than offering the .mpd as a subtitle.
+            let has_base = representation.base_url.is_some() || adaptation.base_url.is_some()
+                || first_period.base_url.is_some() || document.base_url.is_some();
+            if !has_base { continue; }
+            let Ok(base) = merge_dash_base_url(manifest_url, document, first_period, adaptation, representation) else { continue; };
+            let url = base.to_string();
+            let mime = effective_dash_mime_type(adaptation, representation).to_ascii_lowercase();
+            let format = if mime.contains("vtt") || url.to_ascii_lowercase().ends_with(".vtt") {
+                "vtt"
+            } else if mime.contains("ttml") || url.to_ascii_lowercase().ends_with(".ttml") {
+                "ttml"
+            } else {
+                continue;
+            };
+            out.push(SubtitleVariant {
+                language: representation.id.clone(),
+                name: representation.id.clone(),
+                url,
+                format: format.into(),
+            });
+        }
+    }
+    out
+}
+
 fn is_video_representation(adaptation: &DashAdaptation, representation: &DashRepresentation) -> bool {
     adaptation.content_type.eq_ignore_ascii_case("video")
         || adaptation.mime_type.to_ascii_lowercase().starts_with("video/")
@@ -1369,7 +1581,12 @@ fn parse_dash_representations(body: &str, manifest_url: &str) -> Vec<VideoVarian
     let mut out = Vec::new();
     if !document.is_static || document.protected || document.periods.is_empty() {
         let note = if !document.is_static {
-            "Dynamic/live DASH MPDs are not supported"
+            // Live DASH is labelled Live and honestly refused: the
+            // engine has no live DASH recorder in this slice (HLS live
+            // recording exists; DASH would need a segment-timeline
+            // follower that does not exist yet). The row is a label,
+            // not a fake download.
+            "Live DASH streams can't be recorded yet."
         } else if document.protected {
             "ContentProtection/DRM DASH streams are not supported"
         } else {
@@ -1381,10 +1598,11 @@ fn parse_dash_representations(body: &str, manifest_url: &str) -> Vec<VideoVarian
                     if is_video_representation(adaptation, representation) {
                         out.push(VideoVariant {
                             kind: "dash".into(),
-                            quality: representation.height.map(|height| format!("{height}p")).unwrap_or_else(|| representation.id.clone()),
+                            quality: if !document.is_static { "Live".into() } else { representation.height.map(|height| format!("{height}p")).unwrap_or_else(|| representation.id.clone()) },
                             width: representation.width,
                             height: representation.height,
                             bandwidth: representation.bandwidth,
+                            fps: representation.frame_rate.or(adaptation.frame_rate),
                             url: manifest_url.to_string(),
                             downloadable: false,
                             note: Some(note.to_string()),
@@ -1392,6 +1610,8 @@ fn parse_dash_representations(body: &str, manifest_url: &str) -> Vec<VideoVarian
                             audio_representation_id: None,
                             audio_only: Some(false),
                             requires_ffmpeg: None,
+                            is_live: if !document.is_static { Some(true) } else { None },
+                            subtitles: None,
                         });
                     }
                 }
@@ -1471,6 +1691,7 @@ fn parse_dash_representations(body: &str, manifest_url: &str) -> Vec<VideoVarian
                 width: representation.width,
                 height: representation.height,
                 bandwidth: representation.bandwidth,
+                fps: representation.frame_rate.or(adaptation.frame_rate),
                 url: manifest_url.to_string(),
                 downloadable,
                 note,
@@ -1478,6 +1699,11 @@ fn parse_dash_representations(body: &str, manifest_url: &str) -> Vec<VideoVarian
                 audio_representation_id: audio_representation.map(|(_, _, audio)| audio.id.clone()),
                 audio_only: Some(false),
                 requires_ffmpeg: if multi_period { Some(true) } else { None },
+                is_live: None,
+                subtitles: {
+                    let subtitles = dash_subtitle_variants(&document, manifest_url);
+                    if subtitles.is_empty() { None } else { Some(subtitles) }
+                },
             });
         }
     }
@@ -1694,6 +1920,10 @@ fn parse_hls_byterange(value: &str) -> Result<(u64, Option<u64>)> {
 struct HlsMediaPlaylist {
     init: Option<HlsSegmentRef>,
     segments: Vec<HlsSegmentRef>,
+    /// The playlist's #EXT-X-MEDIA-SEQUENCE (default 0): the sequence
+    /// number of segments[0]. The live recorder (Slice 6) uses it to
+    /// skip segments it has already recorded; the VOD path ignores it.
+    media_sequence: u64,
 }
 
 /// Parses one HLS media playlist: segment URIs, the EXT-X-MAP init segment
@@ -1703,9 +1933,19 @@ struct HlsMediaPlaylist {
 /// EXT-X-ENDLIST is a live/unfinished playlist and is rejected; a
 /// `#EXT-X-KEY` with METHOD=SAMPLE-AES (or any other method that is not
 /// NONE or AES-128) is protected content and is rejected, never attempted.
+/// (Slice 6) `parse_hls_live_media_playlist` is the same parser with the
+/// ENDLIST requirement lifted, for the live recorder.
 fn parse_hls_media_playlist(body: &str, base: &Url) -> Result<HlsMediaPlaylist> {
-    if !is_complete_vod_playlist(body) {
-        return Err(anyhow!("This is a live or unfinished HLS playlist. Only completed VOD playlists can be downloaded in this build."));
+    parse_hls_media_playlist_inner(body, base, false)
+}
+
+fn parse_hls_live_media_playlist(body: &str, base: &Url) -> Result<HlsMediaPlaylist> {
+    parse_hls_media_playlist_inner(body, base, true)
+}
+
+fn parse_hls_media_playlist_inner(body: &str, base: &Url, live: bool) -> Result<HlsMediaPlaylist> {
+    if !live && !is_complete_vod_playlist(body) {
+        return Err(anyhow!("This is a live or unfinished HLS playlist. Only completed VOD playlists can be downloaded as a normal download; live streams are recorded instead."));
     }
     let mut init = None;
     let mut segments = Vec::new();
@@ -1786,7 +2026,7 @@ fn parse_hls_media_playlist(body: &str, base: &Url) -> Result<HlsMediaPlaylist> 
             segments.push(HlsSegmentRef { url, range, key });
         }
     }
-    Ok(HlsMediaPlaylist { init, segments })
+    Ok(HlsMediaPlaylist { init, segments, media_sequence })
 }
 
 /// Parses the IV attribute of an `#EXT-X-KEY` line: `0x` followed by 32
@@ -1823,6 +2063,8 @@ async fn fetch_text_with(client: &Client, url: &str, session: Option<&SessionHea
 /// chosen, matching the old behaviour. A selection that names a variant
 /// or audio group the master no longer lists is an error, not a silent
 /// fall back to a different quality — the user asked for that quality.
+/// (Slice 6) A selection that names an audio rendition's playlist
+/// instead is the audio-only row: the plan is that playlist alone.
 /// When `playlist_url` is a bare media playlist (no master), there is
 /// nothing to select from and the selection is ignored. Live playlists,
 /// SESSION-KEY encryption and non-AES-128 media encryption are rejected
@@ -1836,34 +2078,51 @@ async fn resolve_hls_plan(playlist_url: &str, selection: &HlsSelection, session:
         if let Some(reason) = unsupported_hls_master_reason(&body) {
             return Err(anyhow!(reason));
         }
-        // The selected variant, or the first (highest) when the caller
-        // made no choice. A selection that no longer matches the master
-        // is an error: the playlist changed under the user.
-        let variant = match selection.media_url.as_deref() {
-            Some(wanted) => variants.iter().find(|variant| variant.url == wanted)
-                .ok_or_else(|| anyhow!("The selected HLS quality is no longer listed in the master playlist"))?,
-            None => variants.first().expect("non-empty variant list"),
-        };
-        let media_url = variant.url.clone();
-        // The audio rendition for the variant: the explicitly selected
-        // GROUP-ID, or the variant's own AUDIO group, or the DEFAULT
-        // rendition when the variant names no group. An explicitly
-        // selected group that does not exist is an error, like the
-        // variant itself; the DEFAULT fall back applies only to the
-        // unselected case, matching the old behaviour.
         let renditions = parse_hls_audio_renditions(&body, &base);
-        let audio = match selection.audio_group.as_deref() {
-            Some(wanted) => Some(renditions.iter().find(|rendition| rendition.group_id == wanted)
-                .map(|rendition| rendition.uri.clone())
-                .ok_or_else(|| anyhow!("The selected HLS audio track is no longer listed in the master playlist"))?),
-            None => variant.audio_representation_id.as_deref().and_then(|group| {
+        // The audio-only row selects an audio rendition's media
+        // playlist, not a video variant: when the selection names one,
+        // the plan is that playlist alone, with no video track and no
+        // second audio track. This is how the "Audio" row downloads.
+        if let Some(wanted) = selection.media_url.as_deref() {
+            if let Some(rendition) = renditions.iter().find(|rendition| rendition.uri == wanted) {
+                (rendition.uri.clone(), None)
+            } else {
+                // The selected variant, or the first (highest) when the caller
+                // made no choice. A selection that no longer matches the master
+                // is an error: the playlist changed under the user.
+                let variant = variants.iter().find(|variant| variant.url == wanted)
+                    .ok_or_else(|| anyhow!("The selected HLS quality is no longer listed in the master playlist"))?;
+                let media_url = variant.url.clone();
+                // The audio rendition for the variant: the explicitly selected
+                // GROUP-ID, or the variant's own AUDIO group, or the DEFAULT
+                // rendition when the variant names no group. An explicitly
+                // selected group that does not exist is an error, like the
+                // variant itself; the DEFAULT fall back applies only to the
+                // unselected case, matching the old behaviour.
+                let audio = match selection.audio_group.as_deref() {
+                    Some(wanted) => Some(renditions.iter().find(|rendition| rendition.group_id == wanted)
+                        .map(|rendition| rendition.uri.clone())
+                        .ok_or_else(|| anyhow!("The selected HLS audio track is no longer listed in the master playlist"))?),
+                    None => variant.audio_representation_id.as_deref().and_then(|group| {
+                        renditions.iter()
+                            .find(|rendition| rendition.group_id == group)
+                            .or_else(|| renditions.iter().find(|rendition| rendition.is_default))
+                            .map(|rendition| rendition.uri.clone())
+                    }),
+                };
+                (media_url, audio)
+            }
+        } else {
+            let variant = variants.first().expect("non-empty variant list");
+            let media_url = variant.url.clone();
+            let audio = variant.audio_representation_id.as_deref().and_then(|group| {
                 renditions.iter()
                     .find(|rendition| rendition.group_id == group)
                     .or_else(|| renditions.iter().find(|rendition| rendition.is_default))
                     .map(|rendition| rendition.uri.clone())
-            }),
-        };
-        (media_url, audio)
+            });
+            (media_url, audio)
+        }
     } else {
         (playlist_url.to_string(), None)
     };
@@ -2675,6 +2934,269 @@ pub async fn download_hls(
         DownloadOutcome::Paused => Err(anyhow!("HLS download paused before completion")),
         DownloadOutcome::Cancelled => Err(anyhow!("HLS download cancelled")),
     }
+}
+
+/// The media playlist URL a live recording should follow: the same
+/// master-selection rules as `resolve_hls_plan` (chosen variant, or an
+/// audio rendition's playlist for the audio-only row, or the first
+/// variant), but without building a VOD plan — a live playlist has no
+/// fixed segment list to plan against. A bare media playlist is its own
+/// answer.
+async fn resolve_hls_live_media_url(playlist_url: &str, selection: &HlsSelection, session: Option<&SessionHeaders>) -> Result<String> {
+    let base = Url::parse(playlist_url)?;
+    let client = client()?;
+    let body = fetch_text_with(&client, playlist_url, session).await?;
+    let variants = parse_hls_master(&body, &base)?;
+    if variants.is_empty() {
+        return Ok(playlist_url.to_string());
+    }
+    if let Some(reason) = unsupported_hls_master_reason(&body) {
+        return Err(anyhow!(reason));
+    }
+    let renditions = parse_hls_audio_renditions(&body, &base);
+    if let Some(wanted) = selection.media_url.as_deref() {
+        if let Some(rendition) = renditions.iter().find(|rendition| rendition.uri == wanted) {
+            return Ok(rendition.uri.clone());
+        }
+        if let Some(variant) = variants.iter().find(|variant| variant.url == wanted) {
+            return Ok(variant.url.clone());
+        }
+        return Err(anyhow!("The selected HLS quality is no longer listed in the master playlist"));
+    }
+    Ok(variants.first().expect("non-empty variant list").url.clone())
+}
+
+/// How many consecutive polls with no new segment stop a live
+/// recording as stalled. Ten silent windows is 20 s at the shortest
+/// target duration and 5 min at the longest — long enough that a brief
+/// encoder hiccup never kills a recording, short enough that a dead
+/// stream does not poll forever.
+const LIVE_STALL_LIMIT: u64 = 10;
+
+/// Records a live HLS stream as it arrives (Slice 6). The media playlist
+/// is polled every TARGETDURATION (default 6 s, clamped 2–30 s); each
+/// poll downloads only the segments whose sequence numbers have not been
+/// recorded yet, in order, appending them to a single `.ts` file with the
+/// same segment fetcher the VOD path uses (AES-128 decryption, byte
+/// ranges, rate limiting). The first poll records the whole live window
+/// as it stands — there is no earlier window to recover.
+///
+/// Stops when the playlist gains EXT-X-ENDLIST (Completed), when the
+/// user cancels (Cancelled — the partial file is kept, it is a valid
+/// recording of what arrived), when it pauses (Paused — also keeps the
+/// partial; a later resume re-records from the live edge, it does not
+/// continue the old recording), or when the playlist stalls with no new
+/// segment for LIVE_STALL_LIMIT consecutive polls (a stall error — the
+/// partial is kept, and when nothing was recorded at all no empty file
+/// is left behind). A segment that slid out of the window
+/// between the playlist fetch and its download (404) is skipped, not
+/// fatal — but if the very first poll's segments are all gone, the
+/// recording fails instead of producing an empty file. fMP4 live
+/// (EXT-X-MAP present) is refused upfront: its segments cannot be
+/// appended into a playable file without a remuxer, and the refusal
+/// leaves no empty target file behind. No checkpoint is
+/// written — a live recording has no fixed segment list to resume from.
+pub async fn download_hls_live(
+    playlist_url: &str,
+    selection: &HlsSelection,
+    target: &Path,
+    session: Option<&SessionHeaders>,
+    mut control: watch::Receiver<DownloadControl>,
+    progress_tx: mpsc::UnboundedSender<DownloadProgress>,
+    rate_limiter: Arc<GlobalRateLimiter>,
+) -> Result<DownloadOutcome> {
+    let client = client()?;
+    let key_cache = HlsKeyCache::default();
+    let media_url = resolve_hls_live_media_url(playlist_url, selection, session).await?;
+    let media_base = Url::parse(&media_url)?;
+    // The target is the recording itself: create it once, append every
+    // segment in order. The desktop reserves a unique path beforehand.
+    let mut output = fs::OpenOptions::new().create(true).write(true).truncate(true).open(target).await?;
+    let segment_temp = target.with_extension("live-seg");
+    let mut next_sequence: Option<u64> = None;
+    let mut downloaded: u64 = 0;
+    let mut recorded: u64 = 0;
+    let mut stalled_polls: u64 = 0;
+    loop {
+        // Copy the control value out first: matching on
+        // `*control.borrow()` directly would hold the watch Ref across
+        // the awaits inside the arms, and the Ref is not Send.
+        let current = *control.borrow();
+        match current {
+            DownloadControl::Cancelled => {
+                let _ = fs::remove_file(&segment_temp).await;
+                return Ok(DownloadOutcome::Cancelled);
+            }
+            DownloadControl::Paused => {
+                let _ = fs::remove_file(&segment_temp).await;
+                return Ok(DownloadOutcome::Paused);
+            }
+            DownloadControl::Running => {}
+        }
+        let body = fetch_text_with(&client, &media_url, session).await?;
+        let parsed = parse_hls_live_media_playlist(&body, &media_base)?;
+        // fMP4 live cannot be appended into a playable file: refuse
+        // honestly instead of writing fragments that never play. The
+        // refusal happens before any segment is appended (on the first
+        // poll), so the target is still the empty reservation — remove
+        // it instead of leaving a 0-byte file behind. If a later poll
+        // somehow gained an init map after segments were recorded, the
+        // partial is kept: it is a real recording.
+        if parsed.init.is_some() {
+            let _ = fs::remove_file(&segment_temp).await;
+            if recorded == 0 {
+                let _ = fs::remove_file(target).await;
+            }
+            return Err(anyhow!("Live stream in this format can't be recorded yet."));
+        }
+        let skip = match next_sequence {
+            None => 0,
+            Some(next) => next.saturating_sub(parsed.media_sequence) as usize,
+        };
+        let mut recorded_this_poll = 0_u64;
+        let mut attempted_this_poll = 0_u64;
+        for (index, segment) in parsed.segments.iter().enumerate().skip(skip) {
+            attempted_this_poll += 1;
+            let sequence = parsed.media_sequence + index as u64;
+            match fetch_hls_segment(&client, segment, session, &segment_temp, &rate_limiter, &key_cache).await {
+                Ok(bytes) => {
+                    let mut input = fs::File::open(&segment_temp).await?;
+                    let copied = tokio::io::copy(&mut input, &mut output).await?;
+                    debug_assert_eq!(copied, bytes);
+                    let _ = fs::remove_file(&segment_temp).await;
+                    downloaded = downloaded.saturating_add(bytes);
+                    recorded += 1;
+                    recorded_this_poll += 1;
+                    next_sequence = Some(sequence + 1);
+                    let _ = progress_tx.send(DownloadProgress {
+                        downloaded,
+                        total: None,
+                        percent: None,
+                        phase: "recording".into(),
+                    });
+                }
+                Err(error) => {
+                    // A segment that slid out of the live window while
+                    // this poll was running is gone for good: skip it
+                    // and keep recording the rest. Anything else
+                    // (auth, network, corrupt segment) fails the
+                    // recording — the error_text funnel labels it.
+                    let gone = error.downcast_ref::<reqwest::Error>()
+                        .and_then(|error| error.status())
+                        .is_some_and(|status| status == reqwest::StatusCode::NOT_FOUND);
+                    if gone {
+                        next_sequence = Some(sequence + 1);
+                        continue;
+                    }
+                    let _ = fs::remove_file(&segment_temp).await;
+                    return Err(error);
+                }
+            }
+        }
+        // The first poll's window was entirely gone before any segment
+        // could be fetched: fail instead of returning an empty file —
+        // and remove the empty target, which nothing was recorded into.
+        if recorded == 0 && attempted_this_poll > 0 && recorded_this_poll == 0 {
+            let _ = fs::remove_file(&segment_temp).await;
+            let _ = fs::remove_file(target).await;
+            return Err(anyhow!("The live stream's segments are no longer available."));
+        }
+        if is_complete_vod_playlist(&body) {
+            let _ = fs::remove_file(&segment_temp).await;
+            output.flush().await?;
+            return Ok(DownloadOutcome::Completed);
+        }
+        // A playlist that stops advancing is a dead stream, not a slow
+        // one: after LIVE_STALL_LIMIT consecutive polls with no new
+        // segment, stop with a stall error instead of polling forever.
+        // The partial recording is kept; when nothing was recorded at
+        // all the empty target goes with it (same rule as the fMP4
+        // refusal above).
+        if recorded_this_poll == 0 {
+            stalled_polls += 1;
+            if stalled_polls >= LIVE_STALL_LIMIT {
+                let _ = fs::remove_file(&segment_temp).await;
+                if recorded == 0 {
+                    let _ = fs::remove_file(target).await;
+                }
+                // Slice 6 fix round 2 (nit 1): when nothing was
+                // recorded the target is gone with it, so claiming the
+                // partial was kept lies — the message says so only
+                // when a partial actually survives.
+                let message = if recorded == 0 {
+                    "The live stream stalled — no new segments arrived."
+                } else {
+                    "The live stream stalled — no new segments arrived. The partial recording was kept."
+                };
+                return Err(anyhow!(message));
+            }
+        } else {
+            stalled_polls = 0;
+        }
+        // Wait for the next window: TARGETDURATION from the playlist
+        // itself (default 6 s, clamped 2–30 s), woken early when the
+        // user pauses or cancels.
+        let poll = parse_hls_target_duration(&body).unwrap_or(6).clamp(2, 30);
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(poll)) => {}
+            _ = control.changed() => {}
+        }
+    }
+}
+
+/// The playlist's `#EXT-X-TARGETDURATION`, in seconds, when present.
+fn parse_hls_target_duration(body: &str) -> Option<u64> {
+    body.lines().map(str::trim)
+        .find_map(|line| line.strip_prefix("#EXT-X-TARGETDURATION:"))
+        .and_then(|value| value.trim().parse().ok())
+}
+
+/// Downloads an HLS subtitle media playlist (format "m3u8") into one
+/// `.vtt` file: each segment is a WebVTT fragment, so the fragments are
+/// concatenated with the duplicate `WEBVTT` headers stripped after the
+/// first. Single-file subtitles (format "vtt"/"ttml") are plain direct
+/// downloads and never reach this function. A live subtitle playlist
+/// (no ENDLIST) is refused — live subtitles are not recorded in this
+/// slice. The caller reserves the target path (a `.vtt` file).
+pub async fn download_hls_subtitles(
+    playlist_url: &str,
+    target: &Path,
+    session: Option<&SessionHeaders>,
+    rate_limiter: Arc<GlobalRateLimiter>,
+) -> Result<PathBuf> {
+    let client = client()?;
+    let base = Url::parse(playlist_url)?;
+    let body = fetch_text_with(&client, playlist_url, session).await?;
+    if !is_complete_vod_playlist(&body) {
+        return Err(anyhow!("Live subtitle playlists can't be downloaded yet."));
+    }
+    let parsed = parse_hls_media_playlist(&body, &base)?;
+    if parsed.segments.is_empty() {
+        return Err(anyhow!("No subtitle segments were found in this playlist"));
+    }
+    let mut out = fs::File::create(target).await?;
+    let mut first = true;
+    for segment in &parsed.segments {
+        // Subtitle segments are small text; fetched whole (with the
+        // session, so a login-walled track labels as auth, not 403).
+        let text = fetch_text_with(&client, &segment.url, session).await?;
+        let _ = rate_limiter.reserve(text.len() as u64).await;
+        let mut text = text.as_str();
+        // Every fragment repeats the WEBVTT header; keep only the
+        // first, so the joined file is one valid WebVTT document.
+        if !first {
+            if let Some(rest) = text.strip_prefix("WEBVTT") {
+                text = rest.trim_start_matches(['\r', '\n']);
+            }
+        }
+        if !first && !text.is_empty() {
+            out.write_all(b"\n").await?;
+        }
+        out.write_all(text.as_bytes()).await?;
+        first = false;
+    }
+    out.flush().await?;
+    Ok(target.to_path_buf())
 }
 
 fn find_dash_representation<'a>(
@@ -3821,14 +4343,16 @@ async fn dash_stopped_outcome(stopped: DownloadControl, target: &Path) -> Downlo
 mod tests {
     use super::{
         dash_output_extension, dash_work_dir, download_dash_into, download_dash_resumable,
-        expand_dash_template, hidden_command, is_complete_vod_playlist, parse_dash_document,
-        parse_dash_representations, parse_dash_sidx, parse_hls_master, resolve_dash_track,
+        expand_dash_template, hidden_command,
+        hls_audio_only_variant, hls_single_variant, is_complete_vod_playlist, parse_dash_document,
+        parse_dash_representations, parse_dash_sidx, parse_hls_live_media_playlist,
+        parse_hls_master, parse_hls_media_playlist, resolve_dash_track,
         unsupported_hls_master_reason, unsupported_hls_reason, DashCheckpointTrack, DashJobState,
         DownloadControl, DownloadOutcome, partial_download_metadata_path, SessionHeaders,
     };
     use crate::download::{reserve_download_path, GlobalRateLimiter};
     use std::collections::{HashMap, HashSet};
-    use std::sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex, RwLock};
+    use std::sync::{atomic::{AtomicBool, AtomicUsize, Ordering}, Arc, Mutex, RwLock};
     use std::time::Duration;
     use tokio::sync::{mpsc, watch};
     use url::Url;
@@ -5701,13 +6225,101 @@ mod tests {
         stop_dash_server(shutdown, server);
         tokio::fs::remove_dir_all(out_dir).await.unwrap();
     }
+
+    // --- Slice 6: live / subtitles / audio-only / fps ---
+
+    #[test]
+    fn hls_master_subtitles_and_frame_rate_surface_on_variants() {
+        let playlist = "#EXTM3U\n#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",LANGUAGE=\"en\",NAME=\"English\",DEFAULT=YES,URI=\"subs-en.m3u8\"\n#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",LANGUAGE=\"es\",NAME=\"Spanish\",URI=\"subs-es.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=2400000,RESOLUTION=1280x720,FRAME-RATE=30.000\n720.m3u8\n";
+        let base = Url::parse("https://cdn.example.test/master.m3u8").unwrap();
+        let variants = parse_hls_master(playlist, &base).unwrap();
+        assert_eq!(variants.len(), 1);
+        assert_eq!(variants[0].quality, "720p");
+        assert_eq!(variants[0].fps, Some(30.0));
+        let subtitles = variants[0].subtitles.as_ref().expect("subtitle renditions must ride on the variant");
+        assert_eq!(subtitles.len(), 2);
+        assert_eq!(subtitles[0].language, "en");
+        assert_eq!(subtitles[0].name, "English");
+        assert_eq!(subtitles[0].format, "m3u8");
+        assert!(subtitles[0].url.ends_with("/subs-en.m3u8"));
+        assert_eq!(subtitles[1].language, "es");
+    }
+
+    #[test]
+    fn hls_master_audio_only_row_uses_default_rendition() {
+        let playlist = "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",LANGUAGE=\"en\",NAME=\"English\",DEFAULT=YES,URI=\"audio-en.m3u8\"\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",LANGUAGE=\"es\",NAME=\"Spanish\",URI=\"audio-es.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=2400000,RESOLUTION=1280x720,AUDIO=\"audio\"\n720.m3u8\n";
+        let base = Url::parse("https://cdn.example.test/master.m3u8").unwrap();
+        let row = hls_audio_only_variant(playlist, &base).expect("an audio row must exist");
+        assert_eq!(row.quality, "Audio");
+        assert_eq!(row.audio_only, Some(true));
+        // The DEFAULT rendition wins over the merely-first one.
+        assert!(row.url.ends_with("/audio-en.m3u8"));
+        assert_eq!(row.representation_id.as_deref(), Some("audio"));
+    }
+
+    #[test]
+    fn hls_live_media_playlist_parses_but_vod_parser_rejects_it() {
+        let live = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:42\n#EXTINF:6.0,\nseg42.ts\n#EXTINF:6.0,\nseg43.ts\n";
+        let base = Url::parse("https://cdn.example.test/live.m3u8").unwrap();
+        let parsed = parse_hls_live_media_playlist(live, &base).unwrap();
+        assert_eq!(parsed.segments.len(), 2);
+        assert_eq!(parsed.media_sequence, 42);
+        assert!(parsed.init.is_none());
+        assert!(parse_hls_media_playlist(live, &base).is_err(), "the VOD parser must still refuse a live playlist");
+        let vod = format!("{live}#EXT-X-ENDLIST\n");
+        assert!(parse_hls_media_playlist(&vod, &base).is_ok(), "the same playlist with ENDLIST is VOD");
+    }
+
+    #[test]
+    fn hls_single_variant_labels_live_ts_and_refuses_live_fmp4() {
+        let live_ts = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:6.0,\nseg0.ts\n";
+        let variant = hls_single_variant("https://cdn.example.test/live.m3u8", live_ts);
+        assert_eq!(variant.is_live, Some(true));
+        assert_eq!(variant.quality, "Live");
+        assert!(variant.downloadable, "live TS records as it streams");
+        assert!(variant.note.as_deref().unwrap().contains("records the stream"));
+        let live_fmp4 = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:6.0,\nseg0.m4s\n";
+        let variant = hls_single_variant("https://cdn.example.test/live.m3u8", live_fmp4);
+        assert_eq!(variant.is_live, Some(true));
+        assert!(!variant.downloadable, "live fMP4 cannot be appended into a playable file");
+        assert!(variant.note.as_deref().unwrap().contains("can't be recorded yet"));
+    }
+
+    #[test]
+    fn dash_live_mpd_is_labelled_live_and_not_downloadable() {
+        let dynamic = r#"<MPD type="dynamic"><Period><AdaptationSet contentType="video"><Representation id="v1" height="720"/></AdaptationSet></Period></MPD>"#;
+        let variants = parse_dash_representations(dynamic, "https://cdn.example.test/video.mpd");
+        assert_eq!(variants.len(), 1);
+        assert_eq!(variants[0].is_live, Some(true));
+        assert_eq!(variants[0].quality, "Live");
+        assert!(!variants[0].downloadable);
+        assert!(variants[0].note.as_deref().unwrap().contains("can't be recorded yet"));
+    }
+
+    #[test]
+    fn dash_static_mpd_surfaces_subtitles_and_frame_rate() {
+        let manifest = r#"<MPD type="static"><Period>
+            <AdaptationSet contentType="video" mimeType="video/mp4"><Representation id="v1" height="720" frameRate="30"/></AdaptationSet>
+            <AdaptationSet contentType="text" mimeType="text/vtt"><Representation id="sub-en" mimeType="text/vtt"><BaseURL>subs-en.vtt</BaseURL></Representation></AdaptationSet>
+            <AdaptationSet contentType="text" mimeType="application/ttml+xml"><Representation id="sub-de"><BaseURL>subs-de.ttml</BaseURL></Representation></AdaptationSet>
+        </Period></MPD>"#;
+        let variants = parse_dash_representations(manifest, "https://cdn.example.test/video.mpd");
+        assert_eq!(variants.len(), 1);
+        assert_eq!(variants[0].fps, Some(30.0));
+        let subtitles = variants[0].subtitles.as_ref().expect("text adaptations must surface as subtitles");
+        assert_eq!(subtitles.len(), 2);
+        assert_eq!(subtitles[0].language, "sub-en");
+        assert_eq!(subtitles[0].format, "vtt");
+        assert!(subtitles[0].url.ends_with("/subs-en.vtt"));
+        assert_eq!(subtitles[1].format, "ttml");
+    }
 }
 
 
 #[cfg(test)]
 mod hls_download_tests {
     use super::{
-        download_hls_resumable, ffmpeg_available, hidden_command, hls_output_extension, hls_work_dir,
+        download_hls_live, download_hls_resumable, download_hls_subtitles, ffmpeg_available, hidden_command, hls_output_extension, hls_work_dir,
         inspect_video, partial_download_metadata_path, validate_hls_content_range,
         DownloadControl, DownloadOutcome, GlobalRateLimiter, HlsSelection, SessionHeaders,
     };
@@ -7176,6 +7788,398 @@ mod hls_download_tests {
         for index in 0..segment_count {
             assert_eq!(counts.get(&format!("/seg{index}.ts")), Some(&1));
         }
+        stop_server(shutdown, server);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    // --- Slice 6: audio-only selection, live recording, subtitles ---
+
+    #[tokio::test]
+    async fn hls_audio_only_selection_downloads_only_the_audio_track() {
+        let mut routes = HashMap::new();
+        routes.insert("/master.m3u8".into(), "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",LANGUAGE=\"en\",NAME=\"English\",DEFAULT=YES,URI=\"audio.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=2400000,RESOLUTION=1280x720,AUDIO=\"audio\"\nvideo.m3u8\n".as_bytes().to_vec());
+        routes.insert("/video.m3u8".into(), "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n#EXTINF:10.0,\nv0.ts\n#EXTINF:10.0,\nv1.ts\n#EXT-X-ENDLIST\n".as_bytes().to_vec());
+        routes.insert("/audio.m3u8".into(), "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n#EXTINF:10.0,\na0.ts\n#EXTINF:10.0,\na1.ts\n#EXT-X-ENDLIST\n".as_bytes().to_vec());
+        routes.insert("/v0.ts".into(), b"VIDEO0".to_vec());
+        routes.insert("/v1.ts".into(), b"VIDEO1".to_vec());
+        routes.insert("/a0.ts".into(), b"AUDIO0".to_vec());
+        routes.insert("/a1.ts".into(), b"AUDIO1".to_vec());
+        let (base, counts, _range_206, shutdown, server) =
+            spawn_hls_server(routes, Duration::from_millis(8), HlsServerOptions { ..Default::default() });
+        let directory = std::env::temp_dir().join(format!("thunderload-hls-audio-only-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("audio.ts")).await.unwrap();
+        let url = format!("{base}/master.m3u8");
+        // The audio-only row selects the audio rendition's playlist, not
+        // a video variant: the plan must be that playlist alone.
+        let selection = HlsSelection { media_url: Some(format!("{base}/audio.m3u8")), audio_group: None };
+        let (_control_tx, control_rx) = fresh_control();
+        let outcome = run_resumable_with_selection_and_session(&url, &target, control_rx, selection, None).await.unwrap();
+        assert_eq!(outcome, DownloadOutcome::Completed);
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(bytes, b"AUDIO0AUDIO1");
+        let counts = counts.lock().unwrap();
+        assert_eq!(counts.get("/v0.ts"), None, "no video segment may be fetched for the audio-only row");
+        assert_eq!(counts.get("/v1.ts"), None);
+        assert_eq!(counts.get("/a0.ts"), Some(&1));
+        assert_eq!(counts.get("/a1.ts"), Some(&1));
+        stop_server(shutdown, server);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    /// A live HLS server: the playlist window slides on every fetch and
+    /// gains EXT-X-ENDLIST on the third fetch, so the recorder must
+    /// capture seg0..seg4 exactly once, in order, then stop. Sequential
+    /// accept loop — the recorder fetches one thing at a time.
+    fn spawn_live_hls_server() -> (String, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let thread_shutdown = shutdown.clone();
+        let thread_fetches = fetches.clone();
+        let handle = std::thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => {
+                        let _ = connection.0.set_nonblocking(false);
+                        connection
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                use std::io::{Read, Write};
+                let mut raw = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                let head_complete = loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) => break false,
+                        Ok(count) => {
+                            raw.extend_from_slice(&buffer[..count]);
+                            if raw.windows(4).any(|window| window == b"\r\n\r\n") { break true; }
+                        }
+                        Err(_) => break false,
+                    }
+                };
+                if !head_complete { continue; }
+                let request = String::from_utf8_lossy(&raw);
+                let path = request.lines().next().unwrap_or_default()
+                    .split_whitespace().nth(1).unwrap_or("/").to_string();
+                let path_only = path.split('?').next().unwrap_or(&path).to_string();
+                let body: Vec<u8> = if path_only == "/live.m3u8" {
+                    let fetch = thread_fetches.fetch_add(1, Ordering::SeqCst) + 1;
+                    // The recorder resolves the media URL with one
+                    // playlist fetch before its first poll, so fetches 1
+                    // and 2 return the same window — the recording
+                    // starts from the window the first poll sees.
+                    let playlist = match fetch {
+                        1 | 2 => "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:2.0,\nseg0.ts\n#EXTINF:2.0,\nseg1.ts\n#EXTINF:2.0,\nseg2.ts\n",
+                        3 => "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:1\n#EXTINF:2.0,\nseg1.ts\n#EXTINF:2.0,\nseg2.ts\n#EXTINF:2.0,\nseg3.ts\n",
+                        _ => "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:2\n#EXTINF:2.0,\nseg2.ts\n#EXTINF:2.0,\nseg3.ts\n#EXTINF:2.0,\nseg4.ts\n#EXT-X-ENDLIST\n",
+                    };
+                    playlist.as_bytes().to_vec()
+                } else if let Some(index) = path_only.strip_prefix("/seg").and_then(|rest| rest.strip_suffix(".ts")) {
+                    format!("SEG{index}").into_bytes()
+                } else {
+                    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    continue;
+                };
+                let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{address}"), shutdown, handle)
+    }
+
+    /// Slice 6 fix round 2 (nit 1): a live playlist that never lists
+    /// a segment — same shape as the stalled server, but the window is
+    /// always empty, so the recorder stalls with nothing recorded.
+    fn spawn_empty_live_hls_server() -> (String, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = shutdown.clone();
+        let handle = std::thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => {
+                        let _ = connection.0.set_nonblocking(false);
+                        connection
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                use std::io::{Read, Write};
+                let mut raw = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                let head_complete = loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) => break false,
+                        Ok(count) => {
+                            raw.extend_from_slice(&buffer[..count]);
+                            if raw.windows(4).any(|window| window == b"\r\n\r\n") { break true; }
+                        }
+                        Err(_) => break false,
+                    }
+                };
+                if !head_complete { continue; }
+                let request = String::from_utf8_lossy(&raw);
+                let path = request.lines().next().unwrap_or_default()
+                    .split_whitespace().nth(1).unwrap_or("/").to_string();
+                let path_only = path.split('?').next().unwrap_or(&path).to_string();
+                let body: Vec<u8> = if path_only == "/live.m3u8" {
+                    b"#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n".to_vec()
+                } else {
+                    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    continue;
+                };
+                let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{address}"), shutdown, handle)
+    }
+
+    #[tokio::test]
+    async fn hls_live_recording_captures_the_window_until_endlist() {
+        let (base, shutdown, server) = spawn_live_hls_server();
+        let directory = std::env::temp_dir().join(format!("thunderload-hls-live-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("live.ts")).await.unwrap();
+        let url = format!("{base}/live.m3u8");
+        let (_control_tx, control_rx) = fresh_control();
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        let outcome = download_hls_live(&url, &HlsSelection::none(), &target, None, control_rx, progress_tx, Arc::new(GlobalRateLimiter::new())).await.unwrap();
+        assert_eq!(outcome, DownloadOutcome::Completed, "the recording must stop when the playlist gains ENDLIST");
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(bytes, b"SEG0SEG1SEG2SEG3SEG4", "each live segment exactly once, in order");
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = server.join();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    /// Serves a fixed live fMP4 playlist (init map + m4s segments, no
+    /// ENDLIST) on every fetch — the recorder must refuse it on its
+    /// first poll.
+    fn spawn_live_fmp4_server() -> (String, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = shutdown.clone();
+        let handle = std::thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => {
+                        let _ = connection.0.set_nonblocking(false);
+                        connection
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                use std::io::{Read, Write};
+                let mut raw = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                let head_complete = loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) => break false,
+                        Ok(count) => {
+                            raw.extend_from_slice(&buffer[..count]);
+                            if raw.windows(4).any(|window| window == b"\r\n\r\n") { break true; }
+                        }
+                        Err(_) => break false,
+                    }
+                };
+                if !head_complete { continue; }
+                let request = String::from_utf8_lossy(&raw);
+                let path = request.lines().next().unwrap_or_default()
+                    .split_whitespace().nth(1).unwrap_or("/").to_string();
+                let path_only = path.split('?').next().unwrap_or(&path).to_string();
+                let body: Vec<u8> = if path_only == "/live.m3u8" {
+                    b"#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:2.0,\nseg0.m4s\n#EXTINF:2.0,\nseg1.m4s\n".to_vec()
+                } else if path_only == "/init.mp4" {
+                    b"FAKEINIT".to_vec()
+                } else if let Some(index) = path_only.strip_prefix("/seg").and_then(|rest| rest.strip_suffix(".m4s")) {
+                    format!("SEG{index}").into_bytes()
+                } else {
+                    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    continue;
+                };
+                let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{address}"), shutdown, handle)
+    }
+
+    /// Slice 6 fix (MINOR 2b): a refused live fMP4 recording must leave
+    /// no empty target file behind. The target is created before the
+    /// first playlist fetch; the refusal used to return without
+    /// removing it, so a failed recording left a 0-byte file on disk.
+    #[tokio::test]
+    async fn live_fmp4_refusal_leaves_no_target_file() {
+        let (base, shutdown, server) = spawn_live_fmp4_server();
+        let directory = std::env::temp_dir().join(format!("thunderload-hls-live-fmp4-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("live.ts")).await.unwrap();
+        let url = format!("{base}/live.m3u8");
+        let (_control_tx, control_rx) = fresh_control();
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        let result = download_hls_live(&url, &HlsSelection::none(), &target, None, control_rx, progress_tx, Arc::new(GlobalRateLimiter::new())).await;
+        assert!(result.is_err(), "live fMP4 must be refused, got {result:?}");
+        assert!(!target.exists(), "a refused live fMP4 recording must not leave an empty target file behind");
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = server.join();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    /// Serves the same live window (SEG0–SEG2, TARGETDURATION 2, no
+    /// ENDLIST) on every fetch — the stream never advances, so the
+    /// recorder sees no new segment on any poll after the first.
+    fn spawn_stalled_live_hls_server() -> (String, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = shutdown.clone();
+        let handle = std::thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => {
+                        let _ = connection.0.set_nonblocking(false);
+                        connection
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                use std::io::{Read, Write};
+                let mut raw = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                let head_complete = loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) => break false,
+                        Ok(count) => {
+                            raw.extend_from_slice(&buffer[..count]);
+                            if raw.windows(4).any(|window| window == b"\r\n\r\n") { break true; }
+                        }
+                        Err(_) => break false,
+                    }
+                };
+                if !head_complete { continue; }
+                let request = String::from_utf8_lossy(&raw);
+                let path = request.lines().next().unwrap_or_default()
+                    .split_whitespace().nth(1).unwrap_or("/").to_string();
+                let path_only = path.split('?').next().unwrap_or(&path).to_string();
+                let body: Vec<u8> = if path_only == "/live.m3u8" {
+                    b"#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:2.0,\nseg0.ts\n#EXTINF:2.0,\nseg1.ts\n#EXTINF:2.0,\nseg2.ts\n".to_vec()
+                } else if let Some(index) = path_only.strip_prefix("/seg").and_then(|rest| rest.strip_suffix(".ts")) {
+                    format!("SEG{index}").into_bytes()
+                } else {
+                    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    continue;
+                };
+                let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{address}"), shutdown, handle)
+    }
+
+    /// Slice 6 fix (MINOR 2a): a stalled live playlist — no new
+    /// segments for LIVE_STALL_LIMIT consecutive polls — must stop with
+    /// a stall error instead of polling forever. The partial recording
+    /// of what arrived before the stall is kept.
+    #[tokio::test]
+    async fn live_stalled_playlist_stops_and_keeps_partial() {
+        let (base, shutdown, server) = spawn_stalled_live_hls_server();
+        let directory = std::env::temp_dir().join(format!("thunderload-hls-live-stall-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("live.ts")).await.unwrap();
+        let url = format!("{base}/live.m3u8");
+        let (_control_tx, control_rx) = fresh_control();
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        // The 60 s timeout is the failing-before guard: without the
+        // stall limit this call never returns.
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            download_hls_live(&url, &HlsSelection::none(), &target, None, control_rx, progress_tx, Arc::new(GlobalRateLimiter::new())),
+        ).await;
+        let result = result.expect("the stalled recorder must stop on its own instead of polling forever");
+        let error = result.expect_err("a stalled live playlist must fail, not complete");
+        assert!(error.to_string().contains("stall"), "the error must label the stall, got: {error}");
+        // Slice 6 fix round 2 (nit 1): segments arrived before the
+        // stall, so the message must say the partial was kept.
+        assert!(error.to_string().contains("The partial recording was kept."), "a stall after segments arrived must say the partial was kept, got: {error}");
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(bytes, b"SEG0SEG1SEG2", "the partial recording of the stalled stream is kept");
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = server.join();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    /// Slice 6 fix round 2 (nit 1): a live playlist that never lists
+    /// a segment stalls with nothing recorded — the empty target is
+    /// removed, so the error must NOT claim a partial was kept.
+    #[tokio::test]
+    async fn live_stalled_empty_playlist_stops_without_a_kept_partial() {
+        let (base, shutdown, server) = spawn_empty_live_hls_server();
+        let directory = std::env::temp_dir().join(format!("thunderload-hls-live-stall-empty-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("live.ts")).await.unwrap();
+        let url = format!("{base}/live.m3u8");
+        let (_control_tx, control_rx) = fresh_control();
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        // The 60 s timeout is the failing-before guard: without the
+        // stall limit this call never returns.
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            download_hls_live(&url, &HlsSelection::none(), &target, None, control_rx, progress_tx, Arc::new(GlobalRateLimiter::new())),
+        ).await;
+        let result = result.expect("the stalled recorder must stop on its own instead of polling forever");
+        let error = result.expect_err("a stalled empty playlist must fail, not complete");
+        assert!(error.to_string().contains("stall"), "the error must label the stall, got: {error}");
+        assert!(!error.to_string().contains("kept"), "with nothing recorded the error must not claim a partial was kept, got: {error}");
+        assert!(!target.exists(), "an empty recording leaves no target file behind");
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = server.join();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hls_subtitle_download_joins_vtt_fragments() {
+        let mut routes = HashMap::new();
+        routes.insert("/subs.m3u8".into(), "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n#EXTINF:10.0,\nsub0.vtt\n#EXTINF:10.0,\nsub1.vtt\n#EXT-X-ENDLIST\n".as_bytes().to_vec());
+        routes.insert("/sub0.vtt".into(), b"WEBVTT\n\n00:00.000 --> 00:01.000\nHello\n".to_vec());
+        routes.insert("/sub1.vtt".into(), b"WEBVTT\n\n00:01.000 --> 00:02.000\nWorld\n".to_vec());
+        let (base, _counts, _range_206, shutdown, server) =
+            spawn_hls_server(routes, Duration::from_millis(8), HlsServerOptions { ..Default::default() });
+        let directory = std::env::temp_dir().join(format!("thunderload-hls-subs-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("subs.vtt")).await.unwrap();
+        let url = format!("{base}/subs.m3u8");
+        let saved = download_hls_subtitles(&url, &target, None, Arc::new(GlobalRateLimiter::new())).await.unwrap();
+        let text = tokio::fs::read_to_string(&saved).await.unwrap();
+        assert_eq!(text.matches("WEBVTT").count(), 1, "the joined file must have exactly one WEBVTT header");
+        assert!(text.contains("Hello"));
+        assert!(text.contains("World"));
         stop_server(shutdown, server);
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }

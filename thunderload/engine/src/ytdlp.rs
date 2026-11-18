@@ -34,7 +34,7 @@
 use anyhow::{anyhow, Context, Result};
 use crate::download::{DownloadControl, DownloadOutcome, DownloadProgress};
 use crate::session::SessionHeaders;
-use crate::video::VideoVariant;
+use crate::video::{SubtitleVariant, VideoVariant};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -585,6 +585,11 @@ fn is_youtube_url(url: &str) -> bool {
 pub struct YtDlpInspect {
     pub title: Option<String>,
     pub variants: Vec<VideoVariant>,
+    /// True when this result came from the generic extractor fallback
+    /// (Slice 6): the page had no site-specific extractor, so yt-dlp
+    /// read whatever generic formats the page itself exposes. The
+    /// caller never lets a generic result overwrite a real inspect.
+    pub generic: bool,
 }
 
 /// A Netscape-format cookies file for one run, deleted when the run
@@ -663,10 +668,6 @@ fn child_path_with_tools() -> String {
     }
 }
 
-/// Inspect one YouTube/social page URL and map its formats onto the
-/// panel's VideoVariant rows. Fails with ToolsMissing when yt-dlp is
-/// not on disk yet (the caller shows the consent UI), and with a
-/// plain-language failure label otherwise.
 /// Inspect cap (default 60 s). Overridable for tests via
 /// THUNDERLOAD_YTDLP_INSPECT_TIMEOUT_SECS — the production default
 /// never changes; only the test suite shortens it.
@@ -683,6 +684,27 @@ pub async fn inspect_page(
     url: &str,
     session: Option<&SessionHeaders>,
 ) -> Result<YtDlpInspect> {
+    inspect_page_with(url, session, false).await
+}
+
+/// Inspect one YouTube/social page URL and map its formats onto the
+/// panel's VideoVariant rows. Fails with ToolsMissing when yt-dlp is
+/// not on disk yet (the caller shows the consent UI), and with a
+/// plain-language failure label otherwise.
+/// `force_generic` (Slice 6) runs yt-dlp with `--force-generic-extractor`:
+/// the fallback when sniffing and the normal inspect found nothing
+/// usable for a page. The generic extractor reads whatever formats the
+/// page itself exposes (direct media links, embedded players) — it
+/// never overrides a real detector result, and the returned rows carry
+/// `generic: true` so the caller can keep them separate from a real
+/// inspect. Inspect cap (default 60 s). Overridable for tests via
+/// THUNDERLOAD_YTDLP_INSPECT_TIMEOUT_SECS — the production default
+/// never changes; only the test suite shortens it.
+pub async fn inspect_page_with(
+    url: &str,
+    session: Option<&SessionHeaders>,
+    force_generic: bool,
+) -> Result<YtDlpInspect> {
     // Verified before executing: missing → ToolsMissing (consent UI),
     // swapped → a plain refusal. Never run an unverified binary.
     verify_tool_on_disk(YtDlpTool::YtDlp).await?;
@@ -697,6 +719,9 @@ pub async fn inspect_page(
         .arg("--no-playlist")
         .arg("--no-warnings")
         .arg(url);
+    if force_generic {
+        command.arg("--force-generic-extractor");
+    }
     if is_youtube_url(url) {
         command.arg("--extractor-args");
         command.arg(format!("youtube:player-client={PLAYER_CLIENT_CHAIN}"));
@@ -776,7 +801,40 @@ pub async fn inspect_page(
             "No downloadable formats were found for this page."
         ));
     }
-    Ok(YtDlpInspect { title, variants })
+    Ok(YtDlpInspect { title, variants, generic: force_generic })
+}
+
+/// Subtitle tracks from a yt-dlp info dict's `subtitles` map
+/// (language → [{url, ext, ...}]). One entry per language, first usable
+/// entry only; the name is the language itself. Only direct-file
+/// formats are kept (vtt/ttml/srt) — a subtitle playlist format would
+/// need assembly the yt-dlp path does not do, so it is skipped, never
+/// faked. Returns an empty list when the info dict carries none.
+fn parse_ytdlp_subtitles(info: &serde_json::Value) -> Vec<SubtitleVariant> {
+    let Some(languages) = info.get("subtitles").and_then(|value| value.as_object()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (language, entries) in languages {
+        let Some(entries) = entries.as_array() else { continue; };
+        for entry in entries {
+            let Some(url) = entry.get("url").and_then(|value| value.as_str()) else { continue; };
+            if url.is_empty() { continue; }
+            let ext = entry.get("ext").and_then(|value| value.as_str()).unwrap_or("").to_ascii_lowercase();
+            let format = match ext.as_str() {
+                "vtt" | "ttml" | "srt" => ext,
+                _ => continue,
+            };
+            out.push(SubtitleVariant {
+                language: language.clone(),
+                name: language.clone(),
+                url: url.to_string(),
+                format,
+            });
+            break;
+        }
+    }
+    out
 }
 
 /// Map one yt-dlp `-j` info dict onto VideoVariant rows: one row per
@@ -790,12 +848,22 @@ pub async fn map_formats(info: &serde_json::Value) -> Vec<VideoVariant> {
         Some(formats) => formats,
         None => return Vec::new(),
     };
+    // Live info (Slice 6): yt-dlp reports it at the top level. Every
+    // row from a live info dict is a live row — the UIs prefix "Live · ".
+    let is_live = info.get("is_live").and_then(|value| value.as_bool()).unwrap_or(false);
+    // Subtitles (Slice 6): yt-dlp's `subtitles` dict maps language →
+    // [{url, ext, ...}]. One row per language, first usable entry only,
+    // attached to every video variant. Formats the downloader cannot
+    // serve (anything but a direct vtt/ttml/srt file) are skipped, never
+    // faked.
+    let subtitles = parse_ytdlp_subtitles(info);
     #[derive(Clone)]
     struct Fmt {
         id: String,
         ext: String,
         height: u32,
         bandwidth: u64,
+        fps: Option<f64>,
         vcodec: String,
         acodec: String,
         url: String,
@@ -844,6 +912,8 @@ pub async fn map_formats(info: &serde_json::Value) -> Vec<VideoVariant> {
                 .and_then(|value| value.as_f64())
                 .map(|tbr| (tbr * 1000.0) as u64)
                 .unwrap_or(0),
+            // fps is what the format carries — shown only when present.
+            fps: format.get("fps").and_then(|value| value.as_f64()),
             vcodec,
             acodec,
             url: url.to_string(),
@@ -888,6 +958,7 @@ pub async fn map_formats(info: &serde_json::Value) -> Vec<VideoVariant> {
             width: None,
             height: Some(fmt.height),
             bandwidth: if fmt.bandwidth > 0 { Some(fmt.bandwidth) } else { None },
+            fps: fmt.fps,
             // The panel never downloads this URL directly — the
             // download goes through yt-dlp with the format selector.
             // The URL is kept so the row still identifies the stream.
@@ -902,6 +973,8 @@ pub async fn map_formats(info: &serde_json::Value) -> Vec<VideoVariant> {
             } else {
                 None
             },
+            is_live: if is_live { Some(true) } else { None },
+            subtitles: if subtitles.is_empty() { None } else { Some(subtitles.clone()) },
         });
     }
     for fmt in muxed {
@@ -915,6 +988,7 @@ pub async fn map_formats(info: &serde_json::Value) -> Vec<VideoVariant> {
             width: None,
             height: if fmt.height > 0 { Some(fmt.height) } else { None },
             bandwidth: if fmt.bandwidth > 0 { Some(fmt.bandwidth) } else { None },
+            fps: fmt.fps,
             url: fmt.url.clone(),
             downloadable: true,
             note: None,
@@ -922,6 +996,8 @@ pub async fn map_formats(info: &serde_json::Value) -> Vec<VideoVariant> {
             audio_representation_id: None,
             audio_only: None,
             requires_ffmpeg: None,
+            is_live: if is_live { Some(true) } else { None },
+            subtitles: if subtitles.is_empty() { None } else { Some(subtitles.clone()) },
         });
     }
     if let Some(audio) = best_audio {
@@ -931,6 +1007,7 @@ pub async fn map_formats(info: &serde_json::Value) -> Vec<VideoVariant> {
             width: None,
             height: None,
             bandwidth: if audio.bandwidth > 0 { Some(audio.bandwidth) } else { None },
+            fps: audio.fps,
             url: audio.url.clone(),
             downloadable: true,
             note: None,
@@ -938,6 +1015,8 @@ pub async fn map_formats(info: &serde_json::Value) -> Vec<VideoVariant> {
             audio_representation_id: None,
             audio_only: Some(true),
             requires_ffmpeg: None,
+            is_live: if is_live { Some(true) } else { None },
+            subtitles: if subtitles.is_empty() { None } else { Some(subtitles.clone()) },
         });
     }
     // Best quality first; the audio-only row sorts last (height 0).
@@ -962,6 +1041,8 @@ pub fn failure_label(stderr: &str) -> &'static str {
     if text.contains("private video")
         || text.contains("video unavailable")
         || text.contains("this video is no longer available")
+        || text.contains("http error 404")
+        || text.contains("404: not found")
     {
         return "This video is removed, private, or region-blocked.";
     }
@@ -1425,6 +1506,7 @@ mod tests {
             width: None,
             height: Some(1080),
             bandwidth: None,
+            fps: None,
             url: "https://example.com/v".into(),
             downloadable: true,
             note: None,
@@ -1432,6 +1514,8 @@ mod tests {
             audio_representation_id: Some("140".into()),
             audio_only: None,
             requires_ffmpeg: None,
+            is_live: None,
+            subtitles: None,
         };
         assert_eq!(format_selector(&variant), "137+140");
         let muxed = VideoVariant {
@@ -1465,11 +1549,58 @@ mod tests {
         assert!(failure_label("ERROR: Sign in to confirm you're not a bot").starts_with("YouTube wants a login"));
         assert!(failure_label("ERROR: Private video").starts_with("This video is removed"));
         assert!(failure_label("ERROR: Video unavailable").starts_with("This video is removed"));
+        assert!(failure_label("ERROR: HTTP Error 404: Not Found").starts_with("This video is removed"));
         assert!(failure_label("WARNING: No supported JavaScript runtime could be found").starts_with("Deno is missing"));
         assert!(failure_label("ERROR: HTTP Error 403: Forbidden").starts_with("YouTube refused"));
         assert!(failure_label("ERROR: Unsupported URL: https://example.com/").starts_with("This page is not"));
         assert!(failure_label("ERROR: [youtube] abc: Failed to extract player response").starts_with("YouTube changed"));
         assert!(failure_label("something totally new").contains("download helper"));
+    }
+
+    // Slice 6: live info marks every row live, fps rides on the format,
+    // and the subtitles dict attaches one entry per language.
+    #[tokio::test]
+    async fn map_formats_marks_live_and_attaches_subtitles_and_fps() {
+        let info = json!({
+            "title": "Live stream",
+            "is_live": true,
+            "formats": [
+                {"format_id": "137", "ext": "mp4", "height": 1080, "tbr": 4500.0, "fps": 30.0, "vcodec": "avc1", "acodec": "none", "url": "https://cdn.example.test/v1080"},
+                {"format_id": "140", "ext": "m4a", "height": null, "tbr": 128.0, "vcodec": "none", "acodec": "mp4a", "url": "https://cdn.example.test/a140"}
+            ],
+            "subtitles": {
+                "en": [{"url": "https://cdn.example.test/en.vtt", "ext": "vtt"}],
+                "es": [{"url": "https://cdn.example.test/es.ttml", "ext": "ttml"}]
+            }
+        });
+        let variants = map_formats(&info).await;
+        assert_eq!(variants.len(), 2);
+        let video = variants.iter().find(|variant| variant.height == Some(1080)).unwrap();
+        assert_eq!(video.is_live, Some(true));
+        assert_eq!(video.fps, Some(30.0));
+        let subtitles = video.subtitles.as_ref().expect("subtitles must ride on the video row");
+        assert_eq!(subtitles.len(), 2);
+        assert_eq!(subtitles[0].language, "en");
+        assert_eq!(subtitles[0].format, "vtt");
+        assert_eq!(subtitles[1].format, "ttml");
+        let audio = variants.iter().find(|variant| variant.audio_only == Some(true)).unwrap();
+        assert_eq!(audio.is_live, Some(true));
+        assert!(audio.subtitles.is_some(), "the audio row carries the same subtitle list");
+    }
+
+    #[tokio::test]
+    async fn map_formats_skips_unusable_subtitle_formats() {
+        let info = json!({
+            "formats": [
+                {"format_id": "18", "ext": "mp4", "height": 360, "tbr": 500.0, "vcodec": "avc1", "acodec": "mp4a", "url": "https://cdn.example.test/v18"}
+            ],
+            "subtitles": {
+                "en": [{"url": "https://cdn.example.test/en.json3", "ext": "json3"}]
+            }
+        });
+        let variants = map_formats(&info).await;
+        assert_eq!(variants.len(), 1);
+        assert!(variants[0].subtitles.is_none(), "a format the downloader cannot serve must not be faked into a row");
     }
 
     #[test]

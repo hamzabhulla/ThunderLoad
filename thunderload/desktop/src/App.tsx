@@ -8,18 +8,20 @@ type StatusTab = "all" | "active" | "completed" | "failed";
 type InspectorTab = "overview" | "files" | "segments" | "activity";
 type Kind = "direct" | "hls" | "dash" | "ytdlp";
 type Status = "Queued" | "Downloading" | "Pausing" | "Paused" | "Cancelling" | "Completed" | "Failed" | "Interrupted" | "Cancelled";
-type Variant = { kind: string; quality: string; width?: number; height?: number; bandwidth?: number; url: string; downloadable: boolean; note?: string; representationId?: string; audioRepresentationId?: string; audioOnly?: boolean };
+type SubtitleVariant = { language: string; name?: string; url: string; format: string };
+type Variant = { kind: string; quality: string; width?: number; height?: number; bandwidth?: number; url: string; downloadable: boolean; note?: string; representationId?: string; audioRepresentationId?: string; audioOnly?: boolean; isLive?: boolean; fps?: number; subtitles?: SubtitleVariant[] };
 type GrabItem = { url: string; kind: string; name: string };
 type GrabResult = { items: GrabItem[]; truncated: boolean };
 type Progress = { downloaded: number; total?: number; percent?: number; phase: string };
-type Item = { id: string; name: string; url: string; kind: Kind; status: Status; percent: number; downloaded: number; total?: number; detail: string; error?: string; createdAt: number; targetPath?: string; scheduledAt?: number; source?: "native"; representationId?: string; audioRepresentationId?: string; segmentsDone?: number; segmentsTotal?: number };
-type StoredJob = { id: string; name: string; url: string; kind: string; origin: string; state: string; downloaded: number; total?: number; percent?: number; segmentsDone?: number; segmentsTotal?: number; targetPath?: string; checkpointPath?: string; representationId?: string; audioRepresentationId?: string; scheduledAtMs?: number; detail: string; error?: string; createdAtMs: number; updatedAtMs: number };
+type Item = { id: string; name: string; url: string; kind: Kind; status: Status; percent: number; downloaded: number; total?: number; detail: string; error?: string; createdAt: number; targetPath?: string; scheduledAt?: number; source?: "native"; representationId?: string; audioRepresentationId?: string; segmentsDone?: number; segmentsTotal?: number; live?: boolean };
+type StoredJob = { id: string; name: string; url: string; kind: string; origin: string; state: string; downloaded: number; total?: number; percent?: number; segmentsDone?: number; segmentsTotal?: number; targetPath?: string; checkpointPath?: string; representationId?: string; audioRepresentationId?: string; scheduledAtMs?: number; detail: string; error?: string; createdAtMs: number; updatedAtMs: number; live?: boolean };
 
 const HISTORY_KEY = "thunderload.history.v2";
 const CONNECTIONS_KEY = "thunderload.connections.v1";
 const PARALLEL_KEY = "thunderload.parallel.v1";
 const SPEED_LIMIT_KEY = "thunderload.speed-limit.v1";
 const NATIVE_IDS_KEY = "thunderload.native-extension-ids.v1";
+const CLIPBOARD_WATCH_KEY = "thunderload.clipboard-watch.v1";
 
 // Extension IDs the user entered once in Settings → Browser connection,
 // one per browser. The startup check re-registers from these, so the
@@ -52,6 +54,17 @@ function isYtDlpPageUrl(value: string): boolean {
     return YTDLP_PAGE_HOSTS.some((listed) => host === listed || host.endsWith("." + listed));
   } catch { return false; }
 }
+// Slice 6: a URL the clipboard watcher treats as downloadable — a
+// direct media file, or a YouTube/social page (which the yt-dlp
+// inspect flow handles once the user picks Download).
+const CLIPBOARD_MEDIA_EXT = /\.(mp4|m4v|mov|webm|mkv|avi|mp3|m4a|aac|wav|ogg|opus|flac|m3u8|mpd|zip|pdf)$/i;
+function isClipboardMediaUrl(value: string): boolean {
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+    return CLIPBOARD_MEDIA_EXT.test(parsed.pathname) || isYtDlpPageUrl(value);
+  } catch { return false; }
+}
 
 function bytes(value: number): string {
   if (!Number.isFinite(value) || value <= 0) return "0 B";
@@ -65,11 +78,19 @@ function readItems(): Item[] {
     if (!Array.isArray(saved)) return [];
     return saved.map((item: Item) => forgetStaleSchedule(item.source === "native"
       ? item
-      : item.status === "Downloading" || item.status === "Pausing"
-        ? item.targetPath
-          ? { ...item, status: "Queued", detail: "Recovering saved partial download…" }
-          : { ...item, status: "Interrupted", detail: "App closed before a resumable checkpoint was created" }
-        : item));
+      : item.live && item.targetPath && (item.status === "Downloading" || item.status === "Pausing" || item.status === "Queued")
+        // Slice 6 fix (MAJOR): a live recording has no checkpoint to
+        // recover from — re-queuing it would re-record over the kept
+        // partial. It comes back Paused, file kept; Pause is terminal.
+        // (Queued with a target is a resume-queued recording from
+        // before this fix; a live job that never started has no
+        // target and stays Queued.)
+        ? { ...item, status: "Paused", detail: "Paused · partial recording kept" }
+        : item.status === "Downloading" || item.status === "Pausing"
+          ? item.targetPath
+            ? { ...item, status: "Queued", detail: "Recovering saved partial download…" }
+            : { ...item, status: "Interrupted", detail: "App closed before a resumable checkpoint was created" }
+          : item));
   } catch { return []; }
 }
 function readSetting(key: string, fallback: number, allowed: number[]): number {
@@ -86,17 +107,49 @@ function nameFromUrl(value: string): string {
 }
 function storedJobToItem(row: StoredJob): Item {
   const kind: Kind = row.kind === "hls" ? "hls" : row.kind === "dash" ? "dash" : row.kind === "ytdlp" ? "ytdlp" : "direct";
-  const status: Status = (["Queued", "Downloading", "Paused", "Completed", "Failed", "Interrupted", "Cancelled"].includes(row.state) ? row.state : "Failed") as Status;
+  const rawStatus: Status = (["Queued", "Downloading", "Pausing", "Paused", "Completed", "Failed", "Interrupted", "Cancelled"].includes(row.state) ? row.state : "Failed") as Status;
+  // Slice 6 fix round 2 (focused re-audit MAJOR + MINOR): readItems'
+  // recovery mapping is dead code unless stored rows get the same
+  // treatment — the seeding effect lets stored rows win by id, so a
+  // live recording closed mid-flight came back Downloading (wedged:
+  // no Pause target, no Resume, no Cancel, no Remove, and one
+  // parallel slot eaten forever), and a VOD job came back Downloading
+  // instead of Queued "Recovering saved partial download…". This
+  // mirrors readItems' mapping exactly, including the Queued case:
+  // a live Queued row WITH a target is a resume-queued recording
+  // from before the fix; a live Queued row WITHOUT one is a schedule
+  // that never started, and stays Queued. "Pausing" is in the list
+  // even though the durable JobState enum has no such variant
+  // (sync maps it to Queued/Interrupted) — a row carrying it must
+  // still recover like Downloading, never fall through to "Failed".
+  let status = rawStatus;
+  let detail = row.detail || "";
+  if (row.live && row.targetPath && (rawStatus === "Downloading" || rawStatus === "Pausing" || rawStatus === "Queued")) {
+    status = "Paused";
+    detail = "Paused · partial recording kept";
+  } else if (rawStatus === "Downloading" || rawStatus === "Pausing") {
+    if (row.targetPath) {
+      status = "Queued";
+      detail = "Recovering saved partial download…";
+    } else {
+      status = "Interrupted";
+      detail = "App closed before a resumable checkpoint was created";
+    }
+  }
   const percent = row.percent !== undefined
     ? Math.max(0, Math.min(100, row.percent))
     : row.total ? Math.max(0, Math.min(100, Math.round(row.downloaded / row.total * 100))) : 0;
   return {
     id: row.id, name: row.name || nameFromUrl(row.url), url: row.url, kind, status, percent,
-    downloaded: row.downloaded, total: row.total, detail: row.detail || "",
+    downloaded: row.downloaded, total: row.total, detail,
     error: row.error, createdAt: row.createdAtMs, targetPath: row.targetPath,
     scheduledAt: row.scheduledAtMs, representationId: row.representationId,
     audioRepresentationId: row.audioRepresentationId,
-    segmentsDone: row.segmentsDone, segmentsTotal: row.segmentsTotal
+    segmentsDone: row.segmentsDone, segmentsTotal: row.segmentsTotal,
+    // Slice 6 fix (MAJOR): restore the live flag, or a live row
+    // re-seeded from the durable store loses live routing and takes
+    // the VOD start path, which rejects live playlists.
+    live: row.live ? true : undefined
   };
 }
 function itemToSyncJob(item: Item) {
@@ -106,7 +159,10 @@ function itemToSyncJob(item: Item) {
     targetPath: item.targetPath ?? null, createdAt: item.createdAt,
     scheduledAt: item.scheduledAt ?? null, representationId: item.representationId ?? null,
     audioRepresentationId: item.audioRepresentationId ?? null, detail: item.detail,
-    error: item.error ?? null
+    error: item.error ?? null,
+    // Slice 6 fix (MAJOR): carry the live flag, or a live row synced
+    // to the durable store loses it and comes back as VOD.
+    live: item.live ?? false
   };
 }
 function pageInfo(page: Page) {
@@ -125,9 +181,12 @@ function Status({ value }: { value: Status }) {
 // Statuses for which Cancel is offered — the same set the row actions
 // use, so the Scheduler page can never offer a Cancel the backend
 // silently ignores (a completed job has no live task to cancel).
+// Live recordings are never cancellable: a live partial file IS the
+// recording, and Pause — not Cancel — is how a live recording stops
+// (Slice 6 fix, MAJOR).
 const CANCELLABLE_STATUSES: Status[] = ["Downloading", "Pausing", "Paused", "Failed", "Interrupted", "Queued"];
 function canCancel(item: Item): boolean {
-  return CANCELLABLE_STATUSES.includes(item.status);
+  return !item.live && CANCELLABLE_STATUSES.includes(item.status);
 }
 // The row × button never shows while a transfer is live or
 // cancelling; browser jobs additionally need a state the companion can
@@ -204,6 +263,13 @@ export default function App() {
   const [nativeBanner, setNativeBanner] = useState<"missing-id" | "register-failed" | null>(null);
   const [nativeBannerDismissed, setNativeBannerDismissed] = useState(false);
   const [extensionFileStatus, setExtensionFileStatus] = useState("");
+  // Slice 6: clipboard watcher + LinkGrabber. Off by default — the
+  // user turns it on in Settings. The seen set lives in a ref so a
+  // URL is never offered twice in one app session.
+  const [clipboardWatch, setClipboardWatch] = useState(() => localStorage.getItem(CLIPBOARD_WATCH_KEY) === "1");
+  const [grabbedLinks, setGrabbedLinks] = useState<string[]>([]);
+  const [linkGrabberOpen, setLinkGrabberOpen] = useState(false);
+  const seenClipboardUrls = useRef(new Set<string>());
   const [extensionFileSaving, setExtensionFileSaving] = useState(false);
   const [ffmpegPath, setFfmpegPath] = useState("ffmpeg");
   const [ffmpegStatus, setFfmpegStatus] = useState("");
@@ -322,6 +388,37 @@ export default function App() {
   useEffect(() => { localStorage.setItem(HISTORY_KEY, JSON.stringify(items)); }, [items]);
   useEffect(() => { localStorage.setItem(CONNECTIONS_KEY, String(connections)); }, [connections]);
   useEffect(() => { localStorage.setItem(PARALLEL_KEY, String(parallel)); }, [parallel]);
+  useEffect(() => { localStorage.setItem(CLIPBOARD_WATCH_KEY, clipboardWatch ? "1" : "0"); }, [clipboardWatch]);
+  // Slice 6: clipboard watcher. Opt-in, default off, and it reads the
+  // clipboard ONLY while this window is focused — copying a link in
+  // another app never triggers it. A copied media link (or a
+  // YouTube/social page URL) opens the LinkGrabber dialog; nothing
+  // starts on its own, and a URL already queued or already shown is
+  // never offered again. A denied clipboard permission just skips
+  // that tick — no error, no nag.
+  useEffect(() => {
+    if (!clipboardWatch) return;
+    const timer = window.setInterval(async () => {
+      if (!document.hasFocus()) return;
+      let text: string;
+      try { text = await navigator.clipboard.readText(); } catch { return; }
+      if (!text) return;
+      const found = text.match(/https?:\/\/[^\s"'<>]+/gi) || [];
+      const fresh: string[] = [];
+      for (const raw of found) {
+        const url = raw.replace(/[),.;]+$/, "");
+        if (seenClipboardUrls.current.has(url)) continue;
+        seenClipboardUrls.current.add(url);
+        if (itemsRef.current.some((item) => item.url === url)) continue;
+        if (isClipboardMediaUrl(url)) fresh.push(url);
+      }
+      if (fresh.length) {
+        setGrabbedLinks((current) => [...current, ...fresh.filter((url) => !current.includes(url))]);
+        setLinkGrabberOpen(true);
+      }
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [clipboardWatch]);
   useEffect(() => {
     localStorage.setItem(SPEED_LIMIT_KEY, String(speedLimit));
     void invoke("set_speed_limit", { bytesPerSecond: speedLimit }).catch((error) => setNotice("Could not apply speed limit: " + String(error)));
@@ -426,6 +523,7 @@ export default function App() {
           percent?: number; downloaded?: number; total?: number | null; detail?: string;
           error?: string; createdAt?: number; targetPath?: string;
           representationId?: string; audioRepresentationId?: string;
+          live?: boolean;
         }>>("get_native_downloads");
         if (disposed) return;
         const external: Item[] = jobs.map((job) => ({
@@ -443,7 +541,11 @@ export default function App() {
           targetPath: job.targetPath,
           representationId: job.representationId,
           audioRepresentationId: job.audioRepresentationId,
-          source: "native"
+          source: "native",
+          // Slice 6 fix (MAJOR): carry the companion's live flag, or
+          // a browser-started live recording shows Resume/Cancel
+          // buttons that destroy it.
+          live: job.live ? true : undefined
         }));
         setItems((current) => {
           const merged = new Map(current.filter((item) => item.source !== "native").map((item) => [item.id, item]));
@@ -512,13 +614,25 @@ export default function App() {
         }),
         listen<{ jobId: string; targetPath: string }>("download-paused", ({ payload }) => {
           setItems((current) => current.map((item) => item.id === payload.jobId
-            ? { ...item, status: "Paused", targetPath: payload.targetPath, detail: "Paused · partial file saved", error: undefined }
+            // Slice 6 fix round 2 (nit 3): a live recording has no
+            // checkpoint, so "partial file saved" is the wrong words
+            // for it — the partial IS the recording.
+            ? { ...item, status: "Paused", targetPath: payload.targetPath, detail: item.live ? "Paused · partial recording kept" : "Paused · partial file saved", error: undefined }
             : item));
         }),
         listen<{ jobId: string }>("download-cancelled", ({ payload }) => {
           speedSamples.current.delete(payload.jobId);
           setItems((current) => current.map((item) => item.id === payload.jobId
-            ? { ...item, status: "Cancelled", detail: "Cancelled · partial file removed", targetPath: undefined, downloaded: 0, percent: 0, scheduledAt: undefined }
+            // Slice 6 fix round 2 (nit 2, defense-in-depth): the live
+            // finish arms emit this event too, and a live partial file
+            // IS the recording — never wipe its target or claim it was
+            // removed. No UI path cancels a live job today (every
+            // cancel call site is live-gated), so this is the
+            // finishing race only, but the row must stay honest if it
+            // ever fires: the recording stays on disk, with its size.
+            ? item.live
+              ? { ...item, status: "Cancelled", detail: "Recording stopped · partial file kept", scheduledAt: undefined }
+              : { ...item, status: "Cancelled", detail: "Cancelled · partial file removed", targetPath: undefined, downloaded: 0, percent: 0, scheduledAt: undefined }
             : item));
         }),
 listen<{ jobId: string; error: string; targetPath?: string }>("download-error", ({ payload }) => {
@@ -566,11 +680,21 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           });
           setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, targetPath } : entry));
         } else if (item.kind === "hls") {
-          // Pass the paused/failed job's target back so the backend
+          // Slice 6: a live row records the stream as it arrives —
+          // the live command keeps the partial .ts file on pause,
+          // because the partial file IS the recording. A live row only
+          // ever reaches this command as a brand-new recording: there
+          // is NO checkpoint to reuse, and the engine re-records from
+          // the live edge and truncates the target — so no live row is
+          // ever re-queued on an existing target (Pause is terminal;
+          // see resume()/readItems). The VOD half of this branch
           // reuses its on-disk checkpoint instead of reserving a fresh
           // target and restarting from scratch. The returned path is
-          // stored so Cancel works while the job is running.
-          const targetPath = await invoke<string>("start_hls_download", { jobId: item.id, url: item.url, representationId: item.representationId || null, audioRepresentationId: item.audioRepresentationId || null, filename: item.name, targetPath: item.targetPath || null, scheduledAt: null });
+          // stored so Cancel works while the job is running (VOD only
+          // — Cancel is never offered for live).
+          const targetPath = item.live
+            ? await invoke<string>("start_hls_live_download", { jobId: item.id, url: item.url, representationId: item.representationId || null, audioRepresentationId: item.audioRepresentationId || null, filename: item.name, targetPath: item.targetPath || null, scheduledAt: null })
+            : await invoke<string>("start_hls_download", { jobId: item.id, url: item.url, representationId: item.representationId || null, audioRepresentationId: item.audioRepresentationId || null, filename: item.name, targetPath: item.targetPath || null, scheduledAt: null });
           setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, targetPath } : entry));
         } else if (item.kind === "dash") {
           // Pass the paused/failed job's target back so the backend
@@ -597,7 +721,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     });
   }, [items, active, parallel, connections, clock]);
 
-  async function add(value: string, saveAs?: string, requestedKind?: Kind, representationId?: string, audioRepresentationId?: string) {
+  async function add(value: string, saveAs?: string, requestedKind?: Kind, representationId?: string, audioRepresentationId?: string, live?: boolean) {
     const clean = value.trim();
     if (!/^https?:\/\//i.test(clean)) { setNotice("Enter a valid HTTP or HTTPS URL."); return; }
     let kind: Kind = requestedKind || "direct";
@@ -651,6 +775,11 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       id: crypto.randomUUID(), name: (saveAs || "").trim() || (kind === "hls" || kind === "dash" ? "video.mp4" : suggested),
       url: clean, kind, status: "Queued", percent: 0, downloaded: 0,
       representationId, audioRepresentationId,
+      // Slice 6: only an HLS row can be live — the queue effect
+      // routes it to the live recorder; yt-dlp live and DASH live
+      // never take this path (yt-dlp handles its own, DASH live is
+      // refused by the engine).
+      live: live === true && kind === "hls" ? true : undefined,
       detail: scheduledAt ? "Scheduled for " + new Date(scheduledAt).toLocaleString() : "Waiting in queue",
       createdAt: Date.now(),
       scheduledAt
@@ -678,11 +807,23 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
         await invoke("pause_download", { jobId: item.id });
       }
       setItems((current) => current.map((entry) => entry.id === item.id
-        ? { ...entry, status: "Pausing", detail: "Pausing · saving checkpoint…" }
+        // Slice 6 fix round 2 (nit 3): a live recording has no
+        // checkpoint to save — the pause keeps the partial recording.
+        ? { ...entry, status: "Pausing", detail: item.live ? "Pausing · keeping partial recording…" : "Pausing · saving checkpoint…" }
         : entry));
     } catch (error) { setNotice(String(error)); }
   }
   async function resume(item: Item) {
+    // Slice 6 fix (MAJOR): Pause is terminal for a live recording —
+    // there is no checkpoint to resume from, and re-queuing the same
+    // target would re-record over the kept partial. A live job never
+    // reaches this function through the UI (Resume is not offered for
+    // live jobs); this guard is the last line of defence if a caller
+    // bypasses those gates — it routes to a fresh recording instead.
+    if (item.live) {
+      retry(item);
+      return;
+    }
     if (item.source === "native") {
       if (item.status === "Interrupted" && item.targetPath) {
         // The browser companion has exited. Hand its persistent checkpoint
@@ -729,13 +870,19 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       try {
         if (item.status === "Interrupted") {
           // No native process owns this job anymore: delete its orphaned
-          // checkpoint locally (if any) and drop its record.
+          // checkpoint locally (if any) and drop its record. A live
+          // recording has no checkpoint — the backend keeps its partial
+          // file, so the row keeps its target and says so (Slice 6 fix,
+          // MAJOR). Cancel is never offered for live jobs, so this is
+          // only reachable if a caller bypasses the button gates.
           if (item.targetPath) {
             await invoke("cancel_download", { jobId: item.id, targetPath: item.targetPath });
           }
           await invoke("dismiss_native_download", { jobId: item.id.replace(/^native-/, "") }).catch(() => {});
           setItems((current) => current.map((entry) => entry.id === item.id
-            ? { ...entry, status: "Cancelled", targetPath: undefined, downloaded: 0, percent: 0, detail: "Cancelled · checkpoint removed" }
+            ? item.live
+              ? { ...entry, status: "Cancelled", detail: "Recording stopped · partial file kept" }
+              : { ...entry, status: "Cancelled", targetPath: undefined, downloaded: 0, percent: 0, detail: "Cancelled · checkpoint removed" }
             : entry));
         } else {
           // Direct, HLS and DASH browser jobs alike: the companion owns
@@ -760,7 +907,11 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     try {
       await invoke("cancel_download", { jobId: item.id, targetPath: item.targetPath });
       setItems((current) => current.map((entry) => entry.id === item.id
-        ? { ...entry, status: "Cancelling", detail: "Cancelling and deleting partial file…" }
+        // Slice 6 fix (MAJOR): Cancel is never offered for live jobs,
+        // so this is only reachable if a caller bypasses the button
+        // gates — the backend keeps a live target either way, so the
+        // detail must not claim the partial was deleted.
+        ? { ...entry, status: "Cancelling", detail: item.live ? "Cancelling…" : "Cancelling and deleting partial file…" }
         : entry));
     } catch (error) { setNotice(String(error)); }
   }
@@ -770,8 +921,12 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       await invoke("cancel_app_wake", { jobId: item.id }).catch(() => {});
     }
     // A live browser job is cancelled, not removed: the × button on an
-    // active native job acts as Cancel (all kinds alike).
-    if (item?.source === "native"
+    // active native job acts as Cancel (all kinds alike). A live
+    // recording is the exception — its companion's job already ended
+    // when it paused or failed, so there is no live task to cancel;
+    // fall through to the dismiss below, which drops the stale record
+    // and keeps the recording file. (Slice 6 fix, MAJOR.)
+    if (item?.source === "native" && !item.live
         && ["Downloading", "Pausing", "Paused", "Failed"].includes(item.status)) {
       await cancel(item);
       return;
@@ -781,12 +936,17 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       // its own cancel_download — only an Interrupted job (no companion
       // left) has its orphaned files removed locally. Dismissing asks a
       // live companion to cancel first and waits for it, so the companion
-      // cannot resurrect the record afterwards.
-      if (item.status === "Interrupted" && item.targetPath) {
+      // cannot resurrect the record afterwards. A live Interrupted job
+      // is the exception: its partial file IS the recording, so the
+      // backend must not delete it (Slice 6 fix, MAJOR — cancel_download
+      // skips target deletion for live rows, prefixed id included).
+      if (item.status === "Interrupted" && item.targetPath && !item.live) {
         await invoke("cancel_download", { jobId: item.id, targetPath: item.targetPath }).catch(() => {});
       }
       await invoke("dismiss_native_download", { jobId: item.id.replace(/^native-/, "") }).catch(() => {});
-    } else if (item?.targetPath && item.status !== "Completed") {
+    } else if (item?.targetPath && item.status !== "Completed" && !item.live) {
+      // Slice 6 fix (MAJOR): never call cancel_download for a live
+      // recording — removing the row is enough; the file is kept.
       await invoke("cancel_download", { jobId: item.id, targetPath: item.targetPath }).catch(() => {});
     }
     // Slice 5: drop the durable row too, or a removed job would be
@@ -800,6 +960,14 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     setItems((current) => current.filter((entry) => entry.id !== id || entry.status === "Downloading" || entry.status === "Pausing"));
   }
   function retry(item: Item) {
+    // Slice 6 fix (MAJOR): a live recording has no checkpoint — a
+    // retry is a FRESH recording on a fresh target, never the old one.
+    // Re-queueing the same target would re-record over the kept
+    // partial; the old partial stays on disk.
+    if (item.live) {
+      add(item.url, item.name, item.kind, item.representationId, item.audioRepresentationId, true);
+      return;
+    }
     // A job with a checkpoint on disk resumes from it — a browser job
     // through its companion, a desktop job through the desktop engine.
     // Without a checkpoint there is nothing to resume, so a fresh
@@ -908,6 +1076,20 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       setGrabbing(false);
     }
   }
+  // Slice 6: a subtitle track from the inspected variants. An HLS
+  // subtitle playlist (.m3u8) is assembled into one .vtt file by the
+  // backend; a direct subtitle file (vtt/ttml/srt) is just a direct
+  // download and queues like any other file.
+  async function downloadSubtitle(subtitle: SubtitleVariant) {
+    if (subtitle.format === "m3u8") {
+      try {
+        const path = await invoke<string>("download_subtitles", { playlistUrl: subtitle.url, filename: (subtitle.name || subtitle.language || "subtitles") + ".vtt" });
+        setVideoNotice("Saved · " + path);
+      } catch (error) { setVideoNotice(String(error)); }
+    } else {
+      void add(subtitle.url);
+    }
+  }
   async function downloadGrabbed() {
     const chosen = grabbed.filter((item) => grabChecked[item.url]);
     if (!chosen.length) return;
@@ -930,7 +1112,18 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           if (!best) { failed += 1; continue; }
           add(item.url, item.name, "dash", best.representationId, best.audioRepresentationId);
         } else if (item.kind === "hls") {
-          add(item.url, item.name, "hls");
+          // Inspect first, like DASH: a live playlist must queue
+          // through the live recorder, not the VOD path (which
+          // rejects it). If the inspect fails, queue it exactly as
+          // before — the start call surfaces the real error then.
+          try {
+            const result = await invoke<Variant[]>("inspect_video_url", { url: item.url, referer: grabUrl.trim() });
+            const variants = result.filter((variant) => variant.downloadable && variant.url);
+            variants.sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bandwidth || 0) - (a.bandwidth || 0));
+            const best = variants[0];
+            if (best?.isLive) add(item.url, item.name, "hls", best.url, best.audioRepresentationId, true);
+            else add(item.url, item.name, "hls");
+          } catch { add(item.url, item.name, "hls"); }
         } else {
           add(item.url, item.name, "direct");
         }
@@ -1009,8 +1202,8 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
   function actionButtons(item: Item) {
     return <>
       {item.status === "Downloading" && <button className="quiet-button transfer-control" onClick={(event) => { event.stopPropagation(); void pause(item); }}>Pause</button>}
-      {item.status === "Paused" && <button className="quiet-button transfer-control" onClick={(event) => { event.stopPropagation(); void resume(item); }}>Resume</button>}
-      {(item.status === "Failed" || item.status === "Interrupted") && <button className="quiet-button transfer-control" onClick={(event) => { event.stopPropagation(); void retry(item); }}>{item.targetPath ? "Resume" : "Retry"}</button>}
+      {item.status === "Paused" && !item.live && <button className="quiet-button transfer-control" onClick={(event) => { event.stopPropagation(); void resume(item); }}>Resume</button>}
+      {(item.status === "Failed" || item.status === "Interrupted") && <button className="quiet-button transfer-control" onClick={(event) => { event.stopPropagation(); void retry(item); }}>{item.targetPath && !item.live ? "Resume" : "Retry"}</button>}
       {canCancel(item) && <button className="quiet-button transfer-control" onClick={(event) => { event.stopPropagation(); void cancel(item); }}>Cancel</button>}
       {canRemove(item) && <button className="remove-button" title="Remove" aria-label="Remove" onClick={(event) => { event.stopPropagation(); void remove(item.id); }}>×</button>}
     </>;
@@ -1050,8 +1243,8 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     return <div className="context-overlay" onClick={() => setContextMenu(null)} onContextMenu={(event) => { event.preventDefault(); setContextMenu(null); }}>
       <div className="context-menu" style={{ left: contextMenu.x, top: contextMenu.y }} role="menu" onClick={(event) => event.stopPropagation()}>
         {item.status === "Downloading" && <button role="menuitem" onClick={() => { setContextMenu(null); void pause(item); }}>Pause</button>}
-        {item.status === "Paused" && <button role="menuitem" onClick={() => { setContextMenu(null); void resume(item); }}>Resume</button>}
-        {(item.status === "Failed" || item.status === "Interrupted") && <button role="menuitem" onClick={() => { setContextMenu(null); void retry(item); }}>{item.targetPath ? "Resume" : "Retry"}</button>}
+        {item.status === "Paused" && !item.live && <button role="menuitem" onClick={() => { setContextMenu(null); void resume(item); }}>Resume</button>}
+        {(item.status === "Failed" || item.status === "Interrupted") && <button role="menuitem" onClick={() => { setContextMenu(null); void retry(item); }}>{item.targetPath && !item.live ? "Resume" : "Retry"}</button>}
         {canCancel(item) && <button role="menuitem" onClick={() => { setContextMenu(null); void cancel(item); }}>Cancel</button>}
         {canRemove(item) && <><hr /><button role="menuitem" onClick={() => { setContextMenu(null); void remove(item.id); }}>Remove</button></>}
       </div>
@@ -1081,7 +1274,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           <div><dt>Saved to</dt><dd className="kv-wrap" title={item.targetPath || ""}>{item.targetPath || "Not started yet"}</dd></div>
           <div><dt>Created</dt><dd>{new Date(item.createdAt).toLocaleString()}</dd></div>
           {item.scheduledAt && <div><dt>Scheduled for</dt><dd>{new Date(item.scheduledAt).toLocaleString()}</dd></div>}
-          <div><dt>Resume capability</dt><dd>{item.targetPath ? "Yes — checkpoint saved" : "No"}</dd></div>
+          <div><dt>Resume capability</dt><dd>{item.live ? "No — live recording, Pause is terminal" : item.targetPath ? "Yes — checkpoint saved" : "No"}</dd></div>
           {item.error && <div><dt>Error</dt><dd className="error-text">{item.error}</dd></div>}
         </dl>
         <p className="inspector-detail">{item.detail}</p>
@@ -1133,6 +1326,31 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       </div>
     </div>;
   }
+  // Slice 6: LinkGrabber dialog (Direction A: same dialog shape as
+  // the grabber). It lists links the clipboard watcher caught — one
+  // Download button per link, nothing else inside. A YouTube/social
+  // page URL goes through the same inspect flow a paste would take,
+  // so the user still picks a format.
+  function linkGrabberDialog() {
+    if (!linkGrabberOpen) return null;
+    return <div className="dialog-overlay" role="dialog" aria-label="Link grabber" onClick={() => setLinkGrabberOpen(false)}>
+      <div className="dialog" onClick={(event) => event.stopPropagation()}>
+        <div className="dialog-head"><div><h2>Link grabber</h2></div><button className="remove-button" title="Close" aria-label="Close" onClick={() => setLinkGrabberOpen(false)}>×</button></div>
+        {grabbedLinks.length === 0
+          ? <div className="notice">No links waiting.</div>
+          : <div className="variants">
+            {grabbedLinks.map((url) => <div className="variant" key={url}>
+              <div><strong title={url}>{url.length > 64 ? url.slice(0, 64) + "…" : url}</strong></div>
+              <button className="secondary-button" onClick={() => {
+                void add(url);
+                setGrabbedLinks((current) => current.filter((entry) => entry !== url));
+              }}>Download</button>
+            </div>)}
+          </div>}
+        <div className="dialog-foot"><span className="connection-tag">{grabbedLinks.length} LINK{grabbedLinks.length === 1 ? "" : "S"}</span><button className="quiet-button" onClick={() => setLinkGrabberOpen(false)}>Done</button></div>
+      </div>
+    </div>;
+  }
   // Video grabber dialog (Direction A: the grabber is not a main-window
   // page — it is a dialog reachable from the Queues page and from the
   // Add form's "Inspect media qualities" link). Content is the old
@@ -1152,9 +1370,15 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           {videoNotice && <div className="notice">{videoNotice}</div>}
           {variants.length > 0 && <div className="variants"><div className="variants-heading"><h3>Available streams</h3><span>{variants.length} OPTIONS</span></div>
             {variants.map((variant, index) => <div className="variant" key={variant.url + index}>
-              <div><strong>{variant.quality}</strong><small>{variant.kind.toUpperCase()}{variant.width && variant.height ? " · " + variant.width + " × " + variant.height : ""}{variant.bandwidth ? " · " + Math.round(variant.bandwidth / 1000) + " kbps" : ""}</small>{variant.note && <p>{variant.note}</p>}</div>
-              <button className="secondary-button" disabled={!variant.downloadable} onClick={() => add(variant.kind === "dash" || variant.kind === "hls" ? videoUrl : variant.url, variant.kind === "ytdlp" ? (videoTitle ? videoTitle + ".mp4" : "video.mp4") : "video.mp4", variant.kind === "hls" ? "hls" : variant.kind === "dash" ? "dash" : variant.kind === "ytdlp" ? "ytdlp" : "direct", variant.kind === "hls" ? variant.url : variant.representationId, variant.audioRepresentationId)}>{variant.downloadable ? "Download" : "Unavailable"}</button>
+              <div><strong>{variant.isLive ? "Live · " : ""}{variant.quality}</strong><small>{variant.kind.toUpperCase()}{variant.width && variant.height ? " · " + variant.width + " × " + variant.height : ""}{variant.bandwidth ? " · " + Math.round(variant.bandwidth / 1000) + " kbps" : ""}{variant.fps ? " · " + Math.round(variant.fps) + " fps" : ""}</small>{variant.note && <p>{variant.note}</p>}</div>
+              <button className="secondary-button" disabled={!variant.downloadable} onClick={() => add(variant.kind === "dash" || variant.kind === "hls" ? videoUrl : variant.url, variant.kind === "ytdlp" ? (videoTitle ? videoTitle + ".mp4" : "video.mp4") : "video.mp4", variant.kind === "hls" ? "hls" : variant.kind === "dash" ? "dash" : variant.kind === "ytdlp" ? "ytdlp" : "direct", variant.kind === "hls" ? variant.url : variant.representationId, variant.audioRepresentationId, variant.isLive)}>{variant.downloadable ? "Download" : "Unavailable"}</button>
             </div>)}
+            {variants[0]?.subtitles && variants[0].subtitles.length > 0 && <div className="variants"><div className="variants-heading"><h3>Subtitles</h3><span>{variants[0].subtitles.length} TRACKS</span></div>
+              {variants[0].subtitles.map((subtitle) => <div className="variant" key={subtitle.url}>
+                <div><strong>{subtitle.name || subtitle.language}</strong><small>{subtitle.language} · {subtitle.format.toUpperCase()}</small></div>
+                <button className="secondary-button" onClick={() => void downloadSubtitle(subtitle)}>Download</button>
+              </div>)}
+            </div>}
           </div>}
           <div className="rule" />
           <div className="variants-heading"><h3>Grab a page</h3><span>SAME-PAGE ONLY · MAX 100</span></div>
@@ -1177,7 +1401,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
               <label className="grab-item"><input type="checkbox" checked={!!grabChecked[item.url]} onChange={(event) => setGrabChecked((current) => ({ ...current, [item.url]: event.target.checked }))} /><span><strong>{item.name}</strong><small>{item.kind.toUpperCase()} · {hostOf(item.url)}</small></span></label>
             </div>)}
           </div>}
-          <div className="support-note"><strong>Format support</strong><p>Direct HTTP/HTTPS files use resumable transfers. HLS supports completed unencrypted VOD, with Pause/Resume/Cancel. DASH supports static MPDs with SegmentTemplate/SegmentTimeline, SegmentList, SegmentBase and multi-period, with Pause/Resume/Cancel; separate audio/video requires FFmpeg. Live/dynamic MPDs and DRM are not supported. YouTube and social video pages are inspected with yt-dlp — paste a video page URL above and pick a format; yt-dlp and Deno download on first use from Settings. "Grab a page" below lists media files a page links to directly.</p></div>
+          <div className="support-note"><strong>Format support</strong><p>Direct HTTP/HTTPS files use resumable transfers. HLS supports completed unencrypted VOD, with Pause/Resume/Cancel. Live HLS streams can be recorded as they arrive — the partial file is kept when you stop. DASH supports static MPDs with SegmentTemplate/SegmentTimeline, SegmentList, SegmentBase and multi-period, with Pause/Resume/Cancel; separate audio/video requires FFmpeg. Live/dynamic MPDs and DRM are not supported. YouTube and social video pages are inspected with yt-dlp — paste a video page URL above and pick a format; yt-dlp and Deno download on first use from Settings. "Grab a page" below lists media files a page links to directly.</p></div>
         </div>
       </div>
     </div>;
@@ -1263,6 +1487,10 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
             </select></label>
           </div>
           <div className="rule" />
+          <div className="settings-section"><div><h2>Clipboard watcher</h2><p>Watch the clipboard for media links while this app is focused.</p></div>
+            <label className="setting-row"><span><strong>Watch clipboard for links</strong><small>Off by default. When on, a copied media link opens the LinkGrabber dialog — nothing downloads on its own. Only while this app is focused.</small></span><input type="checkbox" checked={clipboardWatch} onChange={(event) => setClipboardWatch(event.target.checked)} /></label>
+          </div>
+          <div className="rule" />
           <div className="settings-section"><div><h2>Storage</h2><p>ThunderLoad uses a dedicated folder in your system Downloads directory.</p></div><div className="storage-row"><span>Downloads / ThunderLoad</span><button className="secondary-button" onClick={openFolder}>Open folder ↗</button></div></div>
           <div className="rule" />
           <div className="settings-section">
@@ -1343,7 +1571,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
             <p className="footnote">Tools folder: {ytdlpTools ? ytdlpTools.toolsDir : "…"}</p>
           </div>
           <div className="rule" />
-          <div className="settings-section"><div><h2>About</h2><p>Local desktop transfer engine · Version 0.3.4</p></div><div className="about-line"><span>Supported media</span><strong>Direct files · HLS VOD · Static DASH VOD · YouTube &amp; social (yt-dlp)</strong></div><div className="about-line"><span>Direct downloads</span><strong>Pause · Resume · Cancel · Speed limit · Schedule</strong></div><div className="about-line"><span>Still in development</span><strong>Multi-connection resume · Live DASH</strong></div></div>
+          <div className="settings-section"><div><h2>About</h2><p>Local desktop transfer engine · Version 0.3.4</p></div><div className="about-line"><span>Supported media</span><strong>Direct files · HLS VOD · Live HLS recording · Static DASH VOD · YouTube &amp; social (yt-dlp)</strong></div><div className="about-line"><span>Direct downloads</span><strong>Pause · Resume · Cancel · Speed limit · Schedule</strong></div><div className="about-line"><span>Still in development</span><strong>Multi-connection resume · Live DASH</strong></div></div>
         </section>}
 
       </div>
@@ -1353,6 +1581,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     </main>
     {addDialog()}
     {grabberDialog()}
+    {linkGrabberDialog()}
     {contextMenuPanel()}
   </div>;
 }

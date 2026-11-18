@@ -115,6 +115,9 @@ function ensureNativePort() {
     pendingRequests.clear();
     api.runtime.sendMessage({ type: "NATIVE_DISCONNECTED" }).catch(() => {});
   });
+  // Slice 6: the port is back — retry any intercepted download that
+  // was waiting for the desktop app.
+  setTimeout(() => { flushInterceptQueue(); }, 0);
   return nativePort;
 }
 async function requestNative(action, payload = {}, timeoutMs = 30000) {
@@ -127,7 +130,7 @@ async function requestNative(action, payload = {}, timeoutMs = 30000) {
   // re-checks the origin on every request, so the session never leaves
   // the user's machine and is never sent to any other origin. Only the
   // six download/inspect actions get a session.
-  if (["download.start", "video.download", "dash.download", "video.inspect", "ytdlp.inspect", "ytdlp.download"].includes(action) && payload?.url) {
+  if (["download.start", "video.download", "dash.download", "video.inspect", "ytdlp.inspect", "ytdlp.download", "hls.subtitles.download"].includes(action) && payload?.url) {
     payload = { ...payload, session: await sessionForUrl(payload.url) };
   }
   return new Promise((resolve) => {
@@ -218,7 +221,11 @@ async function quickDownloadMedia({ url, kind, pageUrl, filename, selectedVarian
     filename: selected.kind === "hls" || selected.kind === "dash" ? (name.replace(/\.[^.]+$/, "") + ".mp4") : name,
     referer: pageUrl || "",
     representationId: selected.representationId,
-    audioRepresentationId: selected.audioRepresentationId || ""
+    audioRepresentationId: selected.audioRepresentationId || "",
+    // Slice 6: a live row records the stream as it arrives instead of
+    // downloading a finished file — the host routes it to the live
+    // recorder, which keeps the partial as the recording.
+    live: !!(selected.isLive || selected.is_live)
   });
   if (result?.ok) {
     // jobId lets the panel show live progress for this download
@@ -273,11 +280,108 @@ async function interceptDownload(downloadItem) {
   const filename = cleanDownloadFilename(fromItem, safeFilenameFromUrl(downloadItem.url, "download.bin"));
   try { await downloadsCancel(downloadItem.id); } catch (_) { /* Already finished or gone. */ }
   try { await downloadsErase(downloadItem.id); } catch (_) { /* History entry already gone. */ }
-  const native = await requestNative("download.start", { url: downloadItem.url, filename, referer: downloadItem.referrer || "" });
-  if (!native?.ok) await browserDownload(downloadItem.url, filename);
+  // Slice 6: the handoff is queued, not fire-and-forget — if the
+  // native port is down the download waits for the desktop app
+  // instead of being silently dropped.
+  queueIntercept(downloadItem.url, filename, downloadItem.referrer || "");
 }
 if (api.downloads?.onCreated) {
   api.downloads.onCreated.addListener((downloadItem) => { interceptDownload(downloadItem).catch(() => {}); });
+}
+
+// Slice 6: interception transport. An intercepted download that
+// cannot reach the native host is QUEUED and retried (5s, 15s, 30s)
+// — never silently dropped, never double-downloaded (dedupe by URL,
+// in-flight guard, entry removed before any fallback). When the
+// retries are exhausted the browser download runs exactly once as
+// the last resort; interceptDownload's byExtensionId check skips
+// extension-started downloads, so that fallback cannot loop back
+// into the queue. The queue is flushed when the native port comes
+// back (ensureNativePort) and every 30 s, so a download intercepted
+// while the desktop app was closed starts once the app opens.
+const INTERCEPT_RETRY_DELAYS_MS = [5000, 15000, 30000];
+const interceptQueue = new Map();
+// Slice 6: the queue survives a service-worker restart. A plain
+// in-memory Map would silently drop a download intercepted while the
+// desktop app was down the moment the worker was killed — the exact
+// loss this queue exists to prevent. Only the resumable fields are
+// stored (url, filename, referer, attempts); timers and the in-flight
+// flag are rebuilt on rehydrate, and a rehydrated entry retries at
+// once instead of waiting for its next delay.
+const INTERCEPT_QUEUE_KEY = "thunderload.interceptQueue.v1";
+function persistInterceptQueue() {
+  const saved = Array.from(interceptQueue.values()).map((entry) => ({ url: entry.url, filename: entry.filename, referer: entry.referer, attempts: entry.attempts }));
+  api.storage?.local?.set({ [INTERCEPT_QUEUE_KEY]: saved }).catch(() => {});
+}
+function pendingIntercepts() {
+  return Array.from(interceptQueue.values()).map((entry) => ({ url: entry.url, filename: entry.filename, attempts: entry.attempts }));
+}
+function flushInterceptQueue() {
+  for (const entry of Array.from(interceptQueue.values())) tryIntercept(entry).catch(() => {});
+}
+async function tryIntercept(entry) {
+  if (entry.inFlight) return;
+  entry.inFlight = true;
+  const native = await requestNative("download.start", { url: entry.url, filename: entry.filename, referer: entry.referer });
+  entry.inFlight = false;
+  if (native?.ok) {
+    clearTimeout(entry.timer);
+    interceptQueue.delete(entry.url);
+    persistInterceptQueue();
+    return;
+  }
+  entry.attempts += 1;
+  if (entry.attempts > INTERCEPT_RETRY_DELAYS_MS.length) {
+    interceptQueue.delete(entry.url);
+    persistInterceptQueue();
+    await browserDownload(entry.url, entry.filename);
+    return;
+  }
+  persistInterceptQueue();
+  entry.timer = setTimeout(() => { tryIntercept(entry).catch(() => {}); }, INTERCEPT_RETRY_DELAYS_MS[entry.attempts - 1]);
+}
+function queueIntercept(url, filename, referer) {
+  if (interceptQueue.has(url)) return;
+  const entry = { url, filename, referer, attempts: 0, timer: null, inFlight: false };
+  interceptQueue.set(url, entry);
+  persistInterceptQueue();
+  tryIntercept(entry).catch(() => {});
+}
+setInterval(() => { flushInterceptQueue(); }, 30000);
+// Rehydrate the queue after a worker restart (see above): entries
+// recorded before the restart retry at once — the desktop app may
+// already be back by now, so waiting for the next delay would waste
+// the restart.
+api.storage?.local?.get(INTERCEPT_QUEUE_KEY)
+  .then((stored) => {
+    const saved = Array.isArray(stored?.[INTERCEPT_QUEUE_KEY]) ? stored[INTERCEPT_QUEUE_KEY] : [];
+    for (const item of saved) {
+      if (!item?.url || interceptQueue.has(item.url)) continue;
+      interceptQueue.set(item.url, { url: item.url, filename: item.filename || safeFilenameFromUrl(item.url, "download.bin"), referer: item.referer || "", attempts: typeof item.attempts === "number" ? item.attempts : 0, timer: null, inFlight: false });
+    }
+    if (interceptQueue.size) flushInterceptQueue();
+  })
+  .catch(() => {});
+
+// Slice 6: Firefox blocking build. Firefox supports blocking
+// webRequest; Chrome MV3 does not. On Firefox only, a NAVIGATION to
+// a direct media file (link click, address bar, open in new tab) is
+// cancelled and handed to the intercept queue, so the desktop engine
+// takes the download over. Playlists (.m3u8/.mpd), segments and media
+// fetches are never blocked — cancelling those would break playback.
+// Guarded by the browser namespace, which only Firefox exposes, so
+// Chrome never runs this path (the Chrome manifest also does not
+// request webRequestBlocking — the validator asserts both).
+const IS_FIREFOX = typeof globalThis.browser !== "undefined";
+const MEDIA_FILE_NAV_EXT = /\.(?:mp4|m4v|mov|webm|mkv|avi|mp3|m4a|aac|wav|ogg|opus|flac|pdf|zip)(?:$|[?#])/i;
+if (IS_FIREFOX && api.webRequest?.onBeforeRequest) {
+  api.webRequest.onBeforeRequest.addListener((details) => {
+    if (!interceptEnabled) return {};
+    if (!/^https?:\/\//i.test(details.url || "")) return {};
+    if (!MEDIA_FILE_NAV_EXT.test(details.url)) return {};
+    queueIntercept(details.url, safeFilenameFromUrl(details.url, "download.bin"), details.initiator || "");
+    return { cancel: true };
+  }, { urls: ["<all_urls>"], types: ["main_frame", "sub_frame"] }, ["blocking"]);
 }
 
 api.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -362,7 +466,11 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
           sources = sources.filter((item) => !isGoogleVideoRow(item) && !item.isYouTubeDash);
         }
         sendResponse({ ok: true, tabId: tab.id, sources, pageUrl: tab.url || "", truncated: !!truncatedByTab.get(tab.id),
-          ytdlp: ytdlpForPage ? { variants: ytdlpForPage.variants, title: ytdlpForPage.title } : null });
+          ytdlp: ytdlpForPage ? { variants: ytdlpForPage.variants, title: ytdlpForPage.title } : null,
+          // Slice 6: downloads intercepted while the desktop app was
+          // down, still waiting for the handoff — the popup shows them
+          // so the user knows the file is not lost.
+          pendingIntercepts: pendingIntercepts() });
       } catch (error) {
         sendResponse({ ok: false, error: error?.message || "This page does not allow extension scanning" });
       }
@@ -436,6 +544,44 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ ok: true, variants, title, cached: false });
     })();
     return true;
+  }
+  // Slice 6: GenericIE fallback. When sniffing and the normal
+  // yt-dlp inspect found nothing usable for a page, the panel/popup
+  // ask for the generic extractor instead (`--force-generic-extractor`):
+  // yt-dlp reads whatever formats the page itself exposes. The result
+  // lives under a SEPARATE cache key (`generic:<url>`) and is never
+  // written to ytdlpByTab — a generic result must never overwrite a
+  // real inspect, and must never suppress the sniffed rows the way a
+  // real yt-dlp result does. The rows carry `generic: true` from the
+  // host and are rendered like any other quality rows — the quality
+  // shown is what the page carries, never a guessed label.
+  if (message?.type === "YTDLP_INSPECT_GENERIC") {
+    (async () => {
+      const pageUrl = message.pageUrl || "";
+      const cacheKey = "generic:" + pageUrl;
+      const cached = ytdlpCache.get(cacheKey);
+      if (cached && Date.now() - cached.at < YTDLP_CACHE_TTL_MS) {
+        sendResponse({ ok: true, variants: cached.variants, title: cached.title, cached: true, generic: true });
+        return;
+      }
+      const result = await requestNative("ytdlp.inspect", { url: pageUrl, referer: pageUrl, generic: true }, 65000);
+      if (!result?.ok) {
+        sendResponse({ ok: false, error: result?.error || "yt-dlp could not inspect this page.", toolsMissing: result?.toolsMissing || null });
+        return;
+      }
+      const variants = Array.isArray(result.data?.variants) ? result.data.variants : [];
+      const title = result.data?.title || "";
+      ytdlpCache.set(cacheKey, { variants, title, at: Date.now() });
+      pruneYtdlpCache();
+      sendResponse({ ok: true, variants, title, cached: false, generic: true });
+    })();
+    return true;
+  }
+  // Slice 6: the panel's live view of the intercept queue — how many
+  // downloads are waiting for the desktop app right now.
+  if (message?.type === "GET_INTERCEPT_STATUS") {
+    sendResponse({ ok: true, pending: pendingIntercepts() });
+    return false;
   }
   if (message?.type === "YTDLP_DOWNLOAD") {
     // Slice 5: same referer as the inspect — the download must carry

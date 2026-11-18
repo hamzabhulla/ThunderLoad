@@ -34,6 +34,13 @@ for (const [name,manifest] of [["Chromium",chromium],["Firefox",firefox]]) {
   if (!hook || !hook.js?.includes("hook.js") || hook.run_at !== "document_start" || hook.all_frames !== true) throw new Error(name+" must inject hook.js in the MAIN world at document_start (all frames)");
 }
 if (!firefox.browser_specific_settings?.gecko?.id) throw new Error("Firefox manifest needs a stable Gecko add-on ID");
+// Slice 6: Firefox blocking build + GenericIE + interception transport
+// + live/subtitles. Firefox — and only Firefox — requests
+// webRequestBlocking so the background can cancel a navigation to a
+// direct media file and hand it to the desktop engine; Chrome MV3
+// cannot block, so its manifest must NOT carry the permission.
+if (!firefox.permissions?.includes("webRequestBlocking")) throw new Error("Firefox manifest must request webRequestBlocking for the blocking download handoff");
+if (chromium.permissions?.includes("webRequestBlocking")) throw new Error("Chromium manifest must NOT request webRequestBlocking (MV3 cannot block)");
 // Slice 3: yt-dlp routing contract. The background must handle the
 // new YTDLP message types; the panel and popup must show the tool by
 // name on the consent + progress steps ("yt-dlp download ho raha
@@ -65,4 +72,26 @@ if (!background.includes("referer: pageUrl") || !background.includes("referer: m
 if (!background.includes("jobId")) throw new Error("background.js must pass the native jobId through to the panel");
 if (!content.includes("p-progress") || !content.includes("download.progress")) throw new Error("content.js must show live download progress in the panel");
 if (!content.includes("p-title-text")) throw new Error("content.js must show the video/page title at the top of the panel");
+// Slice 6: Firefox blocking build + GenericIE + interception transport
+// + live/subtitles. The generic result lives on a separate cache key
+// and never overwrites a real inspect; an intercepted download is
+// queued and retried instead of dropped; the panel/popup show live
+// rows, subtitle tracks, and the waiting-intercept note.
+if (!background.includes('"YTDLP_INSPECT_GENERIC"')) throw new Error("background.js must handle the GenericIE fallback inspect");
+if (!background.includes("generic: true") || !background.includes("generic:")) throw new Error("background.js must keep generic results on a separate cache key and never let them overwrite a real inspect");
+if (!background.includes("queueIntercept") || !background.includes("INTERCEPT_RETRY_DELAYS_MS")) throw new Error("background.js must queue an intercepted download and retry the handoff instead of dropping it");
+if (!background.includes("thunderload.interceptQueue.v1")) throw new Error("background.js must persist the intercept queue so a worker restart cannot drop a waiting download");
+if (!background.includes('"GET_INTERCEPT_STATUS"')) throw new Error("background.js must report the waiting intercept queue to the panel/popup");
+if (!background.includes("onBeforeRequest") || !background.includes('"blocking"')) throw new Error("background.js must cancel direct-media navigations on Firefox only");
+if (!background.includes("hls.subtitles.download")) throw new Error("background.js must forward subtitle downloads to the native host");
+for (const [name, text] of [["content.js", content], ["popup.js", popup]]) {
+  if (!text.includes("Live · ")) throw new Error(name + " must prefix live rows with Live");
+  if (!text.includes("subtitles")) throw new Error(name + " must surface subtitle tracks");
+}
+// The panel asks the background directly (GET_INTERCEPT_STATUS); the
+// popup reads the same queue from GET_ACTIVE_SOURCES' response
+// (pendingIntercepts) — both must show the waiting-intercept note.
+if (!content.includes("GET_INTERCEPT_STATUS")) throw new Error("content.js must show the waiting-intercept note");
+if (!popup.includes("pendingIntercepts")) throw new Error("popup.js must show the waiting-intercept note");
+if (!content.includes("YTDLP_INSPECT_GENERIC") || !popup.includes("YTDLP_INSPECT_GENERIC")) throw new Error("content.js and popup.js must trigger the GenericIE fallback when nothing was found");
 console.log("Extension manifests and required assets are valid.");
