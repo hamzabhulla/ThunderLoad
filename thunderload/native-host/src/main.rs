@@ -10,7 +10,7 @@ use anyhow::{anyhow, Result};
 use std::{collections::HashMap, sync::{Arc, Mutex, OnceLock}};
 use serde_json::{json, Value};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::{mpsc, watch}};
-use thunderload_engine::{check_ytdlp_update, dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_live, download_hls_resumable, download_hls_subtitles, download_page, download_url_resumable, ensure_tool, error_text, hls_output_extension, hls_work_dir, inspect_page_with, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, tool_status, tools_dir, DownloadControl, DownloadOutcome, GlobalRateLimiter, HlsSelection, SessionHeaders, ToolDownloadProgress, ToolsMissing, YtDlpTool};
+use thunderload_engine::{check_ytdlp_update, dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_live, download_hls_resumable, download_hls_subtitles, download_page, download_url_resumable, ensure_tool, error_text, hls_output_extension, hls_work_dir, inspect_page_with, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, tool_status, tools_dir, DownloadControl, DownloadOutcome, GlobalRateLimiter, HlsSelection, SessionHeaders, ToolDownloadProgress, ToolsMissing, YtDlpTool, DEFAULT_RESUMABLE_CONNECTIONS};
 
 const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 
@@ -151,6 +151,14 @@ fn apply_native_progress(state: &mut Value, progress: &thunderload_engine::Downl
     state["total"] = progress.total.map(Value::from).unwrap_or(Value::Null);
     state["percent"] = progress.percent.map(Value::from).unwrap_or(Value::from(0));
     state["detail"] = json!(progress.phase);
+    // Slice 7b (Gemini claim 14): segment counts ride the same state
+    // file, so the desktop's native poll can show them in the
+    // Inspector. Only written when the transfer reports them — a
+    // sequential job's None must not wipe a previous value.
+    if let (Some(done), Some(total)) = (progress.segments_done, progress.segments_total) {
+        state["segmentsDone"] = json!(done);
+        state["segmentsTotal"] = json!(total);
+    }
     state["updatedAt"] = json!(timestamp_ms());
 }
 
@@ -653,7 +661,7 @@ async fn main() -> Result<()> {
                         } else {
                             download_hls_resumable(
                                 &master_url, &selection, &target, session.as_ref(), control_rx.clone(),
-                                progress_tx, rate_limiter()
+                                progress_tx, rate_limiter(), DEFAULT_RESUMABLE_CONNECTIONS
                             ).await
                         };
                         let _ = progress_handle.await;
@@ -900,7 +908,7 @@ async fn main() -> Result<()> {
 
                         let result = download_dash_resumable(
                             &url, &representation_id, audio_representation_id.as_deref(), &target,
-                            session.as_ref(), control_rx.clone(), progress_tx, rate_limiter()
+                            session.as_ref(), control_rx.clone(), progress_tx, rate_limiter(), DEFAULT_RESUMABLE_CONNECTIONS
                         ).await;
                         let _ = progress_handle.await;
 

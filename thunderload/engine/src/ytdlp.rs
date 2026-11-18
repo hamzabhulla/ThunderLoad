@@ -1100,6 +1100,9 @@ pub fn parse_progress_line(line: &str) -> Option<DownloadProgress> {
         total,
         percent: Some(percent),
         phase: "Downloading".into(),
+        // yt-dlp reports bytes only — no segment counts (Slice 7b).
+        segments_done: None,
+        segments_total: None,
     })
 }
 

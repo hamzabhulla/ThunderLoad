@@ -2579,7 +2579,7 @@ fn hls_segment_path(work_dir: &Path, mark: HlsSegmentMark) -> PathBuf {
 }
 
 /// Fetches every unfinished segment of an HLS plan, in parallel up to
-/// the engine's connections value (`DEFAULT_RESUMABLE_CONNECTIONS`),
+/// `connections` (Slice 7b — the caller's value, already clamped),
 /// writing each finished segment's index into the checkpoint as it
 /// lands. Returns Completed when every segment is on disk, or the
 /// Paused/Cancelled outcome — with the checkpoint written (paused) or
@@ -2608,6 +2608,7 @@ async fn run_hls_segments(
     downloaded_bytes: Arc<AtomicU64>,
     total: usize,
     target: &Path,
+    connections: usize,
 ) -> Result<DownloadOutcome> {
     let mut work: std::collections::VecDeque<(HlsSegmentMark, HlsSegmentRef)> = std::collections::VecDeque::new();
     if state.video_init.is_some() && !state.video_init_done {
@@ -2638,7 +2639,7 @@ async fn run_hls_segments(
             stopped = Some(*control.borrow());
             break;
         }
-        while tasks.len() < DEFAULT_RESUMABLE_CONNECTIONS {
+        while tasks.len() < connections {
             let Some((mark, segment)) = work.pop_front() else { break; };
             let client = client.clone();
             let session = session.cloned();
@@ -2693,6 +2694,7 @@ async fn run_hls_segments(
                 let _ = progress_tx.send(DownloadProgress {
                     downloaded: transferred, total: None,
                     percent: Some(done as f64 * 100.0 / total.max(1) as f64), phase: phase.into(),
+                    segments_done: Some(done as u64), segments_total: Some(total as u64),
                 });
             }
             Ok(Err(error)) => {
@@ -2718,6 +2720,7 @@ async fn run_hls_segments(
                     downloaded: downloaded_bytes.load(Ordering::Relaxed), total: None,
                     percent: Some(state.done_segments() as f64 * 100.0 / total.max(1) as f64),
                     phase: "paused".into(),
+                    segments_done: Some(state.done_segments() as u64), segments_total: Some(total as u64),
                 });
                 Ok(DownloadOutcome::Paused)
             }
@@ -2743,7 +2746,8 @@ async fn run_hls_segments(
 /// the missing segments, bounded by `MAX_SEGMENT_URL_REFRESHES`.
 /// `selection` is what the user picked from the master playlist (Slice 4,
 /// Gemini claim 4); `HlsSelection::none()` keeps the old first-variant
-/// behaviour.
+/// behaviour. `connections` is the segment parallelism (Slice 7b — the
+/// desktop Settings value, clamped 1..=16).
 pub async fn download_hls_resumable(
     playlist_url: &str,
     selection: &HlsSelection,
@@ -2752,6 +2756,7 @@ pub async fn download_hls_resumable(
     control: watch::Receiver<DownloadControl>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
     rate_limiter: Arc<GlobalRateLimiter>,
+    connections: usize,
 ) -> Result<DownloadOutcome> {
     if *control.borrow() == DownloadControl::Cancelled {
         remove_hls_resume_files(target).await;
@@ -2876,6 +2881,7 @@ pub async fn download_hls_resumable(
             &client, &mut state, &work_dir, &meta_path, session, control.clone(),
             progress_tx.clone(), rate_limiter.clone(), &key_cache,
             completed.clone(), downloaded_bytes.clone(), total, target,
+            connections.clamp(1, 16),
         ).await {
             Ok(outcome) => break outcome,
             Err(error) if is_auth_error(&error) && refreshes < MAX_SEGMENT_URL_REFRESHES => {
@@ -2894,6 +2900,7 @@ pub async fn download_hls_resumable(
                     downloaded: downloaded_bytes.load(Ordering::Relaxed), total: None,
                     percent: Some(state.done_segments() as f64 * 100.0 / total.max(1) as f64),
                     phase: "refreshing".into(),
+                    segments_done: Some(state.done_segments() as u64), segments_total: Some(total as u64),
                 });
             }
             Err(error) if is_auth_error(&error) => {
@@ -2912,6 +2919,7 @@ pub async fn download_hls_resumable(
     let _ = progress_tx.send(DownloadProgress {
         downloaded: downloaded_bytes.load(Ordering::Relaxed), total: None,
         percent: Some(100.0), phase: "assembling".into(),
+        segments_done: Some(state.done_segments() as u64), segments_total: Some(total as u64),
     });
     let video_track = work_dir.join("video.assembled");
     assemble_hls_track(&work_dir, &state, false, &video_track).await?;
@@ -2921,6 +2929,7 @@ pub async fn download_hls_resumable(
         let _ = progress_tx.send(DownloadProgress {
             downloaded: downloaded_bytes.load(Ordering::Relaxed), total: None,
             percent: Some(100.0), phase: "muxing".into(),
+            segments_done: Some(state.done_segments() as u64), segments_total: Some(total as u64),
         });
         let muxed = work_dir.join("muxed.mp4");
         mux_hls_tracks(&video_track, &audio_track, &muxed).await?;
@@ -2938,6 +2947,7 @@ pub async fn download_hls_resumable(
     let _ = progress_tx.send(DownloadProgress {
         downloaded: downloaded_bytes.load(Ordering::Relaxed), total: None,
         percent: Some(100.0), phase: "complete".into(),
+        segments_done: Some(state.done_segments() as u64), segments_total: Some(total as u64),
     });
     Ok(DownloadOutcome::Completed)
 }
@@ -2974,7 +2984,7 @@ pub async fn download_hls(
     let stem = Path::new(&safe).file_stem().and_then(|s| s.to_str()).unwrap_or("video");
     let target = unique_video_path(&out_dir, stem, &plan.extension).await?;
     let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
-    let outcome = download_hls_resumable(playlist_url, selection, &target, session, control_rx, progress_tx, rate_limiter).await;
+    let outcome = download_hls_resumable(playlist_url, selection, &target, session, control_rx, progress_tx, rate_limiter, DEFAULT_RESUMABLE_CONNECTIONS).await;
     drop(control_tx);
     match outcome? {
         DownloadOutcome::Completed => Ok(target),
@@ -3120,6 +3130,11 @@ pub async fn download_hls_live(
                         total: None,
                         percent: None,
                         phase: "recording".into(),
+                        // A live recording has no total segment count —
+                        // the window keeps growing — so only the done
+                        // count is reported (Slice 7b).
+                        segments_done: Some(recorded),
+                        segments_total: None,
                     });
                 }
                 Err(error) => {
@@ -3479,6 +3494,7 @@ async fn download_dash_track(
     rate_limiter: Arc<GlobalRateLimiter>,
     done: &HashSet<usize>,
     control: &watch::Receiver<DownloadControl>,
+    connections: usize,
 ) -> Result<DashTrackOutcome> {
     let mut refs = Vec::with_capacity(track.segment_urls.len() + usize::from(track.initialization_url.is_some()));
     if let Some(initialization) = &track.initialization_url {
@@ -3599,15 +3615,18 @@ async fn download_dash_track(
                 total: None,
                 percent: Some(done as f64 * 100.0 / total_segments.max(1) as f64),
                 phase: "dash-segments".into(),
+                segments_done: Some(done as u64), segments_total: Some(total_segments as u64),
             });
             Ok::<PathBuf, anyhow::Error>(path)
         });
-        // Segments run concurrently up to the engine's connections value
-        // (Slice 4; was a hardcoded 6, now DEFAULT_RESUMABLE_CONNECTIONS).
+        // Segments run concurrently up to `connections` (Slice 7b —
+        // the caller's value, already clamped; was the hardcoded
+        // DEFAULT_RESUMABLE_CONNECTIONS before Slice 4, then the
+        // constant itself).
         // The drain waits on the next finished segment OR a control
         // change, so a pause/cancel during a slow segment returns
         // promptly instead of after the in-flight segment finishes.
-        if tasks.len() >= DEFAULT_RESUMABLE_CONNECTIONS {
+        if tasks.len() >= connections {
             if let Some(result) = join_next_or_control(&mut tasks, &mut control_watch, &mut watch_alive).await {
                 if let Err(error) = result? {
                     tasks.abort_all();
@@ -3866,7 +3885,7 @@ async fn download_dash_into(
     let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
     let outcome = download_dash_resumable_with_plan(
         manifest_url, representation_id, audio_representation_id, &target, session,
-        control_rx, progress_tx, rate_limiter, plan,
+        control_rx, progress_tx, rate_limiter, plan, DEFAULT_RESUMABLE_CONNECTIONS,
     ).await;
     drop(control_tx);
     match outcome {
@@ -4159,6 +4178,7 @@ pub async fn download_dash_resumable(
     control: watch::Receiver<DownloadControl>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
     rate_limiter: Arc<GlobalRateLimiter>,
+    connections: usize,
 ) -> Result<DownloadOutcome> {
     // A resume reuses the handoff stored with the checkpoint when the
     // caller has none (F2) — read it before resolving the plan so the
@@ -4173,7 +4193,7 @@ pub async fn download_dash_resumable(
     let plan = resolve_dash_plan(manifest_url, representation_id, audio_representation_id, session).await?;
     download_dash_resumable_with_plan(
         manifest_url, representation_id, audio_representation_id, target, session,
-        control, progress_tx, rate_limiter, plan,
+        control, progress_tx, rate_limiter, plan, connections.clamp(1, 16),
     ).await
 }
 
@@ -4202,6 +4222,7 @@ async fn run_dash_tracks(
     total_segments: usize,
     rate_limiter: Arc<GlobalRateLimiter>,
     control: &watch::Receiver<DownloadControl>,
+    connections: usize,
 ) -> Result<DashTracksOutcome> {
     let mut video_files = Vec::new();
     for (period_index, track) in plan.video_tracks.iter().enumerate() {
@@ -4210,7 +4231,7 @@ async fn run_dash_tracks(
         match download_dash_track(
             client, track, work_dir, &prefix, session, progress_tx,
             completed.clone(), downloaded_bytes.clone(), total_segments, rate_limiter.clone(),
-            &done, control,
+            &done, control, connections,
         ).await? {
             DashTrackOutcome::Assembled(path) => video_files.push(path),
             DashTrackOutcome::Stopped(stopped) => return Ok(DashTracksOutcome::Stopped(stopped)),
@@ -4223,7 +4244,7 @@ async fn run_dash_tracks(
         match download_dash_track(
             client, track, work_dir, &prefix, session, progress_tx,
             completed.clone(), downloaded_bytes.clone(), total_segments, rate_limiter.clone(),
-            &done, control,
+            &done, control, connections,
         ).await? {
             DashTrackOutcome::Assembled(path) => audio_files.push(path),
             DashTrackOutcome::Stopped(stopped) => return Ok(DashTracksOutcome::Stopped(stopped)),
@@ -4242,6 +4263,7 @@ async fn download_dash_resumable_with_plan(
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
     rate_limiter: Arc<GlobalRateLimiter>,
     plan: DashPlan,
+    connections: usize,
 ) -> Result<DownloadOutcome> {
     if *control.borrow() == DownloadControl::Cancelled {
         remove_dash_resume_files(target).await;
@@ -4314,7 +4336,7 @@ async fn download_dash_resumable_with_plan(
         match run_dash_tracks(
             &client, &plan, &work_dir, session, &progress_tx,
             completed.clone(), downloaded_bytes.clone(), total_segments, rate_limiter.clone(),
-            &control,
+            &control, connections,
         ).await {
             Ok(DashTracksOutcome::Finished { video_files, audio_files }) => break (video_files, audio_files),
             Ok(DashTracksOutcome::Stopped(stopped)) => return Ok(dash_stopped_outcome(stopped, target).await),
@@ -4332,6 +4354,7 @@ async fn download_dash_resumable_with_plan(
                     downloaded: downloaded_bytes.load(Ordering::Relaxed), total: None,
                     percent: Some(completed.load(Ordering::Relaxed) as f64 * 100.0 / total_segments.max(1) as f64),
                     phase: "refreshing".into(),
+                    segments_done: Some(completed.load(Ordering::Relaxed) as u64), segments_total: Some(total_segments as u64),
                 });
             }
             Err(error) if is_auth_error(&error) => {
@@ -4402,6 +4425,7 @@ async fn download_dash_resumable_with_plan(
         total: None,
         percent: Some(100.0),
         phase: "complete".into(),
+        segments_done: Some(completed.load(Ordering::Relaxed) as u64), segments_total: Some(total_segments as u64),
     });
     Ok(DownloadOutcome::Completed)
 }
@@ -4427,14 +4451,17 @@ mod tests {
         parse_hls_master, parse_hls_media_playlist, parse_iso_duration, resolve_dash_track,
         unsupported_hls_master_reason, unsupported_hls_reason, attr, DashCheckpointTrack,
         DashJobState, DownloadControl, DownloadOutcome, partial_download_metadata_path,
-        SessionHeaders,
+        SessionHeaders, DEFAULT_RESUMABLE_CONNECTIONS,
     };
     use crate::download::{reserve_download_path, GlobalRateLimiter};
     use std::collections::{HashMap, HashSet};
-    use std::sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex, RwLock};
+    use std::sync::{atomic::{AtomicBool, AtomicUsize, Ordering}, Arc, Mutex, RwLock};
     use std::time::Duration;
     use tokio::sync::{mpsc, watch};
     use url::Url;
+    // The concurrency tracker/barrier are generic test-server helpers
+    // defined in hls_download_tests; the DASH fixture reuses them.
+    use super::hls_download_tests::{ConcurrencyBarrier, InFlightTracker};
 
     #[test]
     fn hls_master_exposes_quality_options_highest_first() {
@@ -5051,6 +5078,15 @@ mod tests {
         spawn_dash_server_with_delay(routes, no_range, Duration::ZERO)
     }
 
+    /// Options for the DASH test fixture, mirroring HlsServerOptions: an
+    /// in-flight tracker and a concurrency barrier. Both default to
+    /// None (no tracking); only the concurrency tests set them.
+    #[derive(Default)]
+    struct DashServerOptions {
+        in_flight: Option<Arc<InFlightTracker>>,
+        barrier: Option<Arc<ConcurrencyBarrier>>,
+    }
+
     /// Same fixture with a fixed delay before every GET response, so a
     /// test can observe progress and pause mid-download instead of racing
     /// a download that finishes in milliseconds on loopback.
@@ -5058,6 +5094,16 @@ mod tests {
         routes: Arc<RwLock<HashMap<String, Vec<u8>>>>,
         no_range: Arc<HashSet<String>>,
         response_delay: Duration,
+    ) -> (String, Arc<Mutex<HashMap<String, usize>>>, Arc<Mutex<HashMap<String, usize>>>, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+        spawn_dash_server_with_options(routes, no_range, response_delay, DashServerOptions::default())
+    }
+
+    /// The delay fixture with tracking options (see DashServerOptions).
+    fn spawn_dash_server_with_options(
+        routes: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+        no_range: Arc<HashSet<String>>,
+        response_delay: Duration,
+        options: DashServerOptions,
     ) -> (String, Arc<Mutex<HashMap<String, usize>>>, Arc<Mutex<HashMap<String, usize>>>, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -5071,6 +5117,7 @@ mod tests {
         let stop = shutdown.clone();
         let counts_out = counts.clone();
         let range_counts_out = range_counts.clone();
+        let DashServerOptions { in_flight, barrier } = options;
         let handle = std::thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 let (mut stream, _) = match listener.accept() {
@@ -5088,6 +5135,8 @@ mod tests {
                 let no_range = no_range.clone();
                 let counts = counts.clone();
                 let range_counts = range_counts.clone();
+                let in_flight = in_flight.clone();
+                let barrier = barrier.clone();
                 std::thread::spawn(move || loop {
                     let mut raw = Vec::new();
                     let mut buffer = [0_u8; 1024];
@@ -5131,6 +5180,26 @@ mod tests {
                         return;
                     }
                     *counts.lock().unwrap().entry(path.clone()).or_insert(0) += 1;
+                    // The request is being served from here until its body
+                    // is fully written: the guard covers the response delay
+                    // and the write. Only media segment fetches are
+                    // tracked — the init segment is fetched as part of the
+                    // same track and would otherwise pollute peak_paths
+                    // (the same fixture artifact the HLS 8-connection
+                    // test documents for the playlist).
+                    let is_segment = path.contains("/seg-") && path.ends_with(".m4s");
+                    let _in_flight = if is_segment {
+                        in_flight.as_ref().map(|tracker| tracker.enter(&path))
+                    } else {
+                        None
+                    };
+                    // Segment requests wait at the concurrency barrier;
+                    // the MPD and init fetches are never gated.
+                    if is_segment {
+                        if let Some(barrier) = &barrier {
+                            barrier.wait_for_all(Duration::from_secs(10));
+                        }
+                    }
                     let bounds = range.as_deref()
                         .filter(|_| !no_range.contains(&path))
                         .and_then(|value| value.strip_prefix("bytes="))
@@ -5722,7 +5791,7 @@ mod tests {
         control_rx: watch::Receiver<DownloadControl>,
     ) -> anyhow::Result<DownloadOutcome> {
         let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
-        download_dash_resumable(url, "v1", None, target, None, control_rx, progress_tx, Arc::new(GlobalRateLimiter::new())).await
+        download_dash_resumable(url, "v1", None, target, None, control_rx, progress_tx, Arc::new(GlobalRateLimiter::new()), DEFAULT_RESUMABLE_CONNECTIONS).await
     }
 
     fn fresh_dash_control() -> (watch::Sender<DownloadControl>, watch::Receiver<DownloadControl>) {
@@ -5805,6 +5874,116 @@ mod tests {
             let key = dash_segment_file_to_request_path(&name);
             assert_eq!(counts_after_resume.get(&key), counts_after_pause.get(&key),
                 "segment {key} was re-requested after resume");
+        }
+        stop_dash_server(shutdown, server);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    // Slice 7b (Gemini claims 7 + 14): a DASH download at connections=1
+    // completes with exact bytes and reports real per-segment counts on
+    // the live channel — init + media segments against the plan total.
+    #[tokio::test]
+    async fn dash_progress_reports_segment_counts_at_one_connection() {
+        let segment_count = 6;
+        let routes: Arc<RwLock<HashMap<String, Vec<u8>>>> = Arc::new(RwLock::new(HashMap::new()));
+        let (base, _counts, _range_counts, shutdown, server) =
+            spawn_dash_server(routes.clone(), Arc::new(HashSet::new()));
+        let init = b"FAKEINIT".to_vec();
+        let mut expected = init.clone();
+        {
+            let mut map = routes.write().unwrap();
+            map.insert("/v1/init.mp4".into(), init.clone());
+            for index in 1..=segment_count {
+                let body = format!("SEGMENT-{index:03}-DATA").into_bytes();
+                expected.extend_from_slice(&body);
+                map.insert(format!("/v1/seg-{index:03}.m4s"), body);
+            }
+            map.insert("/video.mpd".into(), dash_segment_template_mpd(segment_count).into_bytes());
+        }
+        let directory = std::env::temp_dir().join(format!("thunderload-dash-segments-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("movie.mp4")).await.unwrap();
+        let url = format!("{base}/video.mpd");
+        let (_control_tx, control_rx) = fresh_dash_control();
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        let collector = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(progress) = progress_rx.recv().await {
+                events.push(progress);
+            }
+            events
+        });
+        let outcome = download_dash_resumable(&url, "v1", None, &target, None, control_rx, progress_tx, Arc::new(GlobalRateLimiter::new()), 1).await.unwrap();
+        assert_eq!(outcome, DownloadOutcome::Completed);
+        let events = collector.await.unwrap();
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(bytes, expected);
+        // Total segments = init + media segments.
+        let total = (segment_count + 1) as u64;
+        assert!(
+            events.iter().any(|event| event.phase == "dash-segments" && event.segments_total == Some(total)),
+            "a segment event must report the total segment count; events: {events:?}"
+        );
+        let last = events.last().expect("at least a complete event");
+        assert_eq!(last.phase, "complete");
+        assert_eq!((last.segments_done, last.segments_total), (Some(total), Some(total)), "the complete event must report all segments done");
+        stop_dash_server(shutdown, server);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    // Slice 7b (Gemini claim 7): the same concurrency proof for DASH
+    // at connections=2 — the engine fills exactly 2 segment fetches,
+    // not the default 8. The barrier makes the peak deterministic: if
+    // the engine opened 8, the peak would read 7+ and fail this test.
+    #[tokio::test]
+    async fn dash_parallel_fetch_with_two_connections_uses_two_segments() {
+        let segment_count = 12;
+        let routes: Arc<RwLock<HashMap<String, Vec<u8>>>> = Arc::new(RwLock::new(HashMap::new()));
+        let tracker = Arc::new(InFlightTracker { current: AtomicUsize::new(0), max: AtomicUsize::new(0), paths: Mutex::new(std::collections::HashSet::new()), peak_paths: Mutex::new(Vec::new()) });
+        let barrier = Arc::new(ConcurrencyBarrier { target: 2, arrived: AtomicUsize::new(0) });
+        let options = DashServerOptions {
+            in_flight: Some(tracker.clone()),
+            barrier: Some(barrier),
+        };
+        let (base, counts, _range_counts, shutdown, server) =
+            spawn_dash_server_with_options(routes.clone(), Arc::new(HashSet::new()), Duration::from_millis(10), options);
+        let init = b"FAKEINIT".to_vec();
+        let mut expected = init.clone();
+        {
+            let mut map = routes.write().unwrap();
+            map.insert("/v1/init.mp4".into(), init.clone());
+            for index in 1..=segment_count {
+                let body = format!("SEGMENT-{index:03}-DATA").into_bytes();
+                expected.extend_from_slice(&body);
+                map.insert(format!("/v1/seg-{index:03}.m4s"), body);
+            }
+            map.insert("/video.mpd".into(), dash_segment_template_mpd(segment_count).into_bytes());
+        }
+        let directory = std::env::temp_dir().join(format!("thunderload-dash-concurrency-two-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("movie.mp4")).await.unwrap();
+        let url = format!("{base}/video.mpd");
+        let (_control_tx, control_rx) = fresh_dash_control();
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        let collector = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(progress) = progress_rx.recv().await {
+                events.push(progress);
+            }
+            events
+        });
+        let outcome = download_dash_resumable(&url, "v1", None, &target, None, control_rx, progress_tx, Arc::new(GlobalRateLimiter::new()), 2).await.unwrap();
+        assert_eq!(outcome, DownloadOutcome::Completed);
+        let _events = collector.await.unwrap();
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(bytes, expected);
+        let peak_segments = tracker.peak_paths().iter()
+            .filter(|path| path.contains("/seg-") && path.ends_with(".m4s"))
+            .count();
+        assert_eq!(peak_segments, 2, "expected the engine to fill exactly 2 concurrent segment fetches; in flight at the peak: {:?}", tracker.peak_paths());
+        let counts = counts.lock().unwrap();
+        for index in 1..=segment_count {
+            assert_eq!(counts.get(&format!("/v1/seg-{index:03}.m4s")), Some(&1));
         }
         stop_dash_server(shutdown, server);
         tokio::fs::remove_dir_all(directory).await.unwrap();
@@ -6495,6 +6674,7 @@ mod hls_download_tests {
         download_hls_live, download_hls_resumable, download_hls_subtitles, ffmpeg_available, hidden_command, hls_output_extension, hls_work_dir,
         inspect_video, partial_download_metadata_path, validate_hls_content_range,
         DownloadControl, DownloadOutcome, GlobalRateLimiter, HlsSelection, SessionHeaders,
+        DEFAULT_RESUMABLE_CONNECTIONS,
     };
     use crate::session::AUTH_REQUIRED_MESSAGE;
     use crate::download::reserve_download_path;
@@ -6551,13 +6731,16 @@ mod hls_download_tests {
     /// A target that is never reached times out (no deadlock) and the
     /// handlers serve anyway, so the peak honestly reports how many
     /// connections the client actually opened.
-    struct ConcurrencyBarrier {
-        target: usize,
-        arrived: AtomicUsize,
+    ///
+    /// Shared with the DASH fixture in `super::tests` (generic
+    /// test-server helpers, not HLS-specific), hence `pub(super)`.
+    pub(super) struct ConcurrencyBarrier {
+        pub(super) target: usize,
+        pub(super) arrived: AtomicUsize,
     }
 
     impl ConcurrencyBarrier {
-        fn wait_for_all(&self, timeout: Duration) {
+        pub(super) fn wait_for_all(&self, timeout: Duration) {
             let arrived = self.arrived.fetch_add(1, Ordering::Relaxed) + 1;
             if arrived >= self.target {
                 return;
@@ -6576,16 +6759,17 @@ mod hls_download_tests {
     /// number of requests being served right now, `max` the peak seen.
     /// `peak_paths` is the set of request paths that were in flight when
     /// the peak was recorded, so a surprising peak can be diagnosed
-    /// instead of guessed at.
-    struct InFlightTracker {
-        current: AtomicUsize,
-        max: AtomicUsize,
-        paths: Mutex<std::collections::HashSet<String>>,
-        peak_paths: Mutex<Vec<String>>,
+    /// instead of guessed at. Shared with the DASH fixture in
+    /// `super::tests`, hence `pub(super)`.
+    pub(super) struct InFlightTracker {
+        pub(super) current: AtomicUsize,
+        pub(super) max: AtomicUsize,
+        pub(super) paths: Mutex<std::collections::HashSet<String>>,
+        pub(super) peak_paths: Mutex<Vec<String>>,
     }
 
     impl InFlightTracker {
-        fn enter(&self, path: &str) -> InFlightGuard<'_> {
+        pub(super) fn enter(&self, path: &str) -> InFlightGuard<'_> {
             let current = self.current.fetch_add(1, Ordering::Relaxed) + 1;
             {
                 let mut paths = self.paths.lock().unwrap();
@@ -6602,14 +6786,14 @@ mod hls_download_tests {
             self.max.load(Ordering::Relaxed)
         }
 
-        fn peak_paths(&self) -> Vec<String> {
+        pub(super) fn peak_paths(&self) -> Vec<String> {
             let mut paths = self.peak_paths.lock().unwrap().clone();
             paths.sort();
             paths
         }
     }
 
-    struct InFlightGuard<'a> {
+    pub(super) struct InFlightGuard<'a> {
         tracker: &'a InFlightTracker,
         path: String,
     }
@@ -6798,7 +6982,19 @@ mod hls_download_tests {
         session: Option<SessionHeaders>,
     ) -> anyhow::Result<DownloadOutcome> {
         let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
-        download_hls_resumable(url, &selection, target, session.as_ref(), control_rx, progress_tx, Arc::new(GlobalRateLimiter::new())).await
+        download_hls_resumable(url, &selection, target, session.as_ref(), control_rx, progress_tx, Arc::new(GlobalRateLimiter::new()), DEFAULT_RESUMABLE_CONNECTIONS).await
+    }
+
+    // Slice 7b (Gemini claim 7): the same resumable HLS path, but the
+    // caller chooses the connection count instead of the default.
+    async fn run_resumable_with_connections(
+        url: &str,
+        target: &std::path::Path,
+        control_rx: watch::Receiver<DownloadControl>,
+        connections: usize,
+    ) -> anyhow::Result<DownloadOutcome> {
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        download_hls_resumable(url, &HlsSelection::none(), target, None, control_rx, progress_tx, Arc::new(GlobalRateLimiter::new()), connections).await
     }
 
     fn fresh_control() -> (watch::Sender<DownloadControl>, watch::Receiver<DownloadControl>) {
@@ -7961,6 +8157,85 @@ mod hls_download_tests {
         for index in 0..segment_count {
             assert_eq!(counts.get(&format!("/seg{index}.ts")), Some(&1));
         }
+        stop_server(shutdown, server);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    // Slice 7b (Gemini claim 7): the same concurrency proof at
+    // connections=2 — the engine fills exactly 2 segment fetches, not
+    // the default 8. The barrier makes the peak deterministic: if the
+    // engine opened 8, the peak would read 8 and fail this test.
+    #[tokio::test]
+    async fn hls_parallel_fetch_with_two_connections_uses_two_segments() {
+        let segment_count = 24;
+        let (mut routes, bodies) = segment_routes(segment_count, 128 * 1024);
+        routes.insert("/media.m3u8".into(), media_playlist(segment_count).into_bytes());
+        let tracker = Arc::new(InFlightTracker { current: AtomicUsize::new(0), max: AtomicUsize::new(0), paths: Mutex::new(std::collections::HashSet::new()), peak_paths: Mutex::new(Vec::new()) });
+        let barrier = Arc::new(ConcurrencyBarrier { target: 2, arrived: AtomicUsize::new(0) });
+        let options = HlsServerOptions {
+            in_flight: Some(tracker.clone()),
+            barrier: Some(barrier),
+            ..Default::default()
+        };
+        let (base, counts, _range_206, shutdown, server) =
+            spawn_hls_server(routes, Duration::from_millis(8), options);
+        let directory = std::env::temp_dir().join(format!("thunderload-hls-concurrency-two-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("movie.ts")).await.unwrap();
+        let url = format!("{base}/media.m3u8");
+        let (_control_tx, control_rx) = fresh_control();
+        let outcome = run_resumable_with_connections(&url, &target, control_rx, 2).await.unwrap();
+        assert_eq!(outcome, DownloadOutcome::Completed);
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(bytes, bodies.concat());
+        let peak_segments = tracker.peak_paths().iter()
+            .filter(|path| path.starts_with("/seg") && path.ends_with(".ts"))
+            .count();
+        assert_eq!(peak_segments, 2, "expected the engine to fill exactly 2 concurrent segment fetches; in flight at the peak: {:?}", tracker.peak_paths());
+        let counts = counts.lock().unwrap();
+        for index in 0..segment_count {
+            assert_eq!(counts.get(&format!("/seg{index}.ts")), Some(&1));
+        }
+        stop_server(shutdown, server);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    // Slice 7b (Gemini claim 14): the live progress channel reports
+    // real per-segment counts for an HLS download — every segment
+    // event carries done/total, and the complete event reports all
+    // segments done.
+    #[tokio::test]
+    async fn hls_progress_reports_segment_counts() {
+        let segment_count = 6;
+        let (mut routes, bodies) = segment_routes(segment_count, 1024);
+        routes.insert("/media.m3u8".into(), media_playlist(segment_count).into_bytes());
+        let (base, _counts, _range_206, shutdown, server) =
+            spawn_hls_server(routes, Duration::from_millis(1), HlsServerOptions { ..Default::default() });
+        let directory = std::env::temp_dir().join(format!("thunderload-hls-segments-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("movie.ts")).await.unwrap();
+        let url = format!("{base}/media.m3u8");
+        let (_control_tx, control_rx) = fresh_control();
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        let collector = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(progress) = progress_rx.recv().await {
+                events.push(progress);
+            }
+            events
+        });
+        let outcome = download_hls_resumable(&url, &HlsSelection::none(), &target, None, control_rx, progress_tx, Arc::new(GlobalRateLimiter::new()), 2).await.unwrap();
+        assert_eq!(outcome, DownloadOutcome::Completed);
+        let events = collector.await.unwrap();
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(bytes, bodies.concat());
+        assert!(
+            events.iter().any(|event| event.phase == "video-segments" && event.segments_total == Some(segment_count as u64)),
+            "a segment event must report the total segment count; events: {events:?}"
+        );
+        let last = events.last().expect("at least a complete event");
+        assert_eq!(last.phase, "complete");
+        assert_eq!((last.segments_done, last.segments_total), (Some(segment_count as u64), Some(segment_count as u64)), "the complete event must report all segments done");
         stop_server(shutdown, server);
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }

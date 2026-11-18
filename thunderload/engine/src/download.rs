@@ -24,12 +24,21 @@ fn response_is_webpage(headers: &header::HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
+/// Progress on the live channel, emitted by the engine and forwarded to
+/// the UI. `segments_done`/`segments_total` (Slice 7b, Gemini claim 14)
+/// report per-segment progress for segmented transfers — direct
+/// multi-connection files, HLS and DASH — and are `None` when the
+/// transfer does not report segments (sequential downloads, live
+/// recording totals). The UI shows real segment data when present and
+/// an honest "not reported" only when both are `None`.
 #[derive(Debug, Clone, Serialize)]
 pub struct DownloadProgress {
     pub downloaded: u64,
     pub total: Option<u64>,
     pub percent: Option<f64>,
     pub phase: String,
+    pub segments_done: Option<u64>,
+    pub segments_total: Option<u64>,
 }
 
 // Reserve the destination atomically so two simultaneous jobs cannot select
@@ -206,7 +215,8 @@ pub async fn download_url(
                     // Some servers advertise byte ranges but return invalid ranges.
                     // Restart sequentially rather than leave a potentially corrupt file.
                     let _ = progress_tx.send(DownloadProgress {
-                        downloaded: 0, total, percent: Some(0.0), phase: "fallback".into()
+                        downloaded: 0, total, percent: Some(0.0), phase: "fallback".into(),
+                        segments_done: None, segments_total: None,
                     });
                 }
             }
@@ -259,7 +269,8 @@ async fn download_sequential(
                 .map(|size| downloaded as f64 * 100.0 / size as f64);
             if last_report.elapsed() >= std::time::Duration::from_millis(180) {
                 let _ = progress_tx.send(DownloadProgress {
-                    downloaded, total: actual_total, percent, phase: "downloading".into()
+                    downloaded, total: actual_total, percent, phase: "downloading".into(),
+                    segments_done: None, segments_total: None,
                 });
                 last_report = Instant::now();
             }
@@ -280,7 +291,8 @@ async fn download_sequential(
         return Err(error).context("Could not commit completed download; temporary file removed");
     }
     let _ = progress_tx.send(DownloadProgress {
-        downloaded, total: actual_total.or(Some(downloaded)), percent: Some(100.0), phase: "complete".into()
+        downloaded, total: actual_total.or(Some(downloaded)), percent: Some(100.0), phase: "complete".into(),
+        segments_done: None, segments_total: None,
     });
     Ok(target.to_path_buf())
 }
@@ -302,6 +314,11 @@ async fn download_segmented(
     let chunk_size = total / connection_count + u64::from(total % connection_count != 0);
     let received = Arc::new(AtomicU64::new(0));
     let last_report = Arc::new(Mutex::new(Instant::now()));
+    // Slice 7b (Gemini claim 14): per-part progress for the live
+    // channel. The part count is fixed by the layout above, so the
+    // total is known before the first worker starts.
+    let parts_total = ((total + chunk_size - 1) / chunk_size).min(connection_count);
+    let parts_done = Arc::new(AtomicU64::new(0));
     let mut tasks = tokio::task::JoinSet::new();
 
     for index in 0..connections {
@@ -313,6 +330,7 @@ async fn download_segmented(
         let url = url.to_owned();
         let received = received.clone();
         let last_report = last_report.clone();
+        let parts_done = parts_done.clone();
         let session = session.cloned();
         let validator = if_range.map(str::to_string);
         let progress_tx = progress_tx.clone();
@@ -369,6 +387,8 @@ async fn download_segmented(
                             total: Some(total),
                             percent: Some(sum as f64 * 100.0 / total as f64),
                             phase: "downloading".into(),
+                            segments_done: Some(parts_done.load(Ordering::Relaxed)),
+                            segments_total: Some(parts_total),
                         });
                         *last = Instant::now();
                     }
@@ -378,6 +398,7 @@ async fn download_segmented(
             if local_bytes != end - start + 1 {
                 return Err(anyhow!("A range returned an incomplete segment"));
             }
+            parts_done.fetch_add(1, Ordering::Relaxed);
             Ok::<PathBuf, anyhow::Error>(part_path)
         });
     }
@@ -424,7 +445,8 @@ async fn download_segmented(
     }
     let _ = fs::remove_dir_all(&work_dir).await;
     let _ = progress_tx.send(DownloadProgress {
-        downloaded: total, total: Some(total), percent: Some(100.0), phase: "complete".into()
+        downloaded: total, total: Some(total), percent: Some(100.0), phase: "complete".into(),
+        segments_done: Some(parts_total), segments_total: Some(parts_total),
     });
     Ok(target.to_path_buf())
 }
@@ -1057,6 +1079,9 @@ enum SegmentedRun {
 /// (the stall watchdog reads it); `reported` is the running maximum of
 /// bytes ever reported, so progress never goes backwards even across a
 /// re-queue subtraction.
+///
+/// Slice 7b additions: `segments_done`/`segments_total` report the
+/// finished-chunk count on the live progress channel.
 #[allow(clippy::too_many_arguments)]
 async fn download_segment_range(
     client: &Client,
@@ -1072,6 +1097,8 @@ async fn download_segment_range(
     received: Arc<AtomicU64>,
     last_report: Arc<Mutex<Instant>>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
+    segments_done: Arc<AtomicU64>,
+    segments_total: u64,
     chunk_received: Arc<AtomicU64>,
     activity: Arc<Mutex<Instant>>,
     reported: Arc<AtomicU64>,
@@ -1169,6 +1196,8 @@ async fn download_segment_range(
                     total: Some(total),
                     percent: Some(shown as f64 * 100.0 / total as f64),
                     phase: "downloading".into(),
+                    segments_done: Some(segments_done.load(Ordering::Relaxed)),
+                    segments_total: Some(segments_total),
                 });
                 *last = Instant::now();
             }
@@ -1236,6 +1265,11 @@ struct SegmentWorkers {
     queue: Arc<Mutex<DynamicQueue>>,
     chunk_received: Vec<Arc<AtomicU64>>,
     activities: Vec<Arc<Mutex<Instant>>>,
+    // Slice 7b (Gemini claim 14): finished-chunk count for the live
+    // progress channel, seeded from the checkpoint's pre-done chunks so
+    // a resume reports the true count, not zero.
+    segments_done: Arc<AtomicU64>,
+    segments_total: u64,
 }
 
 struct WorkerResult {
@@ -1289,6 +1323,8 @@ async fn download_chunk_worker(
             shared.received.clone(),
             shared.last_report.clone(),
             shared.progress_tx.clone(),
+            shared.segments_done.clone(),
+            shared.segments_total,
             shared.chunk_received[index].clone(),
             shared.activities[slot].clone(),
             shared.reported.clone(),
@@ -1303,6 +1339,10 @@ async fn download_chunk_worker(
                 if let Err(error) = mark_segment_done(&shared.checkpoint, index).await {
                     return WorkerResult { terminal: None, error: Some(error), stats };
                 }
+                // Slice 7b: only after the checkpoint marks the chunk
+                // done — the live count never claims a chunk the resume
+                // state does not have.
+                shared.segments_done.fetch_add(1, Ordering::Relaxed);
                 let chunk_len = end - start + 1;
                 let rate = chunk_len as f64 / started.elapsed().as_secs_f64().max(1e-6);
                 stats.chunks_completed += 1;
@@ -1441,6 +1481,10 @@ async fn run_segmented_download_with_stats(
         queue,
         chunk_received: ranges.iter().map(|_| Arc::new(AtomicU64::new(0))).collect(),
         activities: (0..worker_count).map(|_| Arc::new(Mutex::new(Instant::now()))).collect(),
+        segments_done: Arc::new(AtomicU64::new(
+            ranges.iter().filter(|(_, _, done)| *done).count() as u64,
+        )),
+        segments_total: ranges.len() as u64,
     });
     // Explicit JoinHandles instead of a JoinSet: the stall watchdog must
     // abort ONE worker without touching the others, and JoinSet can only
@@ -1679,6 +1723,8 @@ async fn run_segmented_download_with_stats(
             total: Some(total),
             percent: Some(downloaded as f64 * 100.0 / total as f64),
             phase: "paused".into(),
+            segments_done: Some(shared.segments_done.load(Ordering::Relaxed)),
+            segments_total: Some(shared.segments_total),
         });
         return Ok((SegmentedRun::Finished(DownloadOutcome::Paused), run_stats));
     }
@@ -1709,6 +1755,8 @@ async fn run_segmented_download_with_stats(
         total: Some(total),
         percent: Some(100.0),
         phase: "complete".into(),
+        segments_done: Some(shared.segments_total),
+        segments_total: Some(shared.segments_total),
     });
     Ok((SegmentedRun::Finished(DownloadOutcome::Completed), run_stats))
 }
@@ -1918,16 +1966,17 @@ pub async fn download_url_resumable(
     .await
 }
 
-/// Connections used by `download_url_resumable` when the caller does not
-/// choose: 8 matches the segmented fast path's usual setting and keeps the
-/// segment count small enough that per-segment checkpoint writes stay cheap.
+/// Connections used when the caller does not choose: 8 matches the
+/// segmented fast path's usual setting and keeps the segment count small
+/// enough that per-segment checkpoint writes stay cheap.
 ///
-/// This is the engine's ONE connections value: the HLS and DASH segment
-/// fetchers use it too (Slice 4), so direct files and media segments all
-/// run at the same concurrency. The desktop Settings UI still labels the
-/// setting "one stream" while the engine uses 8 — that UI lie is Slice
-/// 7b's to fix, not this constant's; do not add a second setting here.
-pub(crate) const DEFAULT_RESUMABLE_CONNECTIONS: usize = 8;
+/// This is the engine's default connections value: the HLS and DASH
+/// segment fetchers use it too (Slice 4), so direct files and media
+/// segments all run at the same concurrency unless the caller passes an
+/// explicit count. The desktop Settings value (Slice 7b) overrides it
+/// for desktop downloads; the native host passes this default (it has
+/// no settings channel). Do not add a second setting here.
+pub const DEFAULT_RESUMABLE_CONNECTIONS: usize = 8;
 
 /// Minimum object size for the segmented checkpointed path, mirroring the
 /// fast path's threshold in `download_url`: segmenting a small object buys
@@ -1935,8 +1984,8 @@ pub(crate) const DEFAULT_RESUMABLE_CONNECTIONS: usize = 8;
 const MIN_SEGMENTED_TOTAL: u64 = 2 * 1024 * 1024;
 
 /// Same as `download_url_resumable`, with an explicit connection count.
-/// The desktop queue wires its setting through here in a later slice; the
-/// signature of `download_url_resumable` itself is unchanged.
+/// Slice 7b: the desktop queue wires its setting through here, so the
+/// value the Settings UI shows is the value the engine uses.
 pub async fn download_url_resumable_with_connections(
     url: &str,
     target: &Path,
@@ -2222,7 +2271,7 @@ async fn download_sequential_resumable(
             file.flush().await?;
             let _ = progress_tx.send(DownloadProgress {
                 downloaded, total, percent: total.map(|size| if size == 0 { 0.0 } else { downloaded as f64 * 100.0 / size as f64 }),
-                phase: "paused".into()
+                phase: "paused".into(), segments_done: None, segments_total: None,
             });
             return Ok(DownloadOutcome::Paused);
         }
@@ -2263,7 +2312,8 @@ async fn download_sequential_resumable(
             let percent = total.filter(|size| *size > 0)
                 .map(|size| downloaded as f64 * 100.0 / size as f64);
             let _ = progress_tx.send(DownloadProgress {
-                downloaded, total, percent, phase: "downloading".into()
+                downloaded, total, percent, phase: "downloading".into(),
+                segments_done: None, segments_total: None,
             });
             last_report = Instant::now();
         }
@@ -2279,7 +2329,8 @@ async fn download_sequential_resumable(
     replace_file(&part, target).await?;
     let _ = fs::remove_file(&metadata_path).await;
     let _ = progress_tx.send(DownloadProgress {
-        downloaded, total: total.or(Some(downloaded)), percent: Some(100.0), phase: "complete".into()
+        downloaded, total: total.or(Some(downloaded)), percent: Some(100.0), phase: "complete".into(),
+        segments_done: None, segments_total: None,
     });
     let _ = saved_metadata;
     Ok(DownloadOutcome::Completed)
@@ -3572,6 +3623,74 @@ mod segmented_http_tests {
         assert_eq!(bytes, expected);
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
+
+    // Slice 7b (Gemini claim 7): the connections value the caller passes
+    // is the value the engine uses — 2 connections means exactly two
+    // Range requests, not the old hardcoded 8. (Gemini claim 14) the
+    // same download reports real per-part progress on the live channel.
+    #[tokio::test]
+    async fn download_url_with_two_connections_uses_two_ranges_and_reports_segments() {
+        let (url, range_requests, shutdown, server) = spawn_segment_server();
+        let directory = std::env::temp_dir().join(format!("thunderload-connections-two-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<DownloadProgress>();
+        let collector = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(progress) = progress_rx.recv().await {
+                events.push(progress);
+            }
+            events
+        });
+        let path = directory.join("payload.bin");
+        let result = download_url(&url, &path, 2, None, progress_tx, Arc::new(GlobalRateLimiter::new())).await;
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        result.unwrap();
+        let events = collector.await.unwrap();
+        assert_eq!(range_requests.load(Ordering::Relaxed), 2, "expected exactly two Range requests for connections=2");
+        let bytes = tokio::fs::read(&path).await.unwrap();
+        let expected: Vec<u8> = (0..BODY_SIZE).map(|index| (index % 251) as u8).collect();
+        assert_eq!(bytes, expected);
+        assert!(
+            events.iter().any(|event| event.phase == "downloading" && event.segments_done.is_some() && event.segments_total == Some(2)),
+            "a downloading event must report segments 0..2 of 2; events: {events:?}"
+        );
+        let last = events.last().expect("at least a complete event");
+        assert_eq!(last.phase, "complete");
+        assert_eq!((last.segments_done, last.segments_total), (Some(2), Some(2)), "the complete event must report all parts done");
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    // Slice 7b (Gemini claim 14): a one-connection download is
+    // sequential, so it honestly reports no segments — None, not a
+    // fabricated 0 of 1.
+    #[tokio::test]
+    async fn download_url_with_one_connection_reports_no_segments() {
+        let (url, range_requests, shutdown, server) = spawn_segment_server();
+        let directory = std::env::temp_dir().join(format!("thunderload-connections-one-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<DownloadProgress>();
+        let collector = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(progress) = progress_rx.recv().await {
+                events.push(progress);
+            }
+            events
+        });
+        let path = directory.join("payload.bin");
+        let result = download_url(&url, &path, 1, None, progress_tx, Arc::new(GlobalRateLimiter::new())).await;
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        result.unwrap();
+        let events = collector.await.unwrap();
+        assert_eq!(range_requests.load(Ordering::Relaxed), 0, "one connection must not issue Range requests");
+        assert!(!events.is_empty(), "a sequential download still reports progress");
+        assert!(
+            events.iter().all(|event| event.segments_done.is_none() && event.segments_total.is_none()),
+            "a sequential download must not claim segment progress; events: {events:?}"
+        );
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
 }
 
 
@@ -3907,6 +4026,26 @@ mod segmented_resumable_tests {
         assert_eq!(bytes, body_for(1, LARGE_BODY));
         assert!(!tokio::fs::try_exists(&part).await.unwrap());
         assert!(!tokio::fs::try_exists(&metadata_path).await.unwrap());
+        fixture.stop();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    // Slice 7b (Gemini claim 7): the connections value the caller passes
+    // is stored in the checkpoint, so a resume reuses the count the
+    // download started with instead of the caller's new value.
+    #[tokio::test]
+    async fn with_connections_two_is_stored_in_checkpoint() {
+        let fixture = spawn_checkpoint_server(LARGE_BODY);
+        fixture.slow.store(true, Ordering::Relaxed);
+        let directory = temp_dir("seg-connections-stored");
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("file.bin")).await.unwrap();
+        let outcome = run_until_pause(&fixture.url, &target, 2).await;
+        assert_eq!(outcome, DownloadOutcome::Paused);
+        let metadata = read_resume_metadata(&partial_download_metadata_path(&target))
+            .await
+            .expect("checkpoint metadata missing");
+        assert_eq!(metadata.connections, Some(2), "the checkpoint must store the connections the caller passed");
         fixture.stop();
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }

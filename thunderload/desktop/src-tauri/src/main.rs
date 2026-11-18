@@ -10,7 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{Emitter, Manager};
-use thunderload_engine::{check_ytdlp_update as engine_check_ytdlp_update, dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_live, download_hls_resumable, download_hls_subtitles, download_page, download_url_resumable, ensure_tool, error_text, grab_page_media as engine_grab_page_media, hls_work_dir, inspect_page, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, store_file_name, tool_status, tools_dir, DownloadControl, DownloadOutcome, DownloadProgress, GlobalRateLimiter, HlsSelection, JobKind, JobOrigin, JobRecord, JobState, JobStore, PageMediaList, SessionHeaders, ToolDownloadProgress, ToolStatus, ToolsMissing, YtDlpTool};
+use thunderload_engine::{check_ytdlp_update as engine_check_ytdlp_update, dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_live, download_hls_resumable, download_hls_subtitles, download_page, download_url_resumable_with_connections, ensure_tool, error_text, grab_page_media as engine_grab_page_media, hls_work_dir, inspect_page, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, store_file_name, tool_status, tools_dir, DownloadControl, DownloadOutcome, DownloadProgress, GlobalRateLimiter, HlsSelection, JobKind, JobOrigin, JobRecord, JobState, JobStore, PageMediaList, SessionHeaders, ToolDownloadProgress, ToolStatus, ToolsMissing, YtDlpTool};
 use tokio::{process::Command as TokioCommand, sync::{mpsc, watch}};
 
 /// Build a child-process command that never shows a console window on
@@ -675,7 +675,10 @@ async fn start_download(
         Some(path) => PathBuf::from(path),
         None => reserve_download_path(&default_download_dir().join(&name)).await.map_err(|error| error.to_string())?,
     };
-    let _ = connections; // Resumable transfers use one stream so their checkpoint is continuous.
+    // Slice 7b (Gemini claim 7): the setting is real now — the queue
+    // passes the user's choice in and the engine segments the file at
+    // that count (1..=16 clamped inside). Before this slice the value
+    // was dropped here and the engine always used 8.
     let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
     {
         let mut controls = job_controls().lock().map_err(|_| "Download control lock is unavailable")?;
@@ -712,13 +715,14 @@ async fn start_download(
                 // crash keeps the last reported position; the checkpoint
                 // on disk stays authoritative for resume.
                 let (downloaded, total, percent) = (progress.downloaded, progress.total, progress.percent);
+                let (segments_done, segments_total) = (progress.segments_done, progress.segments_total);
                 with_job_store(|store| {
-                    let _ = store.note_progress(&progress_id, downloaded, total, percent);
+                    let _ = store.note_progress(&progress_id, downloaded, total, percent, segments_done, segments_total);
                 });
                 let _ = progress_app.emit("download-progress", json!({ "jobId": progress_id, "progress": progress }));
             }
         });
-        let result = download_url_resumable(&url, &task_target, session.as_ref(), control_rx, limit, progress_tx).await;
+        let result = download_url_resumable_with_connections(&url, &task_target, session.as_ref(), control_rx, limit, progress_tx, connections).await;
         let cancelled_while_finishing = *transition_rx.borrow() == DownloadControl::Cancelled;
         finish_desktop_download(&app_for_task, &job_for_task, &task_target, result.map_err(|error| error_text(&error)), cancelled_while_finishing).await;
     });
@@ -733,6 +737,7 @@ async fn start_hls_download(
     audio_representation_id: Option<String>,
     filename: String,
     target_path: Option<String>,
+    connections: usize,
     scheduled_at: Option<u64>,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
@@ -793,13 +798,14 @@ async fn start_hls_download(
                 // crash keeps the last reported position; the checkpoint
                 // on disk stays authoritative for resume.
                 let (downloaded, total, percent) = (progress.downloaded, progress.total, progress.percent);
+                let (segments_done, segments_total) = (progress.segments_done, progress.segments_total);
                 with_job_store(|store| {
-                    let _ = store.note_progress(&progress_id, downloaded, total, percent);
+                    let _ = store.note_progress(&progress_id, downloaded, total, percent, segments_done, segments_total);
                 });
                 let _ = progress_app.emit("download-progress", json!({ "jobId": progress_id, "progress": progress }));
             }
         });
-        let result = download_hls_resumable(&url, &selection, &task_target, session.as_ref(), control_rx, progress_tx, rate_limiter()).await;
+        let result = download_hls_resumable(&url, &selection, &task_target, session.as_ref(), control_rx, progress_tx, rate_limiter(), connections).await;
         let cancelled_while_finishing = *transition_rx.borrow() == DownloadControl::Cancelled;
         finish_desktop_download(&app_for_task, &job_for_task, &task_target, result.map_err(|error| error_text(&error)), cancelled_while_finishing).await;
     });
@@ -868,8 +874,9 @@ async fn start_hls_live_download(
         tauri::async_runtime::spawn(async move {
             while let Some(progress) = progress_rx.recv().await {
                 let (downloaded, total, percent) = (progress.downloaded, progress.total, progress.percent);
+                let (segments_done, segments_total) = (progress.segments_done, progress.segments_total);
                 with_job_store(|store| {
-                    let _ = store.note_progress(&progress_id, downloaded, total, percent);
+                    let _ = store.note_progress(&progress_id, downloaded, total, percent, segments_done, segments_total);
                 });
                 let _ = progress_app.emit("download-progress", json!({ "jobId": progress_id, "progress": progress }));
             }
@@ -1394,6 +1401,7 @@ async fn start_dash_download(
     audio_representation_id: Option<String>,
     filename: String,
     target_path: Option<String>,
+    connections: usize,
     scheduled_at: Option<u64>,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
@@ -1455,15 +1463,16 @@ async fn start_dash_download(
                 // crash keeps the last reported position; the checkpoint
                 // on disk stays authoritative for resume.
                 let (downloaded, total, percent) = (progress.downloaded, progress.total, progress.percent);
+                let (segments_done, segments_total) = (progress.segments_done, progress.segments_total);
                 with_job_store(|store| {
-                    let _ = store.note_progress(&progress_id, downloaded, total, percent);
+                    let _ = store.note_progress(&progress_id, downloaded, total, percent, segments_done, segments_total);
                 });
                 let _ = progress_app.emit("download-progress", json!({ "jobId": progress_id, "progress": progress }));
             }
         });
         let result = download_dash_resumable(
             &url, &representation_id, audio_representation_id.as_deref(), &task_target, session.as_ref(),
-            control_rx, progress_tx, rate_limiter(),
+            control_rx, progress_tx, rate_limiter(), connections,
         ).await;
         let cancelled_while_finishing = *transition_rx.borrow() == DownloadControl::Cancelled;
         finish_desktop_download(&app_for_task, &job_for_task, &task_target, result.map_err(|error| error_text(&error)), cancelled_while_finishing).await;
@@ -1580,8 +1589,9 @@ async fn start_ytdlp_download(
         tauri::async_runtime::spawn(async move {
             while let Some(progress) = progress_rx.recv().await {
                 let (downloaded, total, percent) = (progress.downloaded, progress.total, progress.percent);
+                let (segments_done, segments_total) = (progress.segments_done, progress.segments_total);
                 with_job_store(|store| {
-                    let _ = store.note_progress(&progress_id, downloaded, total, percent);
+                    let _ = store.note_progress(&progress_id, downloaded, total, percent, segments_done, segments_total);
                 });
                 let _ = progress_app.emit("download-progress", json!({ "jobId": progress_id, "progress": progress }));
             }

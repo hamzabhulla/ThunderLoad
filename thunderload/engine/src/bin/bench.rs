@@ -59,6 +59,7 @@ use thunderload_engine::{
     download_dash_resumable, download_hls_resumable, download_url,
     download_url_resumable_with_connections, partial_download_metadata_path,
     DownloadControl, DownloadOutcome, GlobalRateLimiter, HlsSelection,
+    DEFAULT_RESUMABLE_CONNECTIONS,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -541,6 +542,7 @@ async fn bench_hls(runs: usize) -> anyhow::Result<BenchResult> {
             control_rx,
             progress_tx,
             new_limiter(),
+            DEFAULT_RESUMABLE_CONNECTIONS,
         )
         .await?;
         let elapsed = start.elapsed();
@@ -595,6 +597,7 @@ async fn bench_dash(runs: usize) -> anyhow::Result<BenchResult> {
             control_rx,
             progress_tx,
             new_limiter(),
+            DEFAULT_RESUMABLE_CONNECTIONS,
         )
         .await?;
         let elapsed = start.elapsed();

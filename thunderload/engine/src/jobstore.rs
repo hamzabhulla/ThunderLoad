@@ -425,13 +425,18 @@ impl JobStore {
     /// Records live progress (bytes/percent). The in-memory row is always
     /// updated; the file is only rewritten when the per-job throttle has
     /// elapsed, so a busy download does not rewrite the store on every
-    /// progress event. Returns false when the id is unknown.
+    /// progress event. `segments_done`/`segments_total` (Slice 7b,
+    /// Gemini claim 14) are stored only when both arrive — a None pair
+    /// means the transfer does not report segments, and must not wipe
+    /// the last known counts. Returns false when the id is unknown.
     pub fn note_progress(
         &mut self,
         id: &str,
         downloaded: u64,
         total: Option<u64>,
         percent: Option<f64>,
+        segments_done: Option<u64>,
+        segments_total: Option<u64>,
     ) -> io::Result<bool> {
         let Some(job) = self.jobs.iter_mut().find(|job| job.id == id) else {
             return Ok(false);
@@ -439,6 +444,10 @@ impl JobStore {
         job.downloaded = downloaded;
         job.total = total;
         job.percent = percent;
+        if let (Some(done), Some(total_segments)) = (segments_done, segments_total) {
+            job.segments_done = Some(done);
+            job.segments_total = Some(total_segments);
+        }
         job.updated_at_ms = now_ms();
         let due = match self.last_progress_save.get(id) {
             None => true,
@@ -992,15 +1001,20 @@ mod tests {
         let (mut store, _) = JobStore::load(&path, Duration::from_secs(3600));
         store.upsert(sample_record("t")).unwrap();
         // First progress report saves (no prior save for this job).
-        assert!(store.note_progress("t", 100, Some(1000), Some(10.0)).unwrap());
+        assert!(store.note_progress("t", 100, Some(1000), Some(10.0), Some(2), Some(8)).unwrap());
         let saved_once = fs::read_to_string(&path).unwrap();
         assert!(saved_once.contains("\"downloaded\": 100"));
+        assert!(saved_once.contains("\"segmentsDone\": 2"), "segments ride on the same save");
         // Second report inside the throttle updates memory only.
-        assert!(store.note_progress("t", 200, Some(1000), Some(20.0)).unwrap());
+        assert!(store.note_progress("t", 200, Some(1000), Some(20.0), Some(3), Some(8)).unwrap());
         assert_eq!(store.get("t").unwrap().downloaded, 200, "memory is always current");
+        assert_eq!(store.get("t").unwrap().segments_done, Some(3), "segments are memory-current too");
         assert_eq!(fs::read_to_string(&path).unwrap(), saved_once, "file is untouched inside the throttle");
+        // A report with no segment counts leaves the last known counts alone.
+        assert!(store.note_progress("t", 300, Some(1000), Some(30.0), None, None).unwrap());
+        assert_eq!(store.get("t").unwrap().segments_done, Some(3), "None must not wipe known segments");
         // Unknown id is a no-op.
-        assert!(!store.note_progress("missing", 1, None, None).unwrap());
+        assert!(!store.note_progress("missing", 1, None, None, None, None).unwrap());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1009,7 +1023,7 @@ mod tests {
         let dir = test_dir("throttle-zero");
         let (mut store, path) = store_in(&dir);
         store.upsert(sample_record("t")).unwrap();
-        store.note_progress("t", 500, Some(1000), Some(50.0)).unwrap();
+        store.note_progress("t", 500, Some(1000), Some(50.0), None, None).unwrap();
         assert!(fs::read_to_string(&path).unwrap().contains("\"downloaded\": 500"));
         let _ = fs::remove_dir_all(&dir);
     }
