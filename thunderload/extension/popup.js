@@ -360,6 +360,10 @@ async function startVariant(variant, source, action, askPermission = false) {
   const filename = filenameFromUrl(source.url, "video");
   const result = await requestNative(action, {
     url: variant.url,
+    // Slice 4: the master playlist URL, so the engine can re-resolve it
+    // with the selected variant + audio instead of downloading the child
+    // media playlist alone (which drops the audio track).
+    masterUrl: source.url,
     referer: pageUrl,
     filename: variant.kind === "hls" || variant.kind === "dash" ? (filename.replace(/\.[^.]+$/, "") + ".mp4") : filename,
     representationId: variant.representationId,

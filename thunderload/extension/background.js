@@ -211,6 +211,10 @@ async function quickDownloadMedia({ url, kind, pageUrl, filename, selectedVarian
   const action = selected.kind === "hls" ? "video.download" : selected.kind === "dash" ? "dash.download" : "download.start";
   const result = await requestNative(action, {
     url: selected.url,
+    // Slice 4: the master playlist URL, so the engine can re-resolve it
+    // with the selected variant + audio instead of downloading the child
+    // media playlist alone (which drops the audio track).
+    masterUrl: url,
     filename: selected.kind === "hls" || selected.kind === "dash" ? (name.replace(/\.[^.]+$/, "") + ".mp4") : name,
     referer: pageUrl || "",
     representationId: selected.representationId,

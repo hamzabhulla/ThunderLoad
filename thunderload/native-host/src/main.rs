@@ -10,7 +10,7 @@ use anyhow::{anyhow, Result};
 use std::{collections::HashMap, sync::{Arc, Mutex, OnceLock}};
 use serde_json::{json, Value};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::{mpsc, watch}};
-use thunderload_engine::{check_ytdlp_update, dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_resumable, download_page, download_url_resumable, ensure_tool, hls_output_extension, hls_work_dir, inspect_page, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, tool_status, tools_dir, DownloadControl, DownloadOutcome, GlobalRateLimiter, SessionHeaders, ToolDownloadProgress, ToolsMissing, YtDlpTool};
+use thunderload_engine::{check_ytdlp_update, dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_resumable, download_page, download_url_resumable, ensure_tool, hls_output_extension, hls_work_dir, inspect_page, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, tool_status, tools_dir, DownloadControl, DownloadOutcome, GlobalRateLimiter, HlsSelection, SessionHeaders, ToolDownloadProgress, ToolsMissing, YtDlpTool};
 
 const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 
@@ -532,9 +532,27 @@ async fn main() -> Result<()> {
             "video.download" => {
                 let url = message.get("url").and_then(Value::as_str).unwrap_or("").to_string();
                 let referer = message.get("referer").and_then(Value::as_str).map(str::to_string);
-                let session = message_session(&message, &url, referer);
+                // Slice 4 (Gemini claim 4): the extension sends the
+                // selected variant's media playlist URL as `url` and the
+                // master playlist URL as `masterUrl` (Slice 3's yt-dlp
+                // pages have no master, so masterUrl is absent there).
+                // The engine resolves the master with the selection, so
+                // the audio rendition the user picked is downloaded and
+                // muxed in instead of silently dropped. A bare media
+                // playlist (no masterUrl, or masterUrl == url) keeps the
+                // old first-variant behaviour.
+                let master_url = message.get("masterUrl").and_then(Value::as_str)
+                    .filter(|value| !value.is_empty()).map(str::to_string)
+                    .unwrap_or_else(|| url.clone());
+                let audio_representation_id = message.get("audioRepresentationId").and_then(Value::as_str)
+                    .filter(|value| !value.is_empty()).map(str::to_string);
+                let selection = HlsSelection {
+                    media_url: if master_url != url { Some(url.clone()) } else { None },
+                    audio_group: audio_representation_id.clone(),
+                };
+                let session = message_session(&message, &master_url, referer);
                 let filename = output_name(message.get("filename"), "video");
-                if !(url.starts_with("http://") || url.starts_with("https://")) {
+                if !(master_url.starts_with("http://") || master_url.starts_with("https://")) {
                     let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": "Only HTTP and HTTPS playlist URLs are supported"}));
                     continue;
                 }
@@ -543,7 +561,7 @@ async fn main() -> Result<()> {
                 // fMP4) — the one-shot download did this, and reserving
                 // from the caller's filename alone would misname a TS
                 // stream as .mp4.
-                let extension = match hls_output_extension(&url, session.as_ref()).await {
+                let extension = match hls_output_extension(&master_url, &selection, session.as_ref()).await {
                     Ok(extension) => extension,
                     Err(error) => {
                         let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": error.to_string()}));
@@ -569,8 +587,18 @@ async fn main() -> Result<()> {
                 }
 
                 let tx = outgoing_tx.clone();
-                let mut state = native_job_state(&job_id, &filename, &url, "hls");
+                // The stored URL is the MASTER playlist, and the selection
+                // rides in the state: a desktop resume of this native job
+                // re-resolves the master with the same variant and audio
+                // instead of falling back to the first variant.
+                let mut state = native_job_state(&job_id, &filename, &master_url, "hls");
                 state["targetPath"] = json!(target.to_string_lossy().to_string());
+                if let Some(media_url) = &selection.media_url {
+                    state["representationId"] = json!(media_url);
+                }
+                if let Some(audio_group) = &selection.audio_group {
+                    state["audioRepresentationId"] = json!(audio_group);
+                }
                 if let Some(session) = &session {
                     state["session"] = serde_json::to_value(session).unwrap_or(Value::Null);
                 }
@@ -603,7 +631,7 @@ async fn main() -> Result<()> {
                         });
 
                         let result = download_hls_resumable(
-                            &url, &target, session.as_ref(), control_rx.clone(),
+                            &master_url, &selection, &target, session.as_ref(), control_rx.clone(),
                             progress_tx, rate_limiter()
                         ).await;
                         let _ = progress_handle.await;
