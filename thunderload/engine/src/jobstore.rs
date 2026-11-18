@@ -31,11 +31,15 @@
 
 use std::{
     collections::HashMap,
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io,
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+// `File` is only used inside a #[cfg(unix)] block (dir fsync after rename);
+// importing it unconditionally warns as unused on Windows.
+#[cfg(unix)]
+use std::fs::File;
 
 use serde::{Deserialize, Serialize};
 
