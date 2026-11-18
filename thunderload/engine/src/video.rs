@@ -501,11 +501,34 @@ fn parse_hls_audio_renditions(body: &str, base: &Url) -> Vec<HlsAudioRendition> 
 
 fn attr(input: &str, name: &str) -> Option<String> {
     let prefix = format!("{name}=");
-    input.split(',').find_map(|part| {
+    split_attr_list(input).into_iter().find_map(|part| {
         let part = part.trim();
         let value = part.strip_prefix(&prefix)?;
         Some(value.trim_matches('"').to_string())
     })
+}
+
+/// Splits an HLS attribute list on commas that sit outside double
+/// quotes, so `NAME="English, US"` stays one attribute (Slice 7a,
+/// Gemini 15c: the old `input.split(',')` cut it in half and the name
+/// came back as just `English`). A comma inside a quoted value is data,
+/// not a separator.
+fn split_attr_list(input: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut in_quotes = false;
+    let mut start = 0;
+    for (index, character) in input.char_indices() {
+        match character {
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                parts.push(&input[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&input[start..]);
+    parts
 }
 
 #[derive(Debug, Clone, Default)]
@@ -659,25 +682,49 @@ fn xml_attributes(element: &quick_xml::events::BytesStart<'_>) -> Result<HashMap
     Ok(values)
 }
 
+/// Parses an ISO 8601 duration (`PT5M`, `PT1H30M`, `P1D`, `P0DT0H5M0S`,
+/// `P1DT2H`) into seconds. The day component was rejected before (Slice
+/// 7a, Gemini 15b: `strip_prefix("PT")` dropped any `P[n]D...` value),
+/// which silently dropped the duration of any MPD that uses it. Garbage
+/// is still rejected: no `P` prefix, no component at all, an unknown
+/// designator, a time component without `T`, or a non-positive total.
 fn parse_iso_duration(value: &str) -> Option<f64> {
-    let time = value.strip_prefix("PT")?;
-    let mut number = String::new();
+    let rest = value.strip_prefix('P')?;
+    let (days_part, time_part) = match rest.split_once('T') {
+        Some((days, time)) => (days, Some(time)),
+        None => (rest, None),
+    };
     let mut seconds = 0.0;
-    for character in time.chars() {
-        if character.is_ascii_digit() || character == '.' {
-            number.push(character);
-            continue;
-        }
-        let amount: f64 = number.parse().ok()?;
-        number.clear();
-        seconds += match character {
-            'H' => amount * 3600.0,
-            'M' => amount * 60.0,
-            'S' => amount,
-            _ => return None,
-        };
+    if !days_part.is_empty() {
+        let days: f64 = days_part.strip_suffix('D')?.parse().ok()?;
+        seconds += days * 86400.0;
     }
-    if !number.is_empty() || !seconds.is_finite() || seconds <= 0.0 {
+    if let Some(time) = time_part {
+        let mut number = String::new();
+        let mut saw_component = false;
+        for character in time.chars() {
+            if character.is_ascii_digit() || character == '.' {
+                number.push(character);
+                continue;
+            }
+            let amount: f64 = number.parse().ok()?;
+            number.clear();
+            saw_component = true;
+            seconds += match character {
+                'H' => amount * 3600.0,
+                'M' => amount * 60.0,
+                'S' => amount,
+                _ => return None,
+            };
+        }
+        if !number.is_empty() || !saw_component {
+            return None;
+        }
+    } else if days_part.is_empty() {
+        // Bare "P" — no day component and no time part.
+        return None;
+    }
+    if !seconds.is_finite() || seconds <= 0.0 {
         return None;
     }
     Some(seconds)
@@ -3399,6 +3446,26 @@ async fn join_next_or_control<T: Send + 'static>(
     }
 }
 
+/// Removes one track's in-progress segment temp files from the work
+/// dir (Slice 7a, claim 5 nit). A segment is written to
+/// `{prefix}-{index:06}.segment.tmp` and renamed into place only on
+/// success, so any `.segment.tmp` left when the track stops or fails is
+/// garbage: an aborted task can never clean up after itself, and a
+/// failed task returns before the rename. Only temp files are removed —
+/// finished `.segment` files are the resume record and are never
+/// touched. Call only after the task set is fully drained, so no task
+/// can still be writing.
+async fn remove_dash_segment_temps(work_dir: &Path, prefix: &str) {
+    let Ok(mut entries) = fs::read_dir(work_dir).await else { return };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(prefix) && name.ends_with(".segment.tmp") {
+            let _ = fs::remove_file(entry.path()).await;
+        }
+    }
+}
+
 async fn download_dash_track(
     client: &Client,
     track: &DashResolvedTrack,
@@ -3542,13 +3609,19 @@ async fn download_dash_track(
         // promptly instead of after the in-flight segment finishes.
         if tasks.len() >= DEFAULT_RESUMABLE_CONNECTIONS {
             if let Some(result) = join_next_or_control(&mut tasks, &mut control_watch, &mut watch_alive).await {
-                if let Err(error) = result? { tasks.abort_all(); return Err(error); }
+                if let Err(error) = result? {
+                    tasks.abort_all();
+                    while tasks.join_next().await.is_some() {}
+                    remove_dash_segment_temps(work_dir, prefix).await;
+                    return Err(error);
+                }
             }
         }
     }
     if let Some(stopped) = stopped {
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
+        remove_dash_segment_temps(work_dir, prefix).await;
         return Ok(DashTrackOutcome::Stopped(stopped));
     }
 
@@ -3561,6 +3634,7 @@ async fn download_dash_track(
             if matches!(*control.borrow(), DownloadControl::Paused | DownloadControl::Cancelled) {
                 tasks.abort_all();
                 while tasks.join_next().await.is_some() {}
+                remove_dash_segment_temps(work_dir, prefix).await;
                 return Ok(DashTrackOutcome::Stopped(*control.borrow()));
             }
             if tasks.is_empty() {
@@ -3574,6 +3648,7 @@ async fn download_dash_track(
         if let control @ (DownloadControl::Paused | DownloadControl::Cancelled) = current {
             tasks.abort_all();
             while tasks.join_next().await.is_some() {}
+            remove_dash_segment_temps(work_dir, prefix).await;
             return Ok(DashTrackOutcome::Stopped(control));
         }
         match result {
@@ -3582,7 +3657,10 @@ async fn download_dash_track(
             Err(error) => failures.push(anyhow!(error)),
         }
     }
-    if let Some(error) = failures.into_iter().next() { return Err(error); }
+    if let Some(error) = failures.into_iter().next() {
+        remove_dash_segment_temps(work_dir, prefix).await;
+        return Err(error);
+    }
 
     let extension = if track.mime_type.to_ascii_lowercase().contains("webm") { "webm" } else { "mp4" };
     let assembled = work_dir.join(format!("{prefix}-track.{extension}"));
@@ -4346,13 +4424,14 @@ mod tests {
         expand_dash_template, hidden_command,
         hls_audio_only_variant, hls_single_variant, is_complete_vod_playlist, parse_dash_document,
         parse_dash_representations, parse_dash_sidx, parse_hls_live_media_playlist,
-        parse_hls_master, parse_hls_media_playlist, resolve_dash_track,
-        unsupported_hls_master_reason, unsupported_hls_reason, DashCheckpointTrack, DashJobState,
-        DownloadControl, DownloadOutcome, partial_download_metadata_path, SessionHeaders,
+        parse_hls_master, parse_hls_media_playlist, parse_iso_duration, resolve_dash_track,
+        unsupported_hls_master_reason, unsupported_hls_reason, attr, DashCheckpointTrack,
+        DashJobState, DownloadControl, DownloadOutcome, partial_download_metadata_path,
+        SessionHeaders,
     };
     use crate::download::{reserve_download_path, GlobalRateLimiter};
     use std::collections::{HashMap, HashSet};
-    use std::sync::{atomic::{AtomicBool, AtomicUsize, Ordering}, Arc, Mutex, RwLock};
+    use std::sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex, RwLock};
     use std::time::Duration;
     use tokio::sync::{mpsc, watch};
     use url::Url;
@@ -4382,6 +4461,48 @@ mod tests {
         assert!(is_complete_vod_playlist("#EXTM3U\n#EXTINF:5,\nsegment.ts\n#EXT-X-ENDLIST"));
         assert!(!is_complete_vod_playlist("#EXTM3U\n#EXTINF:5,\nsegment.ts"));
         assert!(unsupported_hls_reason("#EXTM3U\n#EXTINF:5,\nsegment.ts").is_some());
+    }
+
+    /// Day components are real ISO 8601 durations (Slice 7a, Gemini
+    /// 15b): `P1D` is a day, `P0DT0H5M0S` is five minutes. Before the
+    /// fix both parsed as None and the MPD duration was silently
+    /// dropped. The existing time-only cases and the garbage cases
+    /// keep their old answers.
+    #[test]
+    fn parse_iso_duration_accepts_day_components() {
+        assert_eq!(parse_iso_duration("P1D"), Some(86400.0));
+        assert_eq!(parse_iso_duration("P0DT0H5M0S"), Some(300.0));
+        assert_eq!(parse_iso_duration("P1DT2H"), Some(93600.0));
+        assert_eq!(parse_iso_duration("P2DT3H4M5S"), Some(2.0 * 86400.0 + 3.0 * 3600.0 + 4.0 * 60.0 + 5.0));
+        assert_eq!(parse_iso_duration("PT5M"), Some(300.0));
+        assert_eq!(parse_iso_duration("PT1H30M"), Some(5400.0));
+        assert_eq!(parse_iso_duration("PT0.5S"), Some(0.5));
+        assert_eq!(parse_iso_duration(""), None);
+        assert_eq!(parse_iso_duration("P"), None);
+        assert_eq!(parse_iso_duration("PT"), None);
+        assert_eq!(parse_iso_duration("PT0S"), None);
+        assert_eq!(parse_iso_duration("P1X"), None);
+        assert_eq!(parse_iso_duration("PT5X"), None);
+        assert_eq!(parse_iso_duration("5M"), None);
+        assert_eq!(parse_iso_duration("P1D2H"), None);
+    }
+
+    /// A comma inside a quoted attribute value is data, not a
+    /// separator (Slice 7a, Gemini 15c): `NAME="English, US"` is one
+    /// attribute. Before the fix the split cut it in half and the name
+    /// came back as just `English`. Unquoted values are unaffected.
+    #[test]
+    fn attr_keeps_commas_inside_quoted_values() {
+        let attributes = "TYPE=AUDIO,GROUP-ID=\"audio\",LANGUAGE=\"en\",NAME=\"English, US\",DEFAULT=YES,URI=\"audio.m3u8\"";
+        assert_eq!(attr(attributes, "NAME").as_deref(), Some("English, US"));
+        assert_eq!(attr(attributes, "GROUP-ID").as_deref(), Some("audio"));
+        assert_eq!(attr(attributes, "LANGUAGE").as_deref(), Some("en"));
+        assert_eq!(attr(attributes, "URI").as_deref(), Some("audio.m3u8"));
+        assert_eq!(attr(attributes, "DEFAULT").as_deref(), Some("YES"));
+        assert_eq!(attr(attributes, "MISSING"), None);
+        let with_query = "BANDWIDTH=800000,URI=\"seg.m3u8?x=1,2\"";
+        assert_eq!(attr(with_query, "URI").as_deref(), Some("seg.m3u8?x=1,2"));
+        assert_eq!(attr(with_query, "BANDWIDTH").as_deref(), Some("800000"));
     }
 
     #[test]
@@ -5754,6 +5875,58 @@ mod tests {
             assert_eq!(counts_after_resume.get(&key), counts_after_error.get(&key),
                 "segment {key} was re-requested after the error-interrupted resume");
         }
+        stop_dash_server(shutdown, server);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    /// A segment that fails after its temp file is created must not
+    /// leave the temp behind (Slice 7a, claim 5 nit). Segment 2 is
+    /// served with an empty body, so its task creates
+    /// `video-p0-000002.segment.tmp` and then errors on the empty
+    /// file; the download aborts, but the finished segments and the
+    /// checkpoint stay for resume. Before the fix the empty segment's
+    /// `.segment.tmp` survived in the work dir.
+    #[tokio::test]
+    async fn dash_failed_segment_leaves_no_temp_files() {
+        let segment_count = 4;
+        let routes: Arc<RwLock<HashMap<String, Vec<u8>>>> = Arc::new(RwLock::new(HashMap::new()));
+        let (base, _counts, _range_counts, shutdown, server) =
+            spawn_dash_server(routes.clone(), Arc::new(HashSet::new()));
+        {
+            let mut map = routes.write().unwrap();
+            map.insert("/v1/init.mp4".into(), b"FAKEINIT".to_vec());
+            for index in 1..=segment_count {
+                // Segment 2 is empty on purpose: its task errors only
+                // after creating its temp file.
+                let body = if index == 2 { Vec::new() } else { format!("SEGMENT-{index:03}-DATA").into_bytes() };
+                map.insert(format!("/v1/seg-{index:03}.m4s"), body);
+            }
+            map.insert("/video.mpd".into(), dash_segment_template_mpd(segment_count).into_bytes());
+        }
+        let directory = std::env::temp_dir().join(format!("thunderload-dash-tmp-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("movie.mp4")).await.unwrap();
+        let url = format!("{base}/video.mpd");
+
+        let (_control_tx, control_rx) = fresh_dash_control();
+        let result = run_dash_resumable(&url, &target, control_rx).await;
+        assert!(result.is_err(), "expected the empty segment to abort the download");
+        // The checkpoint and the finished segments survive for resume.
+        assert!(tokio::fs::try_exists(partial_download_metadata_path(&target)).await.unwrap());
+        let work_dir = dash_work_dir(&target);
+        let mut temps = Vec::new();
+        let mut finished = Vec::new();
+        let mut entries = tokio::fs::read_dir(&work_dir).await.unwrap();
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(".segment.tmp") {
+                temps.push(name);
+            } else if name.ends_with(".segment") {
+                finished.push(name);
+            }
+        }
+        assert!(temps.is_empty(), "temp files left behind in the work dir: {temps:?}");
+        assert_eq!(finished.len(), 4, "init + segments 1, 3, 4 must still be on disk: {finished:?}");
         stop_dash_server(shutdown, server);
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
