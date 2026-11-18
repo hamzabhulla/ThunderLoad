@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use crate::session::{apply_session, SessionHeaders};
+use crate::session::{apply_session, SessionHeaders, AUTH_REQUIRED_MESSAGE};
 use futures_util::StreamExt;
 use reqwest::{header, Client, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -326,6 +326,16 @@ async fn download_segmented(
             let response = request.send().await?;
             if validator.as_deref().is_some_and(|expected| !response_matches_validator(response.headers(), expected)) {
                 return Err(anyhow!("The media resource changed during the segmented download"));
+            }
+            // Slice 5 fix: a 401/403 on a segment fetch (the session
+            // expired after a successful first response) is an auth
+            // failure, not a range failure. Check it before the 206
+            // check — the old code discarded the status, so the
+            // error_text funnel could not recover it and the user
+            // saw "Server did not honor byte range" instead of the
+            // login label.
+            if response.status() == StatusCode::UNAUTHORIZED || response.status() == StatusCode::FORBIDDEN {
+                return Err(anyhow!(AUTH_REQUIRED_MESSAGE));
             }
             if response.status() != StatusCode::PARTIAL_CONTENT {
                 return Err(anyhow!("Server did not honor byte range"));
@@ -2106,6 +2116,11 @@ async fn download_sequential_resumable(
     request = apply_session(session, request, url);
     let mut response = request.send().await.context("Could not connect to the download server")?;
     if !response.status().is_success() && response.status() != StatusCode::PARTIAL_CONTENT {
+        // A 401/403 is the login wall, not a generic server error —
+        // say so instead of the bare status (Slice 5).
+        if response.status() == StatusCode::UNAUTHORIZED || response.status() == StatusCode::FORBIDDEN {
+            return Err(anyhow!(AUTH_REQUIRED_MESSAGE));
+        }
         return Err(anyhow!("Download server returned HTTP {}", response.status()));
     }
 
@@ -2285,10 +2300,11 @@ mod resumable_tests {
 #[cfg(test)]
 mod resumable_http_tests {
     use super::{
-        download_url_resumable, partial_download_metadata_path, partial_download_path,
+        download_segmented, download_url_resumable, partial_download_metadata_path, partial_download_path,
         reserve_download_path, DownloadControl, DownloadOutcome, GlobalRateLimiter,
         SessionHeaders, WEBPAGE_NOT_MEDIA_MESSAGE,
     };
+    use crate::AUTH_REQUIRED_MESSAGE;
     use std::{
         io::{Read, Write},
         net::TcpListener,
@@ -2606,6 +2622,87 @@ mod resumable_http_tests {
         ).await;
         assert!(result.is_err(), "a cookie-gated download without a session must fail, got {result:?}");
         drop(control_tx);
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    /// Slice 5: the same gated failure must carry the login label, not
+    /// a bare "Download server returned HTTP 403" — the user can act on
+    /// the label (open the page logged in, retry), not on a status code.
+    #[tokio::test]
+    async fn gated_download_failure_carries_the_login_label() {
+        let (url, _seen, shutdown, server) = spawn_cookie_gated_server();
+        let directory = std::env::temp_dir().join(format!("thunderload-session-label-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("file.bin")).await.unwrap();
+        let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        let error = download_url_resumable(
+            &url, &target, None, control_rx, Arc::new(GlobalRateLimiter::new()), progress_tx,
+        ).await.unwrap_err();
+        assert_eq!(error.to_string(), AUTH_REQUIRED_MESSAGE);
+        drop(control_tx);
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    /// Slice 5 fix: a 403 on a parallel segment fetch (the session
+    /// expired after the first response) must carry the login label,
+    /// not "Server did not honor byte range" — the old error
+    /// discarded the status, so the error_text funnel could not
+    /// recover it. The server answers every request with 403; the
+    /// segmented path is driven directly so the test proves the
+    /// segment fetch itself, not the HEAD/probe path.
+    fn spawn_forbidden_server() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = shutdown.clone();
+        let handle = thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => {
+                        let _ = connection.0.set_nonblocking(false);
+                        connection
+                    },
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(3));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => {
+                            request.extend_from_slice(&buffer[..count]);
+                            if request.windows(4).any(|window| window == b"\r\n\r\n") { break; }
+                        }
+                    }
+                }
+                let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
+        });
+        (format!("http://{address}/download.bin"), shutdown, handle)
+    }
+
+    #[tokio::test]
+    async fn segmented_download_403_carries_the_login_label() {
+        let (url, shutdown, server) = spawn_forbidden_server();
+        let directory = std::env::temp_dir().join(format!("thunderload-segment-403-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("file.bin")).await.unwrap();
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        let client = reqwest::Client::new();
+        let error = download_segmented(
+            &client, &url, &target, BODY_SIZE as u64, 2, None, None, progress_tx, Arc::new(GlobalRateLimiter::new()),
+        ).await.unwrap_err();
+        assert_eq!(error.to_string(), AUTH_REQUIRED_MESSAGE);
         shutdown.store(true, Ordering::Relaxed);
         server.join().unwrap();
         tokio::fs::remove_dir_all(directory).await.unwrap();

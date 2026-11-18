@@ -22,6 +22,7 @@
 //!   rather than a broken entry.
 
 use anyhow::{anyhow, Context, Result};
+use crate::session::SessionHeaders;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -331,10 +332,24 @@ pub fn extract_page_media(html: &str, base_url: &str) -> PageMediaList {
 }
 
 /// Fetch a page and extract its media links (desktop grabber path).
-/// No browser session is attached — the desktop has none — so pages
-/// that need a login or load media with JavaScript may come back empty.
-/// The extension's live-DOM scan is the full path for those pages.
+/// No browser session is attached by default — the desktop has none —
+/// so pages that need a login or load media with JavaScript may come
+/// back empty. The extension's live-DOM scan is the full path for
+/// those pages. Callers that DO hold a session use
+/// `grab_page_media_with_session` (Slice 5): the session's cookies,
+/// Referer and User-Agent are applied to the page fetch, so a
+/// login-walled page answers instead of 403ing.
 pub async fn grab_page_media(page_url: &str) -> Result<PageMediaList> {
+    grab_page_media_with_session(page_url, None).await
+}
+
+/// Same as `grab_page_media`, with a browser session applied to the
+/// page fetch. A 401/403 from the page is relabelled as the login
+/// message instead of a bare status.
+pub async fn grab_page_media_with_session(
+    page_url: &str,
+    session: Option<&SessionHeaders>,
+) -> Result<PageMediaList> {
     let parsed = Url::parse(page_url).context("Invalid page URL")?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(anyhow!("Only HTTP and HTTPS page URLs can be grabbed"));
@@ -348,14 +363,19 @@ pub async fn grab_page_media(page_url: &str) -> Result<PageMediaList> {
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .context("Could not build HTTP client")?;
-    let response = client
-        .get(page_url)
+    let request = crate::session::apply_session(session, client.get(page_url), page_url);
+    let response = request
         .send()
         .await
         .context("Could not fetch the page")?;
-    let mut response = response
-        .error_for_status()
-        .context("The page request failed")?;
+    // A 401/403 is the login wall — show the label alone (Slice 5);
+    // anything else keeps its context.
+    let mut response = response.error_for_status().context("The page request failed").map_err(
+        |error| match crate::session::auth_failure_label(&error) {
+            Some(label) => anyhow::Error::msg(label),
+            None => error,
+        },
+    )?;
     // Read the body in chunks with a size cap (R3): an unbounded
     // `response.text()` lets a huge or streaming page eat memory for
     // the full 30 s timeout. 8 MiB is far above any real link page.
@@ -640,5 +660,94 @@ mod tests {
     async fn grab_page_media_rejects_non_http_and_failed_pages() {
         assert!(grab_page_media("ftp://example.com/page.html").await.is_err());
         assert!(grab_page_media("not a url").await.is_err());
+    }
+
+    /// Slice 5: the grabber with a session can fetch a login-walled
+    /// page (cookies + Referer + UA on the page fetch); without one
+    /// the 403 carries the login label instead of a bare status.
+    #[tokio::test]
+    async fn grab_page_media_with_session_passes_a_cookie_gated_page() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                Arc,
+            },
+            thread,
+            time::Duration,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = shutdown.clone();
+        let handle = thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => {
+                        let _ = connection.0.set_nonblocking(false);
+                        connection
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(3));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => {
+                            request.extend_from_slice(&buffer[..count]);
+                            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let cookie = request
+                    .lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("cookie")
+                            .then(|| value.trim().to_string())
+                    })
+                    .unwrap_or_default();
+                if cookie != "sessionid=abc123" {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    continue;
+                }
+                let body = "<html><head><title>t</title></head><body><video src=\"/v/clip.mp4\" controls></video></body></html>";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        let page_url = format!("http://{address}/page.html");
+        let session = SessionHeaders {
+            cookies: Some("sessionid=abc123".to_string()),
+            referer: Some(page_url.clone()),
+            user_agent: Some("ThunderLoad-Test/1.0".to_string()),
+            origin: SessionHeaders::origin_of(&page_url),
+        };
+        assert!(session.validate(&page_url).is_ok(), "test session must validate");
+        // Without the session the page 403s — and the error is the label.
+        let error = grab_page_media(&page_url).await.unwrap_err();
+        assert_eq!(error.to_string(), crate::session::AUTH_REQUIRED_MESSAGE);
+        // With the session the page answers and the media link is found.
+        let list = grab_page_media_with_session(&page_url, Some(&session)).await.unwrap();
+        assert_eq!(list.items.len(), 1);
+        assert_eq!(list.items[0].url, format!("http://{address}/v/clip.mp4"));
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
     }
 }

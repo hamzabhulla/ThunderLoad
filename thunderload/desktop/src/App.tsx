@@ -635,7 +635,10 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       }
       setNotice("Checking link…");
       try {
-        await invoke<Variant[]>("inspect_video_url", { url: clean, referer: null });
+        // The pasted URL as its own referer: hotlink-protected hosts
+        // accept a same-origin referer, and the desktop has no better
+        // one (Slice 5). The engine validates it before use.
+        await invoke<Variant[]>("inspect_video_url", { url: clean, referer: clean });
       } catch (error) {
         if (String(error).includes("is a webpage")) {
           setNotice(YOUTUBE_PAGE_MESSAGE);
@@ -874,7 +877,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     if (isYtDlpPageUrl(clean)) { await inspectYtDlp(clean); return; }
     setInspecting(true); setVariants([]); setVideoNotice("Inspecting media URL…");
     try {
-      const result = await invoke<Variant[]>("inspect_video_url", { url: clean, referer: null });
+      const result = await invoke<Variant[]>("inspect_video_url", { url: clean, referer: clean });
       setVariants(result);
       setVideoNotice(result.length ? result.length + " stream option(s) found." : "No downloadable streams found.");
     } catch (error) { setVideoNotice(String(error)); }
@@ -918,7 +921,9 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     for (const item of chosen) {
       try {
         if (item.kind === "dash") {
-          const result = await invoke<Variant[]>("inspect_video_url", { url: item.url, referer: null });
+          // Referer is the page the manifest was grabbed from — the
+          // host that linked to it — not the manifest itself (Slice 5).
+          const result = await invoke<Variant[]>("inspect_video_url", { url: item.url, referer: grabUrl.trim() });
           const variants = result.filter((variant) => variant.downloadable && variant.url);
           variants.sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bandwidth || 0) - (a.bandwidth || 0));
           const best = variants[0];

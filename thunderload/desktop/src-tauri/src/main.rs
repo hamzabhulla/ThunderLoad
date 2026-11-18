@@ -10,7 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{Emitter, Manager};
-use thunderload_engine::{check_ytdlp_update as engine_check_ytdlp_update, dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_resumable, download_page, download_url_resumable, ensure_tool, grab_page_media as engine_grab_page_media, hls_work_dir, inspect_page, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, store_file_name, tool_status, tools_dir, DownloadControl, DownloadOutcome, DownloadProgress, GlobalRateLimiter, HlsSelection, JobKind, JobOrigin, JobRecord, JobState, JobStore, PageMediaList, SessionHeaders, ToolDownloadProgress, ToolStatus, ToolsMissing, YtDlpTool};
+use thunderload_engine::{check_ytdlp_update as engine_check_ytdlp_update, dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_resumable, download_page, download_url_resumable, ensure_tool, error_text, grab_page_media as engine_grab_page_media, hls_work_dir, inspect_page, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, store_file_name, tool_status, tools_dir, DownloadControl, DownloadOutcome, DownloadProgress, GlobalRateLimiter, HlsSelection, JobKind, JobOrigin, JobRecord, JobState, JobStore, PageMediaList, SessionHeaders, ToolDownloadProgress, ToolStatus, ToolsMissing, YtDlpTool};
 use tokio::{process::Command as TokioCommand, sync::{mpsc, watch}};
 
 /// Build a child-process command that never shows a console window on
@@ -43,7 +43,7 @@ fn hidden_tokio_command<S: AsRef<std::ffi::OsStr>>(program: S) -> TokioCommand {
 #[tauri::command]
 async fn inspect_video_url(url: String, referer: Option<String>) -> Result<Vec<thunderload_engine::VideoVariant>, String> {
     let session = SessionHeaders::with_referer(referer.as_deref());
-    inspect_video(&url, session.as_ref()).await.map_err(|error| error.to_string())
+    inspect_video(&url, session.as_ref()).await.map_err(|error| error_text(&error))
 }
 
 /// Site grabber (Slice 7): fetch one page and list its media links.
@@ -55,7 +55,7 @@ async fn grab_page_media(page_url: String) -> Result<PageMediaList, String> {
     if !(page_url.starts_with("http://") || page_url.starts_with("https://")) {
         return Err("Only HTTP and HTTPS page URLs are supported".into());
     }
-    engine_grab_page_media(&page_url).await.map_err(|error| error.to_string())
+    engine_grab_page_media(&page_url).await.map_err(|error| error_text(&error))
 }
 
 
@@ -684,7 +684,7 @@ async fn start_download(
         });
         let result = download_url_resumable(&url, &task_target, session.as_ref(), control_rx, limit, progress_tx).await;
         let cancelled_while_finishing = *transition_rx.borrow() == DownloadControl::Cancelled;
-        finish_desktop_download(&app_for_task, &job_for_task, &task_target, result.map_err(|error| error.to_string()), cancelled_while_finishing).await;
+        finish_desktop_download(&app_for_task, &job_for_task, &task_target, result.map_err(|error| error_text(&error)), cancelled_while_finishing).await;
     });
     Ok(target.to_string_lossy().to_string())
 }
@@ -765,7 +765,7 @@ async fn start_hls_download(
         });
         let result = download_hls_resumable(&url, &selection, &task_target, session.as_ref(), control_rx, progress_tx, rate_limiter()).await;
         let cancelled_while_finishing = *transition_rx.borrow() == DownloadControl::Cancelled;
-        finish_desktop_download(&app_for_task, &job_for_task, &task_target, result.map_err(|error| error.to_string()), cancelled_while_finishing).await;
+        finish_desktop_download(&app_for_task, &job_for_task, &task_target, result.map_err(|error| error_text(&error)), cancelled_while_finishing).await;
     });
     Ok(target.to_string_lossy().to_string())
 }
@@ -1293,7 +1293,7 @@ async fn start_dash_download(
             control_rx, progress_tx, rate_limiter(),
         ).await;
         let cancelled_while_finishing = *transition_rx.borrow() == DownloadControl::Cancelled;
-        finish_desktop_download(&app_for_task, &job_for_task, &task_target, result.map_err(|error| error.to_string()), cancelled_while_finishing).await;
+        finish_desktop_download(&app_for_task, &job_for_task, &task_target, result.map_err(|error| error_text(&error)), cancelled_while_finishing).await;
     });
     Ok(target.to_string_lossy().to_string())
 }
