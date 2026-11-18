@@ -10,7 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{Emitter, Manager};
-use thunderload_engine::{check_ytdlp_update as engine_check_ytdlp_update, dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_resumable, download_page, download_url_resumable, ensure_tool, error_text, grab_page_media as engine_grab_page_media, hls_work_dir, inspect_page, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, store_file_name, tool_status, tools_dir, DownloadControl, DownloadOutcome, DownloadProgress, GlobalRateLimiter, HlsSelection, JobKind, JobOrigin, JobRecord, JobState, JobStore, PageMediaList, SessionHeaders, ToolDownloadProgress, ToolStatus, ToolsMissing, YtDlpTool};
+use thunderload_engine::{check_ytdlp_update as engine_check_ytdlp_update, dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_live, download_hls_resumable, download_hls_subtitles, download_page, download_url_resumable, ensure_tool, error_text, grab_page_media as engine_grab_page_media, hls_work_dir, inspect_page, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, store_file_name, tool_status, tools_dir, DownloadControl, DownloadOutcome, DownloadProgress, GlobalRateLimiter, HlsSelection, JobKind, JobOrigin, JobRecord, JobState, JobStore, PageMediaList, SessionHeaders, ToolDownloadProgress, ToolStatus, ToolsMissing, YtDlpTool};
 use tokio::{process::Command as TokioCommand, sync::{mpsc, watch}};
 
 /// Build a child-process command that never shows a console window on
@@ -123,6 +123,33 @@ fn job_session(job_id: &str) -> Option<SessionHeaders> {
     let store = JOB_STORE.get()?;
     let store = store.lock().ok()?;
     store.get(job_id).and_then(|record| record.session.clone())
+}
+
+/// Whether the durable row for this job is a live recording, if the
+/// store knows it. A live recording's partial file IS the recording:
+/// it is never deleted by a cancel and never re-recorded over. Unknown
+/// jobs (no row yet) report false, which is the safe VOD behaviour.
+/// Browser-started rows are mirrored under the companion's own id
+/// (no "native-" prefix), while the frontend calls back with the
+/// prefixed id — check both, so the guard holds whichever row exists.
+fn job_is_live(job_id: &str) -> bool {
+    let Some(store) = JOB_STORE.get() else { return false };
+    let Ok(store) = store.lock() else { return false };
+    if store.get(job_id).map(|record| record.live).unwrap_or(false) {
+        return true;
+    }
+    if let Some(bare) = job_id.strip_prefix("native-") {
+        return store.get(bare).map(|record| record.live).unwrap_or(false);
+    }
+    false
+}
+
+/// Whether a cancel that finds no live task may delete the target's
+/// files. A live recording's partial file is never deleted, and a
+/// finished file is never deleted (D9) — only a paused/failed VOD
+/// job's checkpoint goes.
+fn cancel_may_delete_target(is_live: bool, completed: bool) -> bool {
+    !is_live && !completed
 }
 
 /// Deletes every resume file a desktop download can leave behind: the
@@ -607,10 +634,19 @@ async fn cancel_download(job_id: String, target_path: String, app: tauri::AppHan
         if job_completed(&job_id) {
             return Ok(());
         }
-        let target = PathBuf::from(target_path);
-        delete_desktop_resume_files(&target).await;
+        // A live recording's partial file IS the recording: a cancel
+        // that arrives after its task ended (a Paused live job has no
+        // live task) must not delete it. The live task itself keeps the
+        // file on every finish path, so this branch is the only place
+        // a live target could still be lost. The row still flips to
+        // Cancelled — the recording stopped — with the kept-file detail.
+        if cancel_may_delete_target(job_is_live(&job_id), false) {
+            let target = PathBuf::from(target_path);
+            delete_desktop_resume_files(&target).await;
+        }
+        let cancelled_detail = if job_is_live(&job_id) { "Recording stopped · partial file kept" } else { "Cancelled" };
         with_job_store(|store| {
-            let _ = store.update_state(&job_id, JobState::Cancelled, Some("Cancelled"), None);
+            let _ = store.update_state(&job_id, JobState::Cancelled, Some(cancelled_detail), None);
         });
         // No task is alive to report the cancellation (e.g. the job was
         // already Paused, so its task ended), so emit it here — otherwise
@@ -768,6 +804,143 @@ async fn start_hls_download(
         finish_desktop_download(&app_for_task, &job_for_task, &task_target, result.map_err(|error| error_text(&error)), cancelled_while_finishing).await;
     });
     Ok(target.to_string_lossy().to_string())
+}
+
+/// Slice 6: a live HLS recording. Mirrors start_hls_download, but
+/// the engine records the live window as it arrives instead of
+/// downloading a fixed VOD playlist — so there is no checkpoint and
+/// no resume: a pause or cancel keeps the partial .ts file, because
+/// the partial file IS the recording. The target is forced to .ts
+/// (a live TS window cannot be muxed into .mp4 without a remuxer).
+/// A restart re-records from the live edge; it never resumes.
+#[tauri::command]
+async fn start_hls_live_download(
+    job_id: String,
+    url: String,
+    representation_id: Option<String>,
+    audio_representation_id: Option<String>,
+    filename: String,
+    target_path: Option<String>,
+    scheduled_at: Option<u64>,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err("Only HTTP and HTTPS playlist URLs are supported".into());
+    }
+    let raw = safe_filename(&filename, "video.ts");
+    let name = match raw.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() => format!("{stem}.ts"),
+        _ => raw,
+    };
+    let selection = HlsSelection {
+        media_url: representation_id.clone().filter(|value| !value.trim().is_empty()),
+        audio_group: audio_representation_id.clone().filter(|value| !value.trim().is_empty()),
+    };
+    let target = match target_path {
+        Some(path) => PathBuf::from(path),
+        None => reserve_download_path(&default_download_dir().join(&name)).await.map_err(|error| error.to_string())?,
+    };
+    let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
+    {
+        let mut controls = job_controls().lock().map_err(|_| "Download control lock is unavailable")?;
+        controls.insert(job_id.clone(), control_tx);
+    }
+    let mut record = JobRecord::new_desktop(&job_id, &name, &url, JobKind::Hls, Some(&target));
+    record.scheduled_at_ms = scheduled_at;
+    record.representation_id = representation_id.clone();
+    record.audio_representation_id = audio_representation_id.clone();
+    // Slice 6 fix (MAJOR): a live recording's durable row carries the
+    // live flag, so cancel_download can tell it apart from a VOD job
+    // and get_jobs can return it to the frontend.
+    record.live = true;
+    with_job_store(|store| {
+        let _ = store.start_job(record);
+    });
+    let session = job_session(&job_id);
+    let transition_rx = control_rx.clone();
+    let job_for_task = job_id.clone();
+    let app_for_task = app.clone();
+    let task_target = target.clone();
+    tauri::async_runtime::spawn(async move {
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<DownloadProgress>();
+        let progress_app = app_for_task.clone();
+        let progress_id = job_for_task.clone();
+        tauri::async_runtime::spawn(async move {
+            while let Some(progress) = progress_rx.recv().await {
+                let (downloaded, total, percent) = (progress.downloaded, progress.total, progress.percent);
+                with_job_store(|store| {
+                    let _ = store.note_progress(&progress_id, downloaded, total, percent);
+                });
+                let _ = progress_app.emit("download-progress", json!({ "jobId": progress_id, "progress": progress }));
+            }
+        });
+        let result = download_hls_live(&url, &selection, &task_target, session.as_ref(), control_rx, progress_tx, rate_limiter()).await;
+        let cancelled_while_finishing = *transition_rx.borrow() == DownloadControl::Cancelled;
+        // The shared finish helper deletes the target when a cancel
+        // lands while the job is finishing — for a live recording
+        // that would delete the recording itself, so the live finish
+        // is inline here: every terminal state keeps the partial file.
+        match result.map_err(|error| error_text(&error)) {
+            Ok(DownloadOutcome::Completed) => {
+                mark_job_completed(&job_for_task, &task_target);
+                with_job_store(|store| {
+                    let _ = store.update_state(&job_for_task, JobState::Completed, Some(&format!("Saved · {}", task_target.to_string_lossy())), None);
+                });
+                let _ = app_for_task.emit("download-complete", json!({ "jobId": job_for_task, "path": task_target.to_string_lossy() }));
+                if let Ok(mut controls) = job_controls().lock() { controls.remove(&job_for_task); }
+            }
+            Ok(DownloadOutcome::Paused) if cancelled_while_finishing => {
+                with_job_store(|store| {
+                    let _ = store.update_state(&job_for_task, JobState::Cancelled, Some("Recording stopped · partial file kept"), None);
+                });
+                let _ = app_for_task.emit("download-cancelled", json!({ "jobId": job_for_task }));
+                if let Ok(mut controls) = job_controls().lock() { controls.remove(&job_for_task); }
+            }
+            Ok(DownloadOutcome::Paused) => {
+                with_job_store(|store| {
+                    let _ = store.update_state(&job_for_task, JobState::Paused, Some("Paused · partial recording kept"), None);
+                });
+                let _ = app_for_task.emit("download-paused", json!({ "jobId": job_for_task, "targetPath": task_target.to_string_lossy() }));
+            }
+            Ok(DownloadOutcome::Cancelled) => {
+                with_job_store(|store| {
+                    let _ = store.update_state(&job_for_task, JobState::Cancelled, Some("Recording stopped · partial file kept"), None);
+                });
+                let _ = app_for_task.emit("download-cancelled", json!({ "jobId": job_for_task }));
+                if let Ok(mut controls) = job_controls().lock() { controls.remove(&job_for_task); }
+            }
+            Err(error) => {
+                let error_text = error.clone();
+                with_job_store(|store| {
+                    let _ = store.update_state(&job_for_task, JobState::Failed, Some("Transfer interrupted · partial data kept"), Some(&error_text));
+                });
+                let _ = app_for_task.emit("download-error", json!({ "jobId": job_for_task, "error": error, "targetPath": task_target.to_string_lossy() }));
+                if let Ok(mut controls) = job_controls().lock() { controls.remove(&job_for_task); }
+            }
+        }
+    });
+    Ok(target.to_string_lossy().to_string())
+}
+
+/// Slice 6: a one-shot subtitle download. A direct subtitle file
+/// (vtt/ttml/srt) is just a direct download and goes through
+/// start_download; this command is only for an HLS subtitle playlist
+/// (.m3u8), which the engine assembles into one .vtt file. No job
+/// loop, no progress — the caller gets the saved path (or the
+/// labelled error) directly.
+#[tauri::command]
+async fn download_subtitles(playlist_url: String, filename: String) -> Result<String, String> {
+    if !(playlist_url.starts_with("http://") || playlist_url.starts_with("https://")) {
+        return Err("Only HTTP and HTTPS subtitle URLs are supported".into());
+    }
+    let raw = safe_filename(&filename, "subtitles.vtt");
+    let name = match raw.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() => format!("{stem}.vtt"),
+        _ => raw,
+    };
+    let target = reserve_download_path(&default_download_dir().join(&name)).await.map_err(|error| error.to_string())?;
+    let saved = download_hls_subtitles(&playlist_url, &target, None, rate_limiter()).await.map_err(|error| error_text(&error))?;
+    Ok(saved.to_string_lossy().to_string())
 }
 
 /// Chromium-family browsers vs Firefox: the native-messaging manifest
@@ -1674,6 +1847,11 @@ fn native_value_to_record(job: &Value) -> Option<JobRecord> {
         name: job.get("name").and_then(Value::as_str).unwrap_or("Browser download").to_string(),
         url: url.to_string(),
         kind,
+        // Slice 6 fix (MAJOR): the host stores live in the state file,
+        // and the mirror must carry it — otherwise a browser-started
+        // live recording comes back as a VOD row and its target is not
+        // protected from cancel/delete.
+        live: job.get("live").and_then(Value::as_bool).unwrap_or(false),
         origin: JobOrigin::Native,
         state,
         downloaded: job.get("downloaded").and_then(Value::as_u64).unwrap_or(0),
@@ -1752,6 +1930,12 @@ struct SyncJob {
     detail: String,
     #[serde(default)]
     error: Option<String>,
+    /// A live HLS recording (Slice 6 fix): carried so a live row
+    /// re-seeded from the frontend keeps its live routing instead of
+    /// falling through to the VOD start path, which rejects live
+    /// playlists. Absent for rows sent by older frontends.
+    #[serde(default)]
+    live: bool,
 }
 
 fn sync_job_to_record(job: SyncJob) -> JobRecord {
@@ -1800,6 +1984,7 @@ fn sync_job_to_record(job: SyncJob) -> JobRecord {
         session: None,
         detail: job.detail,
         error: job.error,
+        live: job.live,
         created_at_ms: if job.created_at == 0 { now } else { job.created_at },
         updated_at_ms: now,
     }
@@ -2006,7 +2191,7 @@ fn main() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![inspect_video_url, grab_page_media, start_download, pause_download, cancel_download, set_speed_limit, schedule_app_wake, cancel_app_wake, start_hls_download, start_dash_download, inspect_ytdlp_url, start_ytdlp_download, get_ytdlp_tools_status, ensure_ytdlp_tool, check_ytdlp_update, open_ytdlp_release_page, open_tools_folder, get_ffmpeg_path, set_ffmpeg_path, get_native_downloads, control_native_download, dismiss_native_download, register_native_host, check_native_host, open_download_folder, save_extension_file, get_jobs, sync_jobs, remove_job, cancel_queued_job])
+        .invoke_handler(tauri::generate_handler![inspect_video_url, grab_page_media, start_download, pause_download, cancel_download, set_speed_limit, schedule_app_wake, cancel_app_wake, start_hls_download, start_hls_live_download, download_subtitles, start_dash_download, inspect_ytdlp_url, start_ytdlp_download, get_ytdlp_tools_status, ensure_ytdlp_tool, check_ytdlp_update, open_ytdlp_release_page, open_tools_folder, get_ffmpeg_path, set_ffmpeg_path, get_native_downloads, control_native_download, dismiss_native_download, register_native_host, check_native_host, open_download_folder, save_extension_file, get_jobs, sync_jobs, remove_job, cancel_queued_job])
         .run(tauri::generate_context!())
         .expect("error while running ThunderLoad desktop app");
 }
@@ -2463,3 +2648,91 @@ mod native_host_tests {
         assert_eq!(native_manifest_dir("safari", home), None);
     }
 }
+
+/// Slice 6 fix (MAJOR): a live recording's kept partial must survive
+/// the desktop paths that used to destroy it — cancel must never delete
+/// a live target, and a live row must keep its flag through every
+/// re-seeding path (frontend sync, native mirror). These tests pin the
+/// pure decision functions; the Tauri commands around them are
+/// verified by the desktop's CI run (the desktop crate does not build
+/// on the dev VM).
+#[cfg(test)]
+mod live_job_tests {
+    use super::{cancel_may_delete_target, native_value_to_record, sync_job_to_record, SyncJob};
+    use serde_json::json;
+
+    #[test]
+    fn cancel_never_deletes_a_live_target() {
+        // Live: the partial file IS the recording — never deleted,
+        // whether or not the job also completed.
+        assert!(!cancel_may_delete_target(true, false));
+        assert!(!cancel_may_delete_target(true, true));
+        // VOD: a finished file is never deleted (D9); only a
+        // paused/failed VOD job's checkpoint goes.
+        assert!(!cancel_may_delete_target(false, true));
+        assert!(cancel_may_delete_target(false, false));
+    }
+
+    #[test]
+    fn sync_job_carries_the_live_flag() {
+        let live = SyncJob {
+            id: "live-1".to_string(),
+            name: "live.ts".to_string(),
+            url: "https://example.test/live.m3u8".to_string(),
+            kind: "hls".to_string(),
+            status: "Paused".to_string(),
+            downloaded: 123,
+            total: None,
+            percent: None,
+            target_path: Some("/tmp/live.ts".to_string()),
+            created_at: 1,
+            scheduled_at: None,
+            representation_id: None,
+            audio_representation_id: None,
+            detail: "Paused · partial recording kept".to_string(),
+            error: None,
+            live: true,
+        };
+        let record = sync_job_to_record(live);
+        assert!(
+            record.live,
+            "a live row re-seeded from the frontend must stay live, or it takes the VOD start path"
+        );
+        let vod = SyncJob {
+            id: "vod-1".to_string(),
+            name: "video.mp4".to_string(),
+            url: "https://example.test/vod.m3u8".to_string(),
+            kind: "hls".to_string(),
+            status: "Paused".to_string(),
+            downloaded: 456,
+            total: None,
+            percent: None,
+            target_path: Some("/tmp/video.mp4".to_string()),
+            created_at: 1,
+            scheduled_at: None,
+            representation_id: None,
+            audio_representation_id: None,
+            detail: "Paused".to_string(),
+            error: None,
+            live: false,
+        };
+        assert!(
+            !sync_job_to_record(vod).live,
+            "a VOD row must not come back live"
+        );
+    }
+
+    #[test]
+    fn native_mirror_reads_the_live_flag() {
+        let live = json!({"id": "n1", "kind": "hls", "status": "Paused", "url": "https://example.test/live.m3u8", "targetPath": "/tmp/live.ts", "live": true});
+        let record = native_value_to_record(&live).expect("a live native row must convert");
+        assert!(record.live, "a browser-started live recording must stay live in the mirror, or cancel deletes its target");
+        let vod = json!({"id": "n2", "kind": "hls", "status": "Paused", "url": "https://example.test/vod.m3u8", "targetPath": "/tmp/video.mp4"});
+        let record = native_value_to_record(&vod).expect("a VOD native row must convert");
+        assert!(
+            !record.live,
+            "a native row without live must not come back live"
+        );
+    }
+}
+

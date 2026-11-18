@@ -77,12 +77,72 @@ function filenameFromUrl(url, fallback) {
 // Quality label from a real variant only: "{height}p" (+ " HD" at
 // 720p and up), "Audio" for audio-only streams, otherwise the
 // engine's own quality string ("Adaptive" for an HLS master).
-// No fps and no subtitles are shown — the engine exposes neither.
+// Slice 6: a live row is prefixed "Live · ", and the frame rate rides
+// next to the quality when the source carries it — never guessed.
 function qualityLabel(variant) {
   const height = variant?.height || 0;
-  if (height > 0) return height + "p" + (height >= 720 ? " HD" : "");
-  if (variant?.audioOnly || variant?.audio_only) return "Audio";
-  return variant?.quality || "Stream";
+  let label;
+  if (height > 0) label = height + "p" + (height >= 720 ? " HD" : "");
+  else if (variant?.audioOnly || variant?.audio_only) label = "Audio";
+  else label = variant?.quality || "Stream";
+  if (variant?.isLive || variant?.is_live) label = "Live · " + label;
+  if (variant?.fps) label += " · " + Math.round(variant.fps) + " fps";
+  return label;
+}
+
+// Slice 6: subtitle tracks the engine surfaced for the first variant
+// (they ride on every variant). One row per language with its own
+// Download button — the format is what the source carries.
+function renderSubtitleRows(list, variants) {
+  const subtitles = variants?.[0]?.subtitles || [];
+  if (!subtitles.length) return;
+  list.append(el("div", "quality-sub-head", "Subtitles"));
+  for (const subtitle of subtitles) {
+    const row = el("div", "quality");
+    row.append(el("strong", "", subtitle.name || subtitle.language || "Subtitles"));
+    const download = el("button", "download-btn", "Download");
+    download.addEventListener("click", async () => {
+      download.disabled = true;
+      await downloadSubtitle(subtitle);
+      download.disabled = false;
+    });
+    row.append(download);
+    list.append(row);
+  }
+}
+async function downloadSubtitle(subtitle) {
+  try {
+    if (subtitle.format === "m3u8") {
+      const result = await api.runtime.sendMessage({
+        type: "NATIVE_REQUEST",
+        action: "hls.subtitles.download",
+        payload: { playlistUrl: subtitle.url, url: subtitle.url, filename: (subtitle.language || "subtitles") + ".vtt", referer: pageUrl }
+      });
+      if (!result?.ok) throw new Error(result?.error || "Could not download subtitles.");
+    } else {
+      const result = await api.runtime.sendMessage({
+        type: "BROWSER_DOWNLOAD",
+        url: subtitle.url,
+        filename: (subtitle.language || "subtitles") + "." + (subtitle.format || "vtt")
+      });
+      if (!result?.ok) throw new Error(result?.error || "Could not download subtitles.");
+    }
+    showToast("Subtitles saved.");
+  } catch (error) {
+    showToast(nativeErrorMessage(error));
+  }
+}
+
+// Slice 6: downloads intercepted while the desktop app was down are
+// still waiting for the handoff — the popup says so instead of
+// leaving the user wondering where the file went.
+let pendingIntercepts = [];
+function appendInterceptNote() {
+  if (!pendingIntercepts.length) return;
+  sourceList.append(el("div", "intercept-note",
+    pendingIntercepts.length === 1
+      ? "1 download is waiting for the desktop app."
+      : pendingIntercepts.length + " downloads are waiting for the desktop app."));
 }
 function otherLabel(source) {
   const name = filenameFromUrl(source.url, "");
@@ -110,6 +170,7 @@ function renderQualityRows(list, variants, source) {
     row.append(download);
     list.append(row);
   }
+  renderSubtitleRows(list, variants);
 }
 function renderOtherMedia(others) {
   if (!others.length) return null;
@@ -145,10 +206,12 @@ function render() {
     const others = sources.filter((source) => source !== primarySource);
     const otherSection = renderOtherMedia(others);
     if (otherSection) sourceList.append(otherSection);
+    appendInterceptNote();
     return;
   }
   if (!sources.length) {
     sourceList.append(el("div", "empty", "No media found on this page."));
+    appendInterceptNote();
     return;
   }
   primarySource = sources.find((source) => source.kind === "DASH manifest" || source.kind === "HLS playlist") || sources[0];
@@ -165,6 +228,7 @@ function render() {
   sourceList.append(card);
   const otherSection = renderOtherMedia(others);
   if (otherSection) sourceList.append(otherSection);
+  appendInterceptNote();
 }
 function renderYtDlpCard() {
   const card = el("section", "primary-card");
@@ -221,6 +285,7 @@ function renderYtDlpQualityRows(list, variants) {
     row.append(download);
     list.append(row);
   }
+  renderSubtitleRows(list, variants);
 }
 // One named tool-download button (consent + progress, FINAL
 // requirement): the button names the tool ("Download yt-dlp" /
@@ -268,17 +333,25 @@ async function inspectYtDlpPage() {
       ytdlpToolsMissing = result?.toolsMissing || null;
       if (!ytdlpToolsMissing) showToast(result?.error || "Could not inspect this page.");
       ytdlpVariants = null;
+      // Slice 6 fix (MINOR 1): the normal inspect found nothing
+      // usable — try the GenericIE fallback. toolsMissing is the
+      // exception: generic needs the same yt-dlp binary, so it
+      // cannot run either.
+      if (!ytdlpToolsMissing) void inspectGenericPage(++genericInspectRun);
     } else {
       const variants = (result.variants || []).filter((item) => item?.downloadable && item?.url);
       variants.sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bandwidth || 0) - (a.bandwidth || 0));
       ytdlpVariants = variants;
       ytdlpTitle = result.title || "";
       ytdlpToolsMissing = null;
-      void checkYtDlpDeno();
+      if (!variants.length) void inspectGenericPage(++genericInspectRun);
+      else void checkYtDlpDeno();
     }
   } catch (error) {
     showToast(nativeErrorMessage(error));
     ytdlpVariants = null;
+    // A failed inspect is not the end — try the GenericIE fallback.
+    void inspectGenericPage(++genericInspectRun);
   } finally {
     ytdlpInspecting = false;
     render();
@@ -367,7 +440,9 @@ async function startVariant(variant, source, action, askPermission = false) {
     referer: pageUrl,
     filename: variant.kind === "hls" || variant.kind === "dash" ? (filename.replace(/\.[^.]+$/, "") + ".mp4") : filename,
     representationId: variant.representationId,
-    audioRepresentationId: variant.audioRepresentationId || ""
+    audioRepresentationId: variant.audioRepresentationId || "",
+    // Slice 6: a live row records the stream as it arrives.
+    live: !!(variant.isLive || variant.is_live)
   }, askPermission);
   if (!result?.ok) throw new Error(nativeErrorMessage(result?.error || "Could not start the selected quality."));
   return { ok: true, message: "Downloading " + (variant.quality || "media") + " in ThunderLoad." };
@@ -395,6 +470,8 @@ async function scanActiveTab() {
     if (!result?.ok) throw new Error(result?.error || "Cannot scan this page");
     pageUrl = result.pageUrl || "";
     sources = result.sources || [];
+    // Slice 6: downloads intercepted while the desktop app was down.
+    pendingIntercepts = Array.isArray(result.pendingIntercepts) ? result.pendingIntercepts : [];
     if (result.ytdlp) {
       // An inspect already ran for this tab (this popup session or
       // the cached background entry): show its formats, no re-spawn.
@@ -403,7 +480,10 @@ async function scanActiveTab() {
       ytdlpInspecting = false;
       ytdlpToolsMissing = null;
       render();
-      void checkYtDlpDeno();
+      // Slice 6 fix (MINOR 1): a cached inspect that found nothing
+      // usable is not the end — try the GenericIE fallback.
+      if (!ytdlpVariants.length) void inspectGenericPage(++genericInspectRun);
+      else void checkYtDlpDeno();
     } else if (isYtDlpPageUrl(pageUrl)) {
       // First open on a YouTube/social page: inspect it (loading
       // state first — inspect takes 2–10 s; the background cache
@@ -418,11 +498,34 @@ async function scanActiveTab() {
       ytdlpToolsMissing = null;
       render();
       autoInspectPrimary();
+      // Slice 6: GenericIE fallback — sniffing found nothing usable
+      // for this page, so ask yt-dlp's generic extractor what the
+      // page itself exposes. A stale result (user rescanned while
+      // the inspect ran) is dropped by the run guard.
+      if (!sources.length) void inspectGenericPage(++genericInspectRun);
     }
   } catch (error) {
     sources = []; render();
     showToast(error.message || String(error));
   }
+}
+// Slice 6: the GenericIE fallback inspect for the popup. Runs only
+// when the scan found nothing; the run guard drops results from a
+// superseded scan.
+let genericInspectRun = 0;
+async function inspectGenericPage(run) {
+  try {
+    const result = await api.runtime.sendMessage({ type: "YTDLP_INSPECT_GENERIC", pageUrl });
+    if (run !== genericInspectRun) return;
+    if (!result?.ok) return;
+    const variants = (result.variants || []).filter((item) => item?.downloadable && item?.url);
+    if (!variants.length) return;
+    variants.sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bandwidth || 0) - (a.bandwidth || 0));
+    ytdlpVariants = variants;
+    ytdlpTitle = result.title || "";
+    ytdlpToolsMissing = null;
+    render();
+  } catch (_) { /* A failed generic inspect leaves the empty state. */ }
 }
 async function loadInterceptToggle() {
   try {

@@ -168,6 +168,8 @@
       '.p-close{pointer-events:auto;flex:none;width:22px;height:22px;padding:0;border:0;border-radius:5px;background:transparent;color:#8b9eb2;font:16px/1 system-ui,-apple-system,"Segoe UI",sans-serif;cursor:pointer}',
       '.p-close:hover{background:#1e293b;color:#e8f1fc}',
       '.p-qualities{display:grid;gap:6px}',
+      '.p-subtitles{display:grid;gap:6px;margin-top:10px}',
+      '.p-sub-head{color:#aebdce;font:600 11px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}',
       '.p-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;border:1px solid #1e293b;border-radius:6px;background:#111c2e}',
       '.p-row.best{border-color:#16a34a}',
       '.p-best{flex:none;padding:1px 5px;border:1px solid #16a34a;border-radius:4px;color:#4ade80;font:600 9px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}',
@@ -295,13 +297,100 @@
 
   // Quality label from a real variant only: "{height}p" (+ " HD" at
   // 720p and up), "Audio" for audio-only streams, otherwise the
-  // engine's own quality string. No fps and no subtitles are shown —
-  // the engine exposes neither.
+  // engine's own quality string. Slice 6: a live row is prefixed
+  // "Live · ", and the frame rate rides next to the quality when the
+  // source carries it — shown only when present, never guessed.
   function qualityLabel(variant) {
     const height = variant?.height || 0;
-    if (height > 0) return height + "p" + (height >= 720 ? " HD" : "");
-    if (variant?.audioOnly || variant?.audio_only) return "Audio";
-    return variant?.quality || "Stream";
+    let label;
+    if (height > 0) label = height + "p" + (height >= 720 ? " HD" : "");
+    else if (variant?.audioOnly || variant?.audio_only) label = "Audio";
+    else label = variant?.quality || "Stream";
+    if (variant?.isLive || variant?.is_live) label = "Live · " + label;
+    if (variant?.fps) label += " · " + Math.round(variant.fps) + " fps";
+    return label;
+  }
+
+  // Slice 6: subtitle tracks the engine surfaced for the first
+  // variant (they ride on every variant). One row per language with
+  // its own Download button — the format is what the source carries.
+  function subtitleSection(variants, target) {
+    const subtitles = variants?.[0]?.subtitles || [];
+    if (!subtitles.length) return null;
+    const section = document.createElement("div");
+    section.className = "p-subtitles";
+    const heading = document.createElement("div");
+    heading.className = "p-sub-head";
+    heading.textContent = "Subtitles";
+    section.append(heading);
+    for (const subtitle of subtitles) {
+      const row = document.createElement("div");
+      row.className = "p-row";
+      const label = document.createElement("span");
+      label.className = "p-label";
+      label.textContent = subtitle.name || subtitle.language || "Subtitles";
+      const download = document.createElement("button");
+      download.type = "button";
+      download.className = "p-dl";
+      download.textContent = "Download";
+      download.addEventListener("click", () => downloadSubtitle(subtitle, target));
+      row.append(label, download);
+      section.append(row);
+    }
+    return section;
+  }
+
+  // Slice 6: one subtitle download. An HLS subtitle playlist
+  // (format "m3u8") goes to the host, which assembles it into one
+  // .vtt; a single file (vtt/ttml/srt) downloads directly in the
+  // browser. Success shows as a completed progress state, failure
+  // as an error state — same surface as a video download.
+  async function downloadSubtitle(subtitle, target) {
+    if (!subtitle?.url || !target) return;
+    panelDownloadState = { label: subtitle.name || subtitle.language || "Subtitles", percent: 0, phase: "preparing" };
+    panelDownloadSource = subtitle.url;
+    progressSection();
+    try {
+      if (subtitle.format === "m3u8") {
+        const result = await chrome.runtime.sendMessage({
+          type: "NATIVE_REQUEST",
+          action: "hls.subtitles.download",
+          payload: { playlistUrl: subtitle.url, url: subtitle.url, filename: (subtitle.language || "subtitles") + ".vtt", referer: location.href }
+        });
+        if (!result?.ok) throw new Error(result?.error || "Could not download subtitles.");
+      } else {
+        const result = await chrome.runtime.sendMessage({
+          type: "BROWSER_DOWNLOAD",
+          url: subtitle.url,
+          filename: (subtitle.language || "subtitles") + "." + (subtitle.format || "vtt")
+        });
+        if (!result?.ok) throw new Error(result?.error || "Could not download subtitles.");
+      }
+      panelDownloadState = { label: subtitle.name || subtitle.language || "Subtitles", phase: "complete" };
+      progressSection();
+    } catch (error) {
+      panelDownloadState = { label: subtitle.name || subtitle.language || "Subtitles", phase: "error", text: error?.message || String(error) };
+      if (isPanelOpen()) progressSection();
+    }
+  }
+
+  // Slice 6: a note when downloads intercepted while the desktop app
+  // was down are still waiting for the handoff — the user should know
+  // the file is queued, not lost. Appended after Connect; guarded
+  // against duplicates across re-renders.
+  function appendInterceptNote(panel) {
+    if (!panel) return;
+    chrome.runtime.sendMessage({ type: "GET_INTERCEPT_STATUS" }).then((result) => {
+      const pending = Array.isArray(result?.pending) ? result.pending : [];
+      if (!pending.length) return;
+      if (!panel.isConnected || panel.querySelector(".p-intercept-note")) return;
+      const note = document.createElement("div");
+      note.className = "p-note show p-intercept-note";
+      note.textContent = pending.length === 1
+        ? "1 download is waiting for the desktop app."
+        : pending.length + " downloads are waiting for the desktop app.";
+      panel.append(note);
+    }).catch(() => {});
   }
 
   // Slice 1b: a long (often gibberish) filename is shown short —
@@ -565,9 +654,29 @@
     empty.textContent = "No downloadable media URL is exposed by this player. DRM or protected streams may not be accessible.";
     panel.append(empty);
     panel.append(connectButton());
+    appendInterceptNote(panel);
     status?.classList.remove("show");
     panel.classList.add("show");
     clearTimeout(autoHideTimer);
+    // Slice 6: GenericIE fallback — nothing was detected, so ask
+    // yt-dlp's generic extractor what the page itself exposes. If it
+    // finds formats the panel becomes the formats panel; if not (or
+    // the user closed the panel meanwhile) the empty panel stays.
+    tryGenericInspect(target);
+  }
+
+  async function tryGenericInspect(target) {
+    let result;
+    try {
+      result = await chrome.runtime.sendMessage({ type: "YTDLP_INSPECT_GENERIC", pageUrl: location.href });
+    } catch (_) { return; }
+    if (panelTarget !== target || panelPrimary !== null || !panelEl()?.classList.contains("show")) return;
+    if (!result?.ok) return;
+    const variants = (result.variants || []).filter((item) => item?.downloadable && item?.url);
+    if (!variants.length) return;
+    variants.sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bandwidth || 0) - (a.bandwidth || 0));
+    panelYtDlp = { variants, title: result.title || "", generic: true };
+    renderYtDlpPanel();
   }
 
   // Slice 3: yt-dlp panel state. null = inspect in flight;
@@ -690,6 +799,9 @@
         list.className = "p-qualities";
         for (const [index, variant] of variants.entries()) list.append(ytdlpVariantRow(variant, panelTarget, index === 0));
         scroll.append(list);
+        // Slice 6: subtitle tracks ride on the first variant.
+        const subs = subtitleSection(variants, panelTarget);
+        if (subs) scroll.append(subs);
       } else {
         const empty = document.createElement("div");
         empty.className = "p-empty";
@@ -709,6 +821,7 @@
       if (scroll.childElementCount) panel.append(scroll);
       panel.append(connectButton());
     }
+    appendInterceptNote(panel);
     status?.classList.remove("show");
     panel.classList.add("show");
     clearTimeout(autoHideTimer);
@@ -733,22 +846,36 @@
           panelYtDlp = result?.toolsMissing
             ? { toolsMissing: result.toolsMissing }
             : { error: result?.error || "Could not inspect this page." };
+          // Slice 6 fix (MINOR 1): the normal inspect found nothing
+          // usable — try the GenericIE fallback before settling on
+          // the error state. toolsMissing is the exception: generic
+          // needs the same yt-dlp binary, so it cannot run either.
+          if (!result?.toolsMissing) tryGenericInspect(target);
         } else {
           const variants = (result.variants || []).filter((item) => item?.downloadable && item?.url);
           variants.sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bandwidth || 0) - (a.bandwidth || 0));
           panelYtDlp = { variants, title: result.title || "" };
-          // Deno check: after a successful inspect, a missing Deno
-          // means YouTube fell back to fewer formats — offer the
-          // download right here instead of failing silently.
-          try {
-            const toolStatus = await chrome.runtime.sendMessage({ type: "YTDLP_TOOLS_STATUS" });
-            if (toolStatus?.ok && toolStatus.deno && toolStatus.deno.present === false) ytdlpDenoMissing = true;
-          } catch (_) { /* Tools status is best-effort here. */ }
+          if (!variants.length) {
+            // Slice 6 fix (MINOR 1): no usable formats from the normal
+            // inspect — try the GenericIE fallback.
+            tryGenericInspect(target);
+          } else {
+            // Deno check: after a successful inspect, a missing Deno
+            // means YouTube fell back to fewer formats — offer the
+            // download right here instead of failing silently.
+            try {
+              const toolStatus = await chrome.runtime.sendMessage({ type: "YTDLP_TOOLS_STATUS" });
+              if (toolStatus?.ok && toolStatus.deno && toolStatus.deno.present === false) ytdlpDenoMissing = true;
+            } catch (_) { /* Tools status is best-effort here. */ }
+          }
         }
         if (panelEl()?.classList.contains("show")) renderYtDlpPanel();
       } catch (_) {
         if (panelTarget !== target) return;
         panelYtDlp = { error: "Could not inspect this page." };
+        // Slice 6 fix (MINOR 1): a failed inspect is not the end —
+        // try the GenericIE fallback before settling on the error.
+        tryGenericInspect(target);
         if (panelEl()?.classList.contains("show")) renderYtDlpPanel();
       }
     })();
@@ -837,6 +964,9 @@
         for (const [index, variant] of panelVariants.entries()) list.append(variantRow(variant, panelTarget, index === 0));
       }
       scroll.append(list);
+      // Slice 6: subtitle tracks ride on the first variant.
+      const subs = subtitleSection(panelVariants, panelTarget);
+      if (subs) scroll.append(subs);
     } else {
       // Direct media has no qualities to list — one row for the file
       // itself: its short name, its container, and a Download button.
@@ -881,6 +1011,7 @@
     }
     if (scroll.childElementCount) panel.append(scroll);
     panel.append(connectButton());
+    appendInterceptNote(panel);
     status?.classList.remove("show");
     panel.classList.add("show");
     clearTimeout(autoHideTimer);

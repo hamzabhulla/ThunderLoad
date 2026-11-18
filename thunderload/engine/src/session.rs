@@ -240,13 +240,60 @@ pub fn map_auth_error(error: reqwest::Error) -> anyhow::Error {
 
 /// User-facing text for a failed engine call: a 401/403 anywhere in
 /// the error chain becomes the login label, anything else keeps its
-/// own message. The desktop and the native host both funnel their job
-/// failures through this one function, so a gated download reads the
-/// same in the app whether it started in the browser or on the desktop.
+/// own message — unless it is one of the known failure shapes below,
+/// which get a plain-language label of their own (Slice 6). The
+/// desktop and the native host both funnel their job failures through
+/// this one function, so a gated download reads the same in the app
+/// whether it started in the browser or on the desktop.
+///
+/// Label precedence (open question, Slice 5/6 — preserved as-is, Hamza
+/// to decide): auth wins over everything, including Slice 4's
+/// refresh-exhaustion expiry message, because a 401/403 in the chain
+/// is the login label by design. If Hamza decides expiry should win,
+/// the change is one branch here.
 pub fn error_text(error: &anyhow::Error) -> String {
-    auth_failure_label(error)
-        .map(str::to_string)
-        .unwrap_or_else(|| error.to_string())
+    if let Some(label) = auth_failure_label(error) {
+        return label.to_string();
+    }
+    if let Some(label) = download_failure_label(error) {
+        return label;
+    }
+    error.to_string()
+}
+
+/// Plain-language labels for the failure shapes whose cause is known
+/// (Slice 6), checked after auth. A 404 is a gone file, a 416 is a
+/// resume the server will not honour, a 5xx is the server's fault, and
+/// a transport failure is a connection problem — none of those is a
+/// login problem, and none of them deserves a bare status code or a
+/// raw reqwest message. Anything unrecognised stays raw: inventing a
+/// label for an unknown error would be worse than showing it.
+pub fn download_failure_label(error: &anyhow::Error) -> Option<String> {
+    for cause in error.chain() {
+        if let Some(request_error) = cause.downcast_ref::<reqwest::Error>() {
+            if let Some(status) = request_error.status() {
+                return Some(match status {
+                    reqwest::StatusCode::NOT_FOUND => {
+                        "This file is no longer available (404).".to_string()
+                    }
+                    reqwest::StatusCode::RANGE_NOT_SATISFIABLE => {
+                        "This download can't be resumed from where it stopped.".to_string()
+                    }
+                    status if status.is_server_error() => {
+                        format!("The server reported an error (HTTP {}). Try again later.", status.as_u16())
+                    }
+                    _ => return None,
+                });
+            }
+            if request_error.is_connect() {
+                return Some("Could not reach the server. Check your connection and try again.".to_string());
+            }
+            if request_error.is_timeout() {
+                return Some("The server took too long to respond. Try again.".to_string());
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -426,5 +473,41 @@ mod tests {
         assert_eq!(relabelled.to_string(), AUTH_REQUIRED_MESSAGE);
         let kept = map_auth_error(status_error(500).await);
         assert!(kept.to_string().contains("500"));
+    }
+
+    // Slice 6: known failure shapes get a plain-language label; auth
+    // still wins over all of them.
+    #[tokio::test]
+    async fn download_failure_label_maps_known_shapes() {
+        let not_found = anyhow::Error::new(status_error(404).await);
+        assert_eq!(download_failure_label(&not_found).as_deref(), Some("This file is no longer available (404)."));
+        let range = anyhow::Error::new(status_error(416).await);
+        assert_eq!(download_failure_label(&range).as_deref(), Some("This download can't be resumed from where it stopped."));
+        let server = anyhow::Error::new(status_error(503).await);
+        assert!(download_failure_label(&server).unwrap().contains("503"));
+        // Auth wins: a 403 is a login label, never a generic failure label.
+        let forbidden = anyhow::Error::new(status_error(403).await);
+        assert_eq!(download_failure_label(&forbidden), None);
+        assert_eq!(error_text(&forbidden), AUTH_REQUIRED_MESSAGE);
+        assert_eq!(error_text(&not_found), "This file is no longer available (404).");
+        // An unknown error stays raw — no invented label.
+        let plain = anyhow::anyhow!("something odd happened");
+        assert_eq!(download_failure_label(&plain), None);
+        assert_eq!(error_text(&plain), "something odd happened");
+    }
+
+    #[tokio::test]
+    async fn download_failure_label_maps_connect_and_timeout() {
+        // Unreachable localhost port: a real connect failure.
+        let error = reqwest::Client::new()
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .unwrap_err();
+        let wrapped = anyhow::Error::new(error);
+        assert_eq!(
+            download_failure_label(&wrapped).as_deref(),
+            Some("Could not reach the server. Check your connection and try again.")
+        );
     }
 }

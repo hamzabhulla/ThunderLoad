@@ -31,8 +31,10 @@ button{cursor:pointer}.secondary{min-height:30px;padding:0 10px;border:1px solid
 .switch input:checked + .slider{background:#16a34a}
 .switch input:checked + .slider::after{transform:translateX(16px);background:#fff}
 .toast{display:none;margin-top:10px;padding:8px 9px;border:1px solid #1e293b;border-radius:5px;background:#111c2e;color:#c8def2;font-size:10px;line-height:1.4}.toast.show{display:block}
-/* Slice 3: yt-dlp card — named tool consent + progress, never a
-   generic "downloading tool" label. */
+/* Slice 6: subtitle rows under the quality list, and the note for
+   downloads intercepted while the desktop app was down. */
+.quality-sub-head{color:#aebdce;font-size:11px;font-weight:600}
+.intercept-note{padding:8px;color:#aebdce;font-size:10px;line-height:1.5}
 .ytdlp-note{padding:8px;color:#aebdce;font-size:10px;line-height:1.5}
 .ytdlp-consent{display:grid;gap:8px}
 .secondary-btn{min-height:30px;padding:0 12px;border:1px solid #16a34a;border-radius:6px;background:transparent;color:#4ade80;font-size:11px;font-weight:600}.secondary-btn:hover{background:rgba(22,163,74,.15)}.secondary-btn:disabled{opacity:.5;cursor:wait}
