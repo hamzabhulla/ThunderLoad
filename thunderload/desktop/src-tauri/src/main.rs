@@ -10,7 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{Emitter, Manager};
-use thunderload_engine::{check_ytdlp_update as engine_check_ytdlp_update, dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_resumable, download_page, download_url_resumable, ensure_tool, grab_page_media as engine_grab_page_media, hls_work_dir, inspect_page, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, store_file_name, tool_status, tools_dir, DownloadControl, DownloadOutcome, DownloadProgress, GlobalRateLimiter, JobKind, JobOrigin, JobRecord, JobState, JobStore, PageMediaList, SessionHeaders, ToolDownloadProgress, ToolStatus, ToolsMissing, YtDlpTool};
+use thunderload_engine::{check_ytdlp_update as engine_check_ytdlp_update, dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_resumable, download_page, download_url_resumable, ensure_tool, grab_page_media as engine_grab_page_media, hls_work_dir, inspect_page, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, store_file_name, tool_status, tools_dir, DownloadControl, DownloadOutcome, DownloadProgress, GlobalRateLimiter, HlsSelection, JobKind, JobOrigin, JobRecord, JobState, JobStore, PageMediaList, SessionHeaders, ToolDownloadProgress, ToolStatus, ToolsMissing, YtDlpTool};
 use tokio::{process::Command as TokioCommand, sync::{mpsc, watch}};
 
 /// Build a child-process command that never shows a console window on
@@ -693,6 +693,8 @@ async fn start_download(
 async fn start_hls_download(
     job_id: String,
     url: String,
+    representation_id: Option<String>,
+    audio_representation_id: Option<String>,
     filename: String,
     target_path: Option<String>,
     scheduled_at: Option<u64>,
@@ -702,6 +704,15 @@ async fn start_hls_download(
         return Err("Only HTTP and HTTPS playlist URLs are supported".into());
     }
     let name = safe_filename(&filename, "video.mp4");
+    // Slice 4 (Gemini claim 4): the HLS selection travels with the job.
+    // `url` is the MASTER playlist URL (the frontend passes videoUrl);
+    // the chosen variant's identity is its media playlist URL, which the
+    // frontend stores in representationId — HLS variants carry no
+    // representation id of their own. Empty strings mean "no choice".
+    let selection = HlsSelection {
+        media_url: representation_id.clone().filter(|value| !value.trim().is_empty()),
+        audio_group: audio_representation_id.clone().filter(|value| !value.trim().is_empty()),
+    };
     // Resume reuses the paused job's target so the on-disk HLS checkpoint
     // is found; a fresh job reserves a new target, as before. The
     // target_path argument is optional for existing callers. The target
@@ -716,9 +727,13 @@ async fn start_hls_download(
         let mut controls = job_controls().lock().map_err(|_| "Download control lock is unavailable")?;
         controls.insert(job_id.clone(), control_tx);
     }
-    // Durable job record (Slice 5) — see start_download.
+    // Durable job record (Slice 5) — see start_download. The selection
+    // is stored so a desktop resume re-resolves the master with the same
+    // variant and audio instead of falling back to the first variant.
     let mut record = JobRecord::new_desktop(&job_id, &name, &url, JobKind::Hls, Some(&target));
     record.scheduled_at_ms = scheduled_at;
+    record.representation_id = representation_id.clone();
+    record.audio_representation_id = audio_representation_id.clone();
     with_job_store(|store| {
         let _ = store.start_job(record);
     });
@@ -748,7 +763,7 @@ async fn start_hls_download(
                 let _ = progress_app.emit("download-progress", json!({ "jobId": progress_id, "progress": progress }));
             }
         });
-        let result = download_hls_resumable(&url, &task_target, session.as_ref(), control_rx, progress_tx, rate_limiter()).await;
+        let result = download_hls_resumable(&url, &selection, &task_target, session.as_ref(), control_rx, progress_tx, rate_limiter()).await;
         let cancelled_while_finishing = *transition_rx.borrow() == DownloadControl::Cancelled;
         finish_desktop_download(&app_for_task, &job_for_task, &task_target, result.map_err(|error| error.to_string()), cancelled_while_finishing).await;
     });

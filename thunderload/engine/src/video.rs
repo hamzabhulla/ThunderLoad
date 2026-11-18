@@ -1,5 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use crate::session::{apply_session, SessionHeaders};
+use aes::Aes128;
+use cbc::{cipher::{generic_array::{typenum::U16, GenericArray}, BlockDecryptMut, KeyIvInit}, Decryptor};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::{path::{Path, PathBuf}, sync::{atomic::{AtomicU64, AtomicUsize, Ordering}, Arc}, time::Duration};
@@ -8,7 +10,41 @@ use quick_xml::{events::Event, Reader};
 use futures_util::StreamExt;
 use std::collections::{HashMap, HashSet};
 use url::Url;
-use crate::download::{default_download_dir, partial_download_metadata_path, safe_filename, DownloadControl, DownloadOutcome, DownloadProgress, GlobalRateLimiter, WEBPAGE_NOT_MEDIA_MESSAGE};
+use crate::download::{default_download_dir, partial_download_metadata_path, safe_filename, DownloadControl, DownloadOutcome, DownloadProgress, GlobalRateLimiter, DEFAULT_RESUMABLE_CONNECTIONS, WEBPAGE_NOT_MEDIA_MESSAGE};
+
+/// How many times one download re-resolves its playlist/manifest to
+/// refresh expired signed URLs before giving up. Two refreshes cover a
+/// playlist that expired mid-download and one unlucky retry; more would
+/// just hammer a server that will never serve the URLs again.
+const MAX_SEGMENT_URL_REFRESHES: usize = 2;
+
+/// True when `error` is an HTTP 401/403 — the signature of an expired
+/// signed URL (or a session the server no longer accepts). Segment
+/// fetchers use it to decide whether re-resolving the playlist is worth
+/// trying; every other failure keeps the checkpoint and fails as today.
+fn is_auth_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<reqwest::Error>()
+        .and_then(|error| error.status())
+        .is_some_and(|status| status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN)
+}
+
+/// The identity of a media URL for plan comparison: the URL with its
+/// query string and fragment stripped. Signed segment URLs rotate their
+/// query (the signature) on every manifest fetch while the media itself
+/// stays the same file — comparing full URLs would treat every refresh
+/// as a different playlist and restart the download from scratch. The
+/// path (plus the byte range, compared alongside) is what identifies a
+/// segment; a path change is a genuinely different plan.
+fn url_identity(url: &str) -> String {
+    match Url::parse(url) {
+        Ok(mut parsed) => {
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            parsed.to_string()
+        }
+        Err(_) => url.to_string(),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -181,7 +217,11 @@ fn unsupported_hls_reason(body: &str) -> Option<String> {
     for line in body.lines().map(str::trim) {
         if let Some(attributes) = line.strip_prefix("#EXT-X-KEY:") {
             let method = attr(attributes, "METHOD").unwrap_or_default();
-            if !method.eq_ignore_ascii_case("NONE") {
+            // AES-128 is downloadable (Slice 4: decrypted in-engine, key
+            // fetched with the same session as the playlist). Anything
+            // else — SAMPLE-AES, or a method this code has never seen —
+            // is protected content and stays refused, never attempted.
+            if !method.eq_ignore_ascii_case("NONE") && !method.eq_ignore_ascii_case("AES-128") {
                 return Some("Encrypted HLS stream is not supported".into());
             }
         }
@@ -1499,11 +1539,64 @@ async fn unique_video_path(directory: &Path, stem: &str, extension: &str) -> Res
 
 /// One addressable piece of an HLS playlist: a whole segment file, or a
 /// byte range (`EXT-X-BYTERANGE`) of a larger resource.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// Equality is the segment's IDENTITY — its URL with the query stripped
+/// plus its byte range — not its encryption key. The key is fetched fresh
+/// per segment at download time, and a finished segment is already
+/// plaintext on disk, so a key-URI rotation (or a re-key) must not make
+/// a checkpoint look like a different job: the media is the same, the
+/// old plaintext is still correct, and only the query (the signature)
+/// changed. See `url_identity`.
+#[derive(Debug, Clone, Serialize, Deserialize, Eq)]
 struct HlsSegmentRef {
     url: String,
     /// (start offset, length) when the segment is an EXT-X-BYTERANGE slice.
     range: Option<(u64, u64)>,
+    /// AES-128 encryption for this segment, if any (Slice 4). The key is
+    /// fetched at download time and never persisted — only its URI and
+    /// IV are stored, so a resume re-fetches the key fresh.
+    #[serde(default)]
+    key: Option<HlsKeyRef>,
+}
+
+impl PartialEq for HlsSegmentRef {
+    fn eq(&self, other: &Self) -> bool {
+        url_identity(&self.url) == url_identity(&other.url) && self.range == other.range
+    }
+}
+
+/// The AES-128 key for one HLS segment, as declared by `#EXT-X-KEY`:
+/// the key URI (resolved against the playlist) and the IV. `iv` is None
+/// when the playlist carries no explicit IV — then the IV is that
+/// segment's media sequence number as a 16-byte big-endian integer
+/// (RFC 8216 §4.3.2.4), resolved per segment at parse time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct HlsKeyRef {
+    uri: String,
+    iv: Option<[u8; 16]>,
+}
+
+/// What the user picked from an HLS master playlist (Slice 4, Gemini
+/// claim 4). HLS variants carry no representation id of their own, so
+/// the variant's identity is its media playlist URL, and the audio
+/// rendition's identity is its GROUP-ID — the same two values the
+/// `VideoVariant` already carries as `url` and `audio_representation_id`.
+/// Both None means "the first (highest) variant", the old behaviour:
+/// callers that only know a bare media playlist pass the default.
+#[derive(Debug, Clone, Default)]
+pub struct HlsSelection {
+    /// Media playlist URL of the chosen variant, if the caller picked one
+    /// from a master playlist.
+    pub media_url: Option<String>,
+    /// GROUP-ID of the chosen audio rendition, if the variant has one.
+    pub audio_group: Option<String>,
+}
+
+impl HlsSelection {
+    /// No explicit choice: first variant, its own audio group if any.
+    pub fn none() -> Self {
+        Self::default()
+    }
 }
 
 /// Everything needed to (re)download one HLS job, persisted as the
@@ -1527,6 +1620,16 @@ struct HlsJobState {
     audio_segments: Vec<HlsSegmentRef>,
     audio_init_done: bool,
     audio_done: Vec<usize>,
+    /// The user's selection from the master playlist (Slice 4): the
+    /// chosen variant's media playlist URL and audio GROUP-ID. Both None
+    /// on checkpoints written before Slice 4 (`#[serde(default)]`) and
+    /// on bare media playlists, which have no master to select from.
+    /// A different selection is a different job: its segment list and
+    /// output file differ, so it must not reuse this checkpoint.
+    #[serde(default)]
+    selected_media_url: Option<String>,
+    #[serde(default)]
+    selected_audio_group: Option<String>,
 }
 
 impl HlsJobState {
@@ -1544,11 +1647,16 @@ impl HlsJobState {
     /// job: same playlist, same variant, same audio rendition, same
     /// segment list in the same order. Anything else is discarded and the
     /// job restarts from scratch instead of joining two different files.
+    /// Segment identity is URL-minus-query plus byte range (see
+    /// `url_identity`): a signed-URL rotation must not look like a
+    /// different job, or a resume after a refresh would restart.
     fn matches_plan(&self, plan: &HlsJobState) -> bool {
         self.version == plan.version
             && self.playlist_url == plan.playlist_url
             && self.media_url == plan.media_url
             && self.audio_playlist_url == plan.audio_playlist_url
+            && self.selected_media_url == plan.selected_media_url
+            && self.selected_audio_group == plan.selected_audio_group
             && self.session.as_ref().map(|session| session.credential_identity())
                 == plan.session.as_ref().map(|session| session.credential_identity())
             && self.extension == plan.extension
@@ -1579,8 +1687,12 @@ struct HlsMediaPlaylist {
 }
 
 /// Parses one HLS media playlist: segment URIs, the EXT-X-MAP init segment
-/// and EXT-X-BYTERANGE slices. Encrypted segments are rejected; a playlist
-/// without EXT-X-ENDLIST is a live/unfinished playlist and is rejected too.
+/// and EXT-X-BYTERANGE slices, and `#EXT-X-KEY` AES-128 encryption (Slice
+/// 4). The key URI and IV ride on each segment as an `HlsKeyRef`; the
+/// key itself is fetched at download time, never here. A playlist without
+/// EXT-X-ENDLIST is a live/unfinished playlist and is rejected; a
+/// `#EXT-X-KEY` with METHOD=SAMPLE-AES (or any other method that is not
+/// NONE or AES-128) is protected content and is rejected, never attempted.
 fn parse_hls_media_playlist(body: &str, base: &Url) -> Result<HlsMediaPlaylist> {
     if !is_complete_vod_playlist(body) {
         return Err(anyhow!("This is a live or unfinished HLS playlist. Only completed VOD playlists can be downloaded in this build."));
@@ -1591,6 +1703,15 @@ fn parse_hls_media_playlist(body: &str, base: &Url) -> Result<HlsMediaPlaylist> 
     // of the previous range for the same URI (RFC 8216 §4.3.2.2).
     let mut last_end_by_uri: HashMap<String, u64> = HashMap::new();
     let mut pending_range: Option<(u64, Option<u64>)> = None;
+    // `#EXT-X-MEDIA-SEQUENCE` (default 0): the first segment's sequence
+    // number. With no explicit IV, the IV of a segment IS its media
+    // sequence number as a 16-byte big-endian integer (RFC 8216
+    // §4.3.2.4), so the parser — the only place that knows the numbering
+    // — resolves the default IV here, per segment.
+    let mut media_sequence: u64 = 0;
+    // The `#EXT-X-KEY` in force for the next segment, if any. A KEY with
+    // METHOD=NONE clears it; a KEY with METHOD=AES-128 sets it.
+    let mut current_key: Option<HlsKeyRef> = None;
     for line in body.lines().map(str::trim).filter(|l| !l.is_empty()) {
         if let Some(attributes) = line.strip_prefix("#EXT-X-MAP:") {
             let uri = attr(attributes, "URI").and_then(|u| base.join(&u).ok()).map(|u| u.to_string());
@@ -1604,11 +1725,29 @@ fn parse_hls_media_playlist(body: &str, base: &Url) -> Result<HlsMediaPlaylist> 
             if let (Some(url), Some((map_start, map_length))) = (uri.as_ref(), range) {
                 last_end_by_uri.insert(url.clone(), map_start.saturating_add(map_length));
             }
-            init = uri.map(|url| HlsSegmentRef { url, range });
+            // The init segment is container metadata, never encrypted:
+            // the KEY in force applies to media segments only.
+            init = uri.map(|url| HlsSegmentRef { url, range, key: None });
+        } else if let Some(attributes) = line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
+            media_sequence = attributes.trim().parse::<u64>()
+                .context("Invalid EXT-X-MEDIA-SEQUENCE")?;
         } else if let Some(key) = line.strip_prefix("#EXT-X-KEY:") {
             let method = attr(key, "METHOD").unwrap_or_default();
-            if !method.eq_ignore_ascii_case("NONE") {
-                return Err(anyhow!("This HLS playlist is encrypted. ThunderLoad does not decrypt protected streams."));
+            if method.eq_ignore_ascii_case("NONE") {
+                current_key = None;
+            } else if method.eq_ignore_ascii_case("AES-128") {
+                let uri = attr(key, "URI").context("EXT-X-KEY with METHOD=AES-128 has no URI")?;
+                let uri = base.join(&uri).context("EXT-X-KEY URI is not a valid URL")?.to_string();
+                // An explicit IV rides along; without one, the IV is the
+                // media sequence number of the segment the key applies
+                // to, resolved per segment below (None here means that).
+                let iv = match attr(key, "IV") {
+                    Some(value) => Some(parse_hls_iv(&value)?),
+                    None => None,
+                };
+                current_key = Some(HlsKeyRef { uri, iv });
+            } else {
+                return Err(anyhow!("This HLS playlist uses {method} encryption, which is protected content and is not supported."));
             }
         } else if let Some(value) = line.strip_prefix("#EXT-X-BYTERANGE:") {
             pending_range = Some(parse_hls_byterange(value.trim())?);
@@ -1621,10 +1760,38 @@ fn parse_hls_media_playlist(body: &str, base: &Url) -> Result<HlsMediaPlaylist> 
                 last_end_by_uri.insert(url.clone(), start.saturating_add(length));
                 (start, length)
             });
-            segments.push(HlsSegmentRef { url, range });
+            // A KEY without an explicit IV uses this segment's media
+            // sequence number as its IV (RFC 8216 §4.3.2.4): the number
+            // is the playlist's MEDIA-SEQUENCE plus this segment's
+            // position in the list, as a 16-byte big-endian integer.
+            let key = current_key.clone().map(|key_ref| {
+                let iv = key_ref.iv.unwrap_or_else(|| {
+                    let sequence = media_sequence + segments.len() as u64;
+                    let mut iv = [0u8; 16];
+                    iv[8..].copy_from_slice(&sequence.to_be_bytes());
+                    iv
+                });
+                HlsKeyRef { uri: key_ref.uri, iv: Some(iv) }
+            });
+            segments.push(HlsSegmentRef { url, range, key });
         }
     }
     Ok(HlsMediaPlaylist { init, segments })
+}
+
+/// Parses the IV attribute of an `#EXT-X-KEY` line: `0x` followed by 32
+/// hex digits (16 bytes), per RFC 8216 §4.3.2.4.
+fn parse_hls_iv(value: &str) -> Result<[u8; 16]> {
+    let hex = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")).unwrap_or(value);
+    if hex.len() != 32 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(anyhow!("EXT-X-KEY IV must be 0x followed by 32 hex digits, got {value}"));
+    }
+    let mut iv = [0u8; 16];
+    for index in 0..16 {
+        iv[index] = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16)
+            .context("EXT-X-KEY IV is not valid hex")?;
+    }
+    Ok(iv)
 }
 
 async fn fetch_text_with(client: &Client, url: &str, session: Option<&SessionHeaders>) -> Result<String> {
@@ -1633,12 +1800,19 @@ async fn fetch_text_with(client: &Client, url: &str, session: Option<&SessionHea
 }
 
 /// Fetches the playlist (master first, then the chosen media playlist and
-/// its audio rendition, if any) and turns it into a download plan. The
-/// first (highest listed) variant is chosen, matching the old behavior;
-/// the audio rendition is the one whose GROUP-ID matches that variant's
-/// `AUDIO` attribute. Live playlists and encrypted streams are rejected
+/// its audio rendition, if any) and turns it into a download plan.
+///
+/// `selection` (Slice 4, Gemini claim 4) is what the user picked from
+/// the master playlist: the variant's media playlist URL and its audio
+/// GROUP-ID. With no selection the first (highest listed) variant is
+/// chosen, matching the old behaviour. A selection that names a variant
+/// or audio group the master no longer lists is an error, not a silent
+/// fall back to a different quality — the user asked for that quality.
+/// When `playlist_url` is a bare media playlist (no master), there is
+/// nothing to select from and the selection is ignored. Live playlists,
+/// SESSION-KEY encryption and non-AES-128 media encryption are rejected
 /// here, before any segment is fetched.
-async fn resolve_hls_plan(playlist_url: &str, session: Option<&SessionHeaders>) -> Result<HlsJobState> {
+async fn resolve_hls_plan(playlist_url: &str, selection: &HlsSelection, session: Option<&SessionHeaders>) -> Result<HlsJobState> {
     let base = Url::parse(playlist_url)?;
     let client = client()?;
     let body = fetch_text_with(&client, playlist_url, session).await?;
@@ -1647,18 +1821,33 @@ async fn resolve_hls_plan(playlist_url: &str, session: Option<&SessionHeaders>) 
         if let Some(reason) = unsupported_hls_master_reason(&body) {
             return Err(anyhow!(reason));
         }
-        let variant = variants.first().expect("non-empty variant list");
+        // The selected variant, or the first (highest) when the caller
+        // made no choice. A selection that no longer matches the master
+        // is an error: the playlist changed under the user.
+        let variant = match selection.media_url.as_deref() {
+            Some(wanted) => variants.iter().find(|variant| variant.url == wanted)
+                .ok_or_else(|| anyhow!("The selected HLS quality is no longer listed in the master playlist"))?,
+            None => variants.first().expect("non-empty variant list"),
+        };
         let media_url = variant.url.clone();
-        // The rendition whose GROUP-ID matches the variant's AUDIO
-        // attribute; a variant that names a missing group falls back to
-        // the DEFAULT audio rendition instead of failing the download.
-        let audio = variant.audio_representation_id.as_deref().and_then(|group| {
-            let renditions = parse_hls_audio_renditions(&body, &base);
-            renditions.iter()
-                .find(|rendition| rendition.group_id == group)
-                .or_else(|| renditions.iter().find(|rendition| rendition.is_default))
+        // The audio rendition for the variant: the explicitly selected
+        // GROUP-ID, or the variant's own AUDIO group, or the DEFAULT
+        // rendition when the variant names no group. An explicitly
+        // selected group that does not exist is an error, like the
+        // variant itself; the DEFAULT fall back applies only to the
+        // unselected case, matching the old behaviour.
+        let renditions = parse_hls_audio_renditions(&body, &base);
+        let audio = match selection.audio_group.as_deref() {
+            Some(wanted) => Some(renditions.iter().find(|rendition| rendition.group_id == wanted)
                 .map(|rendition| rendition.uri.clone())
-        });
+                .ok_or_else(|| anyhow!("The selected HLS audio track is no longer listed in the master playlist"))?),
+            None => variant.audio_representation_id.as_deref().and_then(|group| {
+                renditions.iter()
+                    .find(|rendition| rendition.group_id == group)
+                    .or_else(|| renditions.iter().find(|rendition| rendition.is_default))
+                    .map(|rendition| rendition.uri.clone())
+            }),
+        };
         (media_url, audio)
     } else {
         (playlist_url.to_string(), None)
@@ -1700,6 +1889,8 @@ async fn resolve_hls_plan(playlist_url: &str, session: Option<&SessionHeaders>) 
         audio_segments,
         audio_init_done: false,
         audio_done: Vec::new(),
+        selected_media_url: selection.media_url.clone(),
+        selected_audio_group: selection.audio_group.clone(),
     })
 }
 
@@ -1773,6 +1964,115 @@ fn validate_hls_content_range(actual: &str, start: u64, end: u64) -> Result<()> 
     Ok(())
 }
 
+/// Cache of fetched AES-128 keys for one download call, keyed by key
+/// URI. Several segments usually share one key; fetching it once per URI
+/// keeps parallel tasks from hammering the key endpoint (and from racing
+/// a signed key URL's expiry). The lock is held across the fetch itself
+/// (see `fetch_hls_key`), so parallel tasks for the same key serialize
+/// and only the first one goes to the network. A key stays cached only
+/// for this one download call — a resume re-fetches it fresh.
+#[derive(Clone, Default)]
+struct HlsKeyCache(Arc<tokio::sync::Mutex<HashMap<String, Arc<[u8; 16]>>>>);
+
+impl HlsKeyCache {
+    /// Fast path: returns the cached key without waiting, when no fetch
+    /// is in flight. Never blocks — `blocking_lock` would panic inside
+    /// the async runtime, so a contended lock just falls through to the
+    /// async lock in `fetch_hls_key`.
+    fn try_get(&self, uri: &str) -> Option<Arc<[u8; 16]>> {
+        self.0.try_lock().ok()?.get(uri).cloned()
+    }
+}
+
+/// Fetches the 16-byte AES-128 key for one segment, with the same session
+/// (cookies, Referer, User-Agent) as the playlist — a key URL behind
+/// auth fails exactly like a protected segment would. The key is never
+/// written to disk and never stored in the checkpoint.
+async fn fetch_hls_key(client: &Client, uri: &str, session: Option<&SessionHeaders>, cache: &HlsKeyCache) -> Result<Arc<[u8; 16]>> {
+    // Fast path: the key is already cached.
+    if let Some(key) = cache.try_get(uri) {
+        return Ok(key);
+    }
+    // The lock is held across the fetch itself, so parallel tasks for the
+    // same key serialize on it and only the first one goes to the network.
+    // A second check inside the lock covers the task that waited.
+    let mut locked = cache.0.lock().await;
+    if let Some(key) = locked.get(uri) {
+        return Ok(key.clone());
+    }
+    let bytes = apply_session(session, client.get(uri), uri)
+        .send().await
+        .with_context(|| format!("Could not fetch the HLS AES-128 key at {uri}"))?
+        .error_for_status()
+        .with_context(|| format!("The HLS AES-128 key at {uri} was refused"))?
+        .bytes().await?;
+    if bytes.len() != 16 {
+        return Err(anyhow!("The HLS AES-128 key at {uri} is {} bytes, not 16", bytes.len()));
+    }
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&bytes);
+    let key = Arc::new(key);
+    locked.insert(uri.to_string(), key.clone());
+    Ok(key)
+}
+
+/// Decrypts one AES-128-CBC encrypted segment file (`raw`, as downloaded)
+/// into `out`, streaming so a large segment never sits whole in memory.
+/// Every 16-byte block but the last is decrypted as it arrives; the last
+/// block is held back, decrypted at EOF, and its PKCS#7 padding is
+/// validated and stripped. Returns the plaintext byte count. A file whose
+/// length is not a multiple of 16, or whose padding is invalid, is an
+/// error — a corrupt segment must fail the download, not silently join
+/// garbage into the output.
+async fn decrypt_aes128_segment(raw: &Path, out: &Path, key: &[u8; 16], iv: &[u8; 16]) -> Result<u64> {
+    use tokio::io::AsyncReadExt;
+    let mut decryptor = Decryptor::<Aes128>::new_from_slices(key, iv)
+        .map_err(|_| anyhow!("The HLS AES-128 key or IV is not 16 bytes"))?;
+    let mut source = fs::File::open(raw).await
+        .with_context(|| format!("Could not open the encrypted segment at {}", raw.display()))?;
+    let mut destination = fs::File::create(out).await
+        .with_context(|| format!("Could not create the decrypted segment at {}", out.display()))?;
+    // One block held back at all times: the last block carries the
+    // padding, and it can only be recognised once the file ends.
+    let mut pending: Vec<u8> = Vec::with_capacity(16);
+    let mut plaintext_bytes: u64 = 0;
+    let mut chunk = [0u8; 65536];
+    loop {
+        let read = source.read(&mut chunk).await
+            .with_context(|| format!("Could not read the encrypted segment at {}", raw.display()))?;
+        if read == 0 {
+            break;
+        }
+        pending.extend_from_slice(&chunk[..read]);
+        // Decrypt every complete block except the last 16 bytes.
+        let decryptable = pending.len().saturating_sub(16) / 16 * 16;
+        for block in pending[..decryptable].chunks_exact_mut(16) {
+            let mut generic = GenericArray::<u8, U16>::from_mut_slice(block);
+            decryptor.decrypt_block_mut(&mut generic);
+        }
+        destination.write_all(&pending[..decryptable]).await
+            .with_context(|| format!("Could not write the decrypted segment at {}", out.display()))?;
+        plaintext_bytes += decryptable as u64;
+        pending.drain(..decryptable);
+    }
+    if pending.len() != 16 {
+        return Err(anyhow!("The encrypted HLS segment at {} is {} bytes, not a multiple of 16", raw.display(), pending.len()));
+    }
+    let mut last = GenericArray::<u8, U16>::from_mut_slice(&mut pending);
+    decryptor.decrypt_block_mut(&mut last);
+    let pad_length = *last.last().unwrap_or(&0) as usize;
+    if pad_length == 0 || pad_length > 16 || !last[16 - pad_length..].iter().all(|byte| *byte as usize == pad_length) {
+        return Err(anyhow!("The encrypted HLS segment at {} has invalid PKCS#7 padding", raw.display()));
+    }
+    let plaintext_len = 16 - pad_length;
+    destination.write_all(&last[..plaintext_len]).await
+        .with_context(|| format!("Could not write the decrypted segment at {}", out.display()))?;
+    plaintext_bytes += plaintext_len as u64;
+    destination.flush().await
+        .with_context(|| format!("Could not flush the decrypted segment at {}", out.display()))?;
+    Ok(plaintext_bytes)
+}
+
 /// Fetches one segment (whole file, or one EXT-X-BYTERANGE window of a
 /// larger resource) into `path`. A server that ignores Range and answers
 /// 200 is handled by slicing the requested window out of the full body;
@@ -1783,7 +2083,24 @@ async fn fetch_hls_segment(
     session: Option<&SessionHeaders>,
     path: &Path,
     rate_limiter: &Arc<GlobalRateLimiter>,
+    key_cache: &HlsKeyCache,
 ) -> Result<u64> {
+    // The key is fetched BEFORE the segment: a refused key aborts before
+    // bandwidth is spent, and the key fetch itself can trigger the
+    // signed-URL refresh (its 403 is classified exactly like a segment
+    // 403). The cache makes the fetch free for segments sharing a key.
+    let key = match &segment.key {
+        Some(key_ref) => Some((
+            fetch_hls_key(client, &key_ref.uri, session, key_cache).await?,
+            key_ref.iv.expect("HlsKeyRef always carries a resolved IV after parsing"),
+        )),
+        None => None,
+    };
+    // An encrypted segment is downloaded as ciphertext to a temp file
+    // and decrypted into `path` only when whole and valid: a partial or
+    // corrupt ciphertext must never be mistaken for a finished segment.
+    // Unencrypted segments write straight to `path`, as before.
+    let raw_path = if key.is_some() { path.with_extension("tmp") } else { path.to_path_buf() };
     let mut request = apply_session(session, client.get(&segment.url), &segment.url);
     if let Some((start, length)) = segment.range {
         request = request.header(
@@ -1792,7 +2109,7 @@ async fn fetch_hls_segment(
         );
     }
     let response = request.send().await?.error_for_status()?;
-    let mut file = fs::File::create(path).await?;
+    let mut file = fs::File::create(&raw_path).await?;
     let mut bytes = 0_u64;
     if let Some((start, length)) = segment.range {
         if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
@@ -1850,6 +2167,16 @@ async fn fetch_hls_segment(
         }
     }
     file.flush().await?;
+    if let Some((key, iv)) = key {
+        // The raw file is closed before decrypting it (Windows keeps an
+        // open handle from blocking the read), and the ciphertext temp
+        // file is removed either way: a failed decrypt must not leave a
+        // stale partial behind for the next attempt to mistake for one.
+        drop(file);
+        let plaintext = decrypt_aes128_segment(&raw_path, path, &key, &iv).await;
+        let _ = fs::remove_file(&raw_path).await;
+        return plaintext;
+    }
     Ok(bytes)
 }
 
@@ -1930,6 +2257,159 @@ fn hls_segment_path(work_dir: &Path, mark: HlsSegmentMark) -> PathBuf {
     }
 }
 
+/// Fetches every unfinished segment of an HLS plan, in parallel up to
+/// the engine's connections value (`DEFAULT_RESUMABLE_CONNECTIONS`),
+/// writing each finished segment's index into the checkpoint as it
+/// lands. Returns Completed when every segment is on disk, or the
+/// Paused/Cancelled outcome — with the checkpoint written (paused) or
+/// the resume files removed (cancelled) — when the control changes. A
+/// segment error aborts the in-flight tasks and returns the error; the
+/// checkpoint keeps the finished segments, so the caller can resume or,
+/// for a 401/403, refresh the playlist and retry.
+///
+/// Pause/cancel are prompt (Slice 4, Gemini claim 5): the loop waits on
+/// `tasks.join_next()` AND `control.changed()` together, so a stop during
+/// a slow segment returns as soon as the control flips instead of after
+/// the in-flight segment finishes. The watch guard is only ever borrowed
+/// at loop tops — never held across an await — so the `!Send`
+/// `watch::Ref` never escapes the loop.
+async fn run_hls_segments(
+    client: &Client,
+    state: &mut HlsJobState,
+    work_dir: &Path,
+    meta_path: &Path,
+    session: Option<&SessionHeaders>,
+    control: watch::Receiver<DownloadControl>,
+    progress_tx: mpsc::UnboundedSender<DownloadProgress>,
+    rate_limiter: Arc<GlobalRateLimiter>,
+    key_cache: &HlsKeyCache,
+    completed: Arc<AtomicUsize>,
+    downloaded_bytes: Arc<AtomicU64>,
+    total: usize,
+    target: &Path,
+) -> Result<DownloadOutcome> {
+    let mut work: std::collections::VecDeque<(HlsSegmentMark, HlsSegmentRef)> = std::collections::VecDeque::new();
+    if state.video_init.is_some() && !state.video_init_done {
+        work.push_back((HlsSegmentMark::VideoInit, state.video_init.clone().expect("checked above")));
+    }
+    for (index, segment) in state.video_segments.iter().enumerate() {
+        if !state.video_done.contains(&index) {
+            work.push_back((HlsSegmentMark::Video(index), segment.clone()));
+        }
+    }
+    if state.audio_init.is_some() && !state.audio_init_done {
+        work.push_back((HlsSegmentMark::AudioInit, state.audio_init.clone().expect("checked above")));
+    }
+    for (index, segment) in state.audio_segments.iter().enumerate() {
+        if !state.audio_done.contains(&index) {
+            work.push_back((HlsSegmentMark::Audio(index), segment.clone()));
+        }
+    }
+
+    let mut tasks = tokio::task::JoinSet::new();
+    // A second receiver watches for control changes: `changed()` needs
+    // &mut, and the coordinator's own receiver is borrowed at loop tops.
+    let mut control_watch = control.clone();
+    let mut watch_alive = true;
+    let mut stopped: Option<DownloadControl> = None;
+    while !work.is_empty() || !tasks.is_empty() {
+        if matches!(*control.borrow(), DownloadControl::Paused | DownloadControl::Cancelled) {
+            stopped = Some(*control.borrow());
+            break;
+        }
+        while tasks.len() < DEFAULT_RESUMABLE_CONNECTIONS {
+            let Some((mark, segment)) = work.pop_front() else { break; };
+            let client = client.clone();
+            let session = session.cloned();
+            let path = hls_segment_path(work_dir, mark);
+            let rate_limiter = rate_limiter.clone();
+            let key_cache = key_cache.clone();
+            tasks.spawn(async move {
+                let bytes = fetch_hls_segment(&client, &segment, session.as_ref(), &path, &rate_limiter, &key_cache).await?;
+                Ok::<(HlsSegmentMark, u64), anyhow::Error>((mark, bytes))
+            });
+        }
+        // Wait for the next finished segment, or for the control to
+        // change — whichever comes first. When the sender is gone the
+        // watch arm is dropped and the loop waits on tasks alone.
+        // `join_next()` is cancel-safe: dropping its future on the
+        // control arm leaves the tasks running.
+        let result = if watch_alive {
+            tokio::select! {
+                result = tasks.join_next() => result,
+                changed = control_watch.changed() => {
+                    if changed.is_err() {
+                        watch_alive = false;
+                    }
+                    continue;
+                }
+            }
+        } else {
+            tasks.join_next().await
+        };
+        let Some(result) = result else { break; };
+        match result {
+            Ok(Ok((mark, bytes))) => {
+                match mark {
+                    HlsSegmentMark::VideoInit => state.video_init_done = true,
+                    HlsSegmentMark::Video(index) => {
+                        if !state.video_done.contains(&index) { state.video_done.push(index); }
+                    }
+                    HlsSegmentMark::AudioInit => state.audio_init_done = true,
+                    HlsSegmentMark::Audio(index) => {
+                        if !state.audio_done.contains(&index) { state.audio_done.push(index); }
+                    }
+                }
+                // Only the coordinator writes the checkpoint, so the
+                // on-disk state can never race with a segment task.
+                write_hls_checkpoint(meta_path, state).await?;
+                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                let transferred = downloaded_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+                let phase = match mark {
+                    HlsSegmentMark::VideoInit | HlsSegmentMark::Video(_) => "video-segments",
+                    HlsSegmentMark::AudioInit | HlsSegmentMark::Audio(_) => "audio-segments",
+                };
+                let _ = progress_tx.send(DownloadProgress {
+                    downloaded: transferred, total: None,
+                    percent: Some(done as f64 * 100.0 / total.max(1) as f64), phase: phase.into(),
+                });
+            }
+            Ok(Err(error)) => {
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+                return Err(error);
+            }
+            Err(error) => {
+                if error.is_cancelled() { continue; }
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+                return Err(anyhow!("HLS segment task failed: {error}"));
+            }
+        }
+    }
+    if let Some(stopped) = stopped {
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        write_hls_checkpoint(meta_path, state).await?;
+        return match stopped {
+            DownloadControl::Paused => {
+                let _ = progress_tx.send(DownloadProgress {
+                    downloaded: downloaded_bytes.load(Ordering::Relaxed), total: None,
+                    percent: Some(state.done_segments() as f64 * 100.0 / total.max(1) as f64),
+                    phase: "paused".into(),
+                });
+                Ok(DownloadOutcome::Paused)
+            }
+            DownloadControl::Cancelled => {
+                remove_hls_resume_files(target).await;
+                Ok(DownloadOutcome::Cancelled)
+            }
+            DownloadControl::Running => unreachable!("loop only stops on pause or cancel"),
+        };
+    }
+    Ok(DownloadOutcome::Completed)
+}
+
 /// HLS download with pause/resume/cancel and an on-disk checkpoint,
 /// mirroring the direct-download pattern in
 /// `download::download_url_resumable`: the playlist URL, chosen variant,
@@ -1937,9 +2417,15 @@ fn hls_segment_path(work_dir: &Path, mark: HlsSegmentMark) -> PathBuf {
 /// so a fresh call — including from a fresh process — resumes from the
 /// next unfinished segment. Cancel removes the partial files. A network
 /// error keeps the checkpoint and the finished segments, so a retry
-/// resumes instead of restarting.
+/// resumes instead of restarting. A 401/403 from a segment or key fetch
+/// re-resolves the playlist (refreshing expired signed URLs) and retries
+/// the missing segments, bounded by `MAX_SEGMENT_URL_REFRESHES`.
+/// `selection` is what the user picked from the master playlist (Slice 4,
+/// Gemini claim 4); `HlsSelection::none()` keeps the old first-variant
+/// behaviour.
 pub async fn download_hls_resumable(
     playlist_url: &str,
+    selection: &HlsSelection,
     target: &Path,
     session: Option<&SessionHeaders>,
     control: watch::Receiver<DownloadControl>,
@@ -1971,7 +2457,7 @@ pub async fn download_hls_resumable(
         .then(|| saved.as_ref().and_then(|saved| saved.session.clone()))
         .flatten();
     let session = session.or(owned_session.as_ref());
-    let mut state = resolve_hls_plan(playlist_url, session).await?;
+    let mut state = resolve_hls_plan(playlist_url, selection, session).await?;
     // Reuse a checkpoint only when it describes exactly this job; a
     // playlist whose segment list changed restarts from scratch.
     let mut reused_checkpoint = false;
@@ -2000,6 +2486,18 @@ pub async fn download_hls_resumable(
                 }
             }
             pruned.audio_done = kept_audio_done;
+            // Swap the fresh segment URLs into the reused checkpoint: the
+            // saved state's URLs may have expired (rotated signed URLs),
+            // and reusing them would 403 the first missing segment and
+            // burn one of the two refreshes. The done-sets stay as
+            // pruned; the plan match already proved the segments are the
+            // same files (identity is URL-minus-query), so the fresh refs
+            // can only differ in the signature query — and the AES-128
+            // key URIs ride along with them.
+            pruned.video_init = state.video_init;
+            pruned.video_segments = state.video_segments;
+            pruned.audio_init = state.audio_init;
+            pruned.audio_segments = state.audio_segments;
             state = pruned;
             reused_checkpoint = true;
         }
@@ -2041,101 +2539,53 @@ pub async fn download_hls_resumable(
     }
     let downloaded_bytes = Arc::new(AtomicU64::new(already_downloaded));
 
-    let mut work: std::collections::VecDeque<(HlsSegmentMark, HlsSegmentRef)> = std::collections::VecDeque::new();
-    if state.video_init.is_some() && !state.video_init_done {
-        work.push_back((HlsSegmentMark::VideoInit, state.video_init.clone().expect("checked above")));
-    }
-    for (index, segment) in state.video_segments.iter().enumerate() {
-        if !state.video_done.contains(&index) {
-            work.push_back((HlsSegmentMark::Video(index), segment.clone()));
-        }
-    }
-    if state.audio_init.is_some() && !state.audio_init_done {
-        work.push_back((HlsSegmentMark::AudioInit, state.audio_init.clone().expect("checked above")));
-    }
-    for (index, segment) in state.audio_segments.iter().enumerate() {
-        if !state.audio_done.contains(&index) {
-            work.push_back((HlsSegmentMark::Audio(index), segment.clone()));
-        }
-    }
-
-    let mut tasks = tokio::task::JoinSet::new();
-    let mut stopped: Option<DownloadControl> = None;
-    while !work.is_empty() || !tasks.is_empty() {
-        if matches!(*control.borrow(), DownloadControl::Paused | DownloadControl::Cancelled) {
-            stopped = Some(*control.borrow());
-            break;
-        }
-        while tasks.len() < 6 {
-            let Some((mark, segment)) = work.pop_front() else { break; };
-            let client = client.clone();
-            let session = session.cloned();
-            let path = hls_segment_path(&work_dir, mark);
-            let rate_limiter = rate_limiter.clone();
-            tasks.spawn(async move {
-                let bytes = fetch_hls_segment(&client, &segment, session.as_ref(), &path, &rate_limiter).await?;
-                Ok::<(HlsSegmentMark, u64), anyhow::Error>((mark, bytes))
-            });
-        }
-        let Some(result) = tasks.join_next().await else { break; };
-        match result {
-            Ok(Ok((mark, bytes))) => {
-                match mark {
-                    HlsSegmentMark::VideoInit => state.video_init_done = true,
-                    HlsSegmentMark::Video(index) => {
-                        if !state.video_done.contains(&index) { state.video_done.push(index); }
-                    }
-                    HlsSegmentMark::AudioInit => state.audio_init_done = true,
-                    HlsSegmentMark::Audio(index) => {
-                        if !state.audio_done.contains(&index) { state.audio_done.push(index); }
-                    }
+    // Signed-URL refresh (Slice 4): a 401/403 from a segment (or key)
+    // fetch usually means the signed URLs expired mid-download. Re-resolve
+    // the playlist with the same session and selection, swap the fresh
+    // URLs into the plan, and retry the segments that are still missing.
+    // The checkpoint and the finished segments are untouched, so the
+    // retry resumes instead of restarting. After
+    // `MAX_SEGMENT_URL_REFRESHES` the last 401/403 is the error. A
+    // re-resolve whose segment list no longer matches the started plan is
+    // a changed playlist, not an expiry, and fails outright.
+    let key_cache = HlsKeyCache::default();
+    let mut refreshes = 0;
+    let outcome = loop {
+        match run_hls_segments(
+            &client, &mut state, &work_dir, &meta_path, session, control.clone(),
+            progress_tx.clone(), rate_limiter.clone(), &key_cache,
+            completed.clone(), downloaded_bytes.clone(), total, target,
+        ).await {
+            Ok(outcome) => break outcome,
+            Err(error) if is_auth_error(&error) && refreshes < MAX_SEGMENT_URL_REFRESHES => {
+                refreshes += 1;
+                let fresh = resolve_hls_plan(playlist_url, selection, session).await
+                    .with_context(|| "Could not refresh the HLS playlist after the signed segment URLs expired")?;
+                if !state.matches_plan(&fresh) {
+                    return Err(anyhow!("The HLS playlist changed while downloading (its segment list no longer matches the started download); restart the download"));
                 }
-                // Only the coordinator writes the checkpoint, so the
-                // on-disk state can never race with a segment task.
+                state.video_init = fresh.video_init;
+                state.video_segments = fresh.video_segments;
+                state.audio_init = fresh.audio_init;
+                state.audio_segments = fresh.audio_segments;
                 write_hls_checkpoint(&meta_path, &state).await?;
-                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                let transferred = downloaded_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
-                let phase = match mark {
-                    HlsSegmentMark::VideoInit | HlsSegmentMark::Video(_) => "video-segments",
-                    HlsSegmentMark::AudioInit | HlsSegmentMark::Audio(_) => "audio-segments",
-                };
-                let _ = progress_tx.send(DownloadProgress {
-                    downloaded: transferred, total: None,
-                    percent: Some(done as f64 * 100.0 / total.max(1) as f64), phase: phase.into(),
-                });
-            }
-            Ok(Err(error)) => {
-                tasks.abort_all();
-                while tasks.join_next().await.is_some() {}
-                return Err(error);
-            }
-            Err(error) => {
-                if error.is_cancelled() { continue; }
-                tasks.abort_all();
-                while tasks.join_next().await.is_some() {}
-                return Err(anyhow!("HLS segment task failed: {error}"));
-            }
-        }
-    }
-    if let Some(stopped) = stopped {
-        tasks.abort_all();
-        while tasks.join_next().await.is_some() {}
-        write_hls_checkpoint(&meta_path, &state).await?;
-        return match stopped {
-            DownloadControl::Paused => {
                 let _ = progress_tx.send(DownloadProgress {
                     downloaded: downloaded_bytes.load(Ordering::Relaxed), total: None,
                     percent: Some(state.done_segments() as f64 * 100.0 / total.max(1) as f64),
-                    phase: "paused".into(),
+                    phase: "refreshing".into(),
                 });
-                Ok(DownloadOutcome::Paused)
             }
-            DownloadControl::Cancelled => {
-                remove_hls_resume_files(target).await;
-                Ok(DownloadOutcome::Cancelled)
+            Err(error) if is_auth_error(&error) => {
+                return Err(error).context("The signed HLS segment URLs expired and refreshing the playlist did not help; retry the download");
             }
-            DownloadControl::Running => unreachable!("loop only stops on pause or cancel"),
-        };
+            Err(error) => return Err(error),
+        }
+    };
+    // The segment phase ended paused or cancelled: the checkpoint is
+    // already written (paused) or the resume files removed (cancelled)
+    // by run_hls_segments — there is nothing to assemble.
+    if outcome != DownloadOutcome::Completed {
+        return Ok(outcome);
     }
 
     let _ = progress_tx.send(DownloadProgress {
@@ -2178,14 +2628,16 @@ pub async fn download_hls_resumable(
 /// alone would misname a TS stream as .mp4.
 pub async fn hls_output_extension(
     playlist_url: &str,
+    selection: &HlsSelection,
     session: Option<&SessionHeaders>,
 ) -> Result<String> {
-    let plan = resolve_hls_plan(playlist_url, session).await?;
+    let plan = resolve_hls_plan(playlist_url, selection, session).await?;
     Ok(plan.extension)
 }
 
 pub async fn download_hls(
     playlist_url: &str,
+    selection: &HlsSelection,
     filename: &str,
     session: Option<&SessionHeaders>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
@@ -2194,14 +2646,14 @@ pub async fn download_hls(
     // Resolve the plan first so the reserved target gets the right
     // extension (mp4 when an EXT-X-MAP init segment is present, ts
     // otherwise); the resumable call re-resolves the same small playlist.
-    let plan = resolve_hls_plan(playlist_url, session).await?;
+    let plan = resolve_hls_plan(playlist_url, selection, session).await?;
     let out_dir = default_download_dir();
     fs::create_dir_all(&out_dir).await?;
     let safe = safe_filename(filename, "video");
     let stem = Path::new(&safe).file_stem().and_then(|s| s.to_str()).unwrap_or("video");
     let target = unique_video_path(&out_dir, stem, &plan.extension).await?;
     let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
-    let outcome = download_hls_resumable(playlist_url, &target, session, control_rx, progress_tx, rate_limiter).await;
+    let outcome = download_hls_resumable(playlist_url, selection, &target, session, control_rx, progress_tx, rate_limiter).await;
     drop(control_tx);
     match outcome? {
         DownloadOutcome::Completed => Ok(target),
@@ -2381,6 +2833,35 @@ enum DashTrackOutcome {
     Stopped(DownloadControl),
 }
 
+/// Awaits the next finished task in a segment `JoinSet`, or a control
+/// change, whichever comes first (Slice 4, Gemini claim 5). Returns `None`
+/// when the control changed — the caller re-checks `control.borrow()` at
+/// its loop top and stops, or carries on when the change was a no-op
+/// (e.g. a Running send) — or when the task set is empty. `watch_alive`
+/// tracks whether the control sender is still alive; once it is gone the
+/// watch arm is dropped and the loop waits on tasks alone. `join_next()`
+/// is cancel-safe, so dropping its future on the control arm leaves the
+/// tasks running.
+async fn join_next_or_control<T: Send + 'static>(
+    tasks: &mut tokio::task::JoinSet<T>,
+    control: &mut watch::Receiver<DownloadControl>,
+    watch_alive: &mut bool,
+) -> Option<Result<T, tokio::task::JoinError>> {
+    if *watch_alive {
+        tokio::select! {
+            result = tasks.join_next() => result,
+            changed = control.changed() => {
+                if changed.is_err() {
+                    *watch_alive = false;
+                }
+                None
+            }
+        }
+    } else {
+        tasks.join_next().await
+    }
+}
+
 async fn download_dash_track(
     client: &Client,
     track: &DashResolvedTrack,
@@ -2410,6 +2891,11 @@ async fn download_dash_track(
     if refs.is_empty() { return Err(anyhow!("DASH representation contains no media URLs")); }
 
     let mut tasks = tokio::task::JoinSet::new();
+    // A second receiver watches for control changes (Slice 4, Gemini
+    // claim 5): `changed()` needs &mut, and the coordinator's own
+    // receiver is borrowed at loop tops only.
+    let mut control_watch = control.clone();
+    let mut watch_alive = true;
     let mut stopped: Option<DownloadControl> = None;
     for (index, (segment_url, range)) in refs.into_iter().enumerate() {
         // Already on disk from an earlier call: the segment file is the
@@ -2512,8 +2998,13 @@ async fn download_dash_track(
             });
             Ok::<PathBuf, anyhow::Error>(path)
         });
-        if tasks.len() >= 6 {
-            if let Some(result) = tasks.join_next().await {
+        // Segments run concurrently up to the engine's connections value
+        // (Slice 4; was a hardcoded 6, now DEFAULT_RESUMABLE_CONNECTIONS).
+        // The drain waits on the next finished segment OR a control
+        // change, so a pause/cancel during a slow segment returns
+        // promptly instead of after the in-flight segment finishes.
+        if tasks.len() >= DEFAULT_RESUMABLE_CONNECTIONS {
+            if let Some(result) = join_next_or_control(&mut tasks, &mut control_watch, &mut watch_alive).await {
                 if let Err(error) = result? { tasks.abort_all(); return Err(error); }
             }
         }
@@ -2525,7 +3016,21 @@ async fn download_dash_track(
     }
 
     let mut failures = Vec::new();
-    while let Some(result) = tasks.join_next().await {
+    loop {
+        let Some(result) = join_next_or_control(&mut tasks, &mut control_watch, &mut watch_alive).await else {
+            // The task set is empty, or the control changed. A stop
+            // aborts the in-flight tasks; a no-op change (e.g. a Running
+            // send) just resumes the drain; an empty set ends it.
+            if matches!(*control.borrow(), DownloadControl::Paused | DownloadControl::Cancelled) {
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+                return Ok(DashTrackOutcome::Stopped(*control.borrow()));
+            }
+            if tasks.is_empty() {
+                break;
+            }
+            continue;
+        };
         // Copy the value out first: the borrow guard must not be held
         // across the awaits below (watch::Ref is not Send).
         let current = *control.borrow();
@@ -2824,11 +3329,15 @@ pub(crate) fn media_checkpoint_info(meta_path: &Path, target: &Path) -> Option<M
     if value.get("playlist_url").is_some() {
         let state: HlsJobState = serde_json::from_value(value).ok()?;
         let (done, total) = (state.done_segments(), state.total_segments());
+        // The selection is the job's identity for a resume: an orphaned
+        // HLS job must re-resolve the master with the same variant and
+        // audio it started with (Slice 4), not fall back to the first
+        // variant. Old checkpoints carry no selection (None = first).
         return Some(MediaCheckpointInfo {
             kind: MediaKind::Hls,
             url: state.playlist_url,
-            representation_id: None,
-            audio_representation_id: None,
+            representation_id: state.selected_media_url,
+            audio_representation_id: state.selected_audio_group,
             session: state.session,
             segments_done: Some(done as u64),
             segments_total: Some(total as u64),
@@ -2876,13 +3385,32 @@ pub(crate) fn media_checkpoint_info(meta_path: &Path, target: &Path) -> Option<M
 /// file is on disk, and segment files are renamed into place only after
 /// their bytes are fully written and validated, so a partial file can
 /// never be mistaken for a finished segment.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// Equality is the track's IDENTITY — mime type plus the initialization
+/// and segment URLs with their queries stripped, plus the byte ranges —
+/// not the full signed URLs. Signed segment URLs rotate their query
+/// (the signature) on every manifest fetch while the media stays the
+/// same; comparing full URLs would treat every refresh as a different
+/// plan and restart the download from scratch. See `url_identity`.
+#[derive(Debug, Clone, Serialize, Deserialize, Eq)]
 struct DashCheckpointTrack {
     mime_type: String,
     initialization_url: Option<String>,
     initialization_range: Option<(u64, u64)>,
     segment_urls: Vec<String>,
     segment_ranges: Vec<Option<(u64, u64)>>,
+}
+
+impl PartialEq for DashCheckpointTrack {
+    fn eq(&self, other: &Self) -> bool {
+        self.mime_type == other.mime_type
+            && self.initialization_range == other.initialization_range
+            && self.segment_ranges == other.segment_ranges
+            && self.initialization_url.as_deref().map(url_identity) == other.initialization_url.as_deref().map(url_identity)
+            && self.segment_urls.len() == other.segment_urls.len()
+            && self.segment_urls.iter().zip(other.segment_urls.iter())
+                .all(|(a, b)| url_identity(a) == url_identity(b))
+    }
 }
 
 impl From<&DashResolvedTrack> for DashCheckpointTrack {
@@ -3034,6 +3562,61 @@ pub async fn download_dash_resumable(
     ).await
 }
 
+/// What one pass over the DASH tracks produced: every track assembled,
+/// or the control that stopped the pass (pause/cancel).
+enum DashTracksOutcome {
+    Finished { video_files: Vec<PathBuf>, audio_files: Vec<PathBuf> },
+    Stopped(DownloadControl),
+}
+
+/// Runs every video track then every audio track of one DASH plan, in
+/// period order, assembling each track into a single file. Done-ness is
+/// re-derived from the segment files on disk at the start of each track,
+/// so a refresh pass skips the segments the previous pass finished.
+/// A segment error aborts the in-flight tasks and returns the error —
+/// the checkpoint and the finished segments survive, so the caller can
+/// resume or, for a 401/403, refresh the manifest and retry.
+async fn run_dash_tracks(
+    client: &Client,
+    plan: &DashPlan,
+    work_dir: &Path,
+    session: Option<&SessionHeaders>,
+    progress_tx: &mpsc::UnboundedSender<DownloadProgress>,
+    completed: Arc<AtomicUsize>,
+    downloaded_bytes: Arc<AtomicU64>,
+    total_segments: usize,
+    rate_limiter: Arc<GlobalRateLimiter>,
+    control: &watch::Receiver<DownloadControl>,
+) -> Result<DashTracksOutcome> {
+    let mut video_files = Vec::new();
+    for (period_index, track) in plan.video_tracks.iter().enumerate() {
+        let prefix = format!("video-p{period_index}");
+        let done = dash_done_refs(work_dir, &prefix, track).await;
+        match download_dash_track(
+            client, track, work_dir, &prefix, session, progress_tx,
+            completed.clone(), downloaded_bytes.clone(), total_segments, rate_limiter.clone(),
+            &done, control,
+        ).await? {
+            DashTrackOutcome::Assembled(path) => video_files.push(path),
+            DashTrackOutcome::Stopped(stopped) => return Ok(DashTracksOutcome::Stopped(stopped)),
+        }
+    }
+    let mut audio_files = Vec::new();
+    for (period_index, track) in plan.audio_tracks.iter().enumerate() {
+        let prefix = format!("audio-p{period_index}");
+        let done = dash_done_refs(work_dir, &prefix, track).await;
+        match download_dash_track(
+            client, track, work_dir, &prefix, session, progress_tx,
+            completed.clone(), downloaded_bytes.clone(), total_segments, rate_limiter.clone(),
+            &done, control,
+        ).await? {
+            DashTrackOutcome::Assembled(path) => audio_files.push(path),
+            DashTrackOutcome::Stopped(stopped) => return Ok(DashTracksOutcome::Stopped(stopped)),
+        }
+    }
+    Ok(DashTracksOutcome::Finished { video_files, audio_files })
+}
+
 async fn download_dash_resumable_with_plan(
     manifest_url: &str,
     representation_id: &str,
@@ -3100,32 +3683,48 @@ async fn download_dash_resumable_with_plan(
     let completed = Arc::new(AtomicUsize::new(already_completed));
     let downloaded_bytes = Arc::new(AtomicU64::new(already_downloaded));
 
-    let mut video_files = Vec::new();
-    for (period_index, track) in plan.video_tracks.iter().enumerate() {
-        let prefix = format!("video-p{period_index}");
-        let done = dash_done_refs(&work_dir, &prefix, track).await;
-        match download_dash_track(
-            &client, track, &work_dir, &prefix, session, &progress_tx,
+    // Signed-URL refresh (Slice 4): a 401/403 from a segment fetch
+    // usually means the signed URLs expired mid-download. Re-resolve the
+    // manifest with the same session and representation ids, swap the
+    // fresh URLs into the plan, and retry the tracks that are still
+    // missing segments. Done-ness is derived from the segment files on
+    // disk, so nothing finished is re-downloaded and the work dir is
+    // never wiped on a refresh. After `MAX_SEGMENT_URL_REFRESHES` the
+    // last 401/403 is the error. A re-resolve whose segment plan no
+    // longer matches the started job is a changed manifest, not an
+    // expiry, and fails outright.
+    let mut refreshes = 0;
+    let mut plan = plan;
+    let (video_files, audio_files) = loop {
+        match run_dash_tracks(
+            &client, &plan, &work_dir, session, &progress_tx,
             completed.clone(), downloaded_bytes.clone(), total_segments, rate_limiter.clone(),
-            &done, &control,
-        ).await? {
-            DashTrackOutcome::Assembled(path) => video_files.push(path),
-            DashTrackOutcome::Stopped(stopped) => return Ok(dash_stopped_outcome(stopped, target).await),
+            &control,
+        ).await {
+            Ok(DashTracksOutcome::Finished { video_files, audio_files }) => break (video_files, audio_files),
+            Ok(DashTracksOutcome::Stopped(stopped)) => return Ok(dash_stopped_outcome(stopped, target).await),
+            Err(error) if is_auth_error(&error) && refreshes < MAX_SEGMENT_URL_REFRESHES => {
+                refreshes += 1;
+                let fresh_plan = resolve_dash_plan(manifest_url, representation_id, audio_representation_id, session).await
+                    .with_context(|| "Could not refresh the DASH manifest after the signed segment URLs expired")?;
+                let fresh_state = DashJobState::from_plan(manifest_url, representation_id, audio_representation_id, session, &fresh_plan);
+                if !state.matches_plan(&fresh_state) {
+                    return Err(anyhow!("The DASH manifest changed while downloading (its segment list no longer matches the started download); restart the download"));
+                }
+                plan = fresh_plan;
+                write_dash_checkpoint(&meta_path, &fresh_state).await?;
+                let _ = progress_tx.send(DownloadProgress {
+                    downloaded: downloaded_bytes.load(Ordering::Relaxed), total: None,
+                    percent: Some(completed.load(Ordering::Relaxed) as f64 * 100.0 / total_segments.max(1) as f64),
+                    phase: "refreshing".into(),
+                });
+            }
+            Err(error) if is_auth_error(&error) => {
+                return Err(error).context("The signed DASH segment URLs expired and refreshing the manifest did not help; retry the download");
+            }
+            Err(error) => return Err(error),
         }
-    }
-    let mut audio_files = Vec::new();
-    for (period_index, track) in plan.audio_tracks.iter().enumerate() {
-        let prefix = format!("audio-p{period_index}");
-        let done = dash_done_refs(&work_dir, &prefix, track).await;
-        match download_dash_track(
-            &client, track, &work_dir, &prefix, session, &progress_tx,
-            completed.clone(), downloaded_bytes.clone(), total_segments, rate_limiter.clone(),
-            &done, &control,
-        ).await? {
-            DashTrackOutcome::Assembled(path) => audio_files.push(path),
-            DashTrackOutcome::Stopped(stopped) => return Ok(dash_stopped_outcome(stopped, target).await),
-        }
-    }
+    };
 
     // The segment loops are the only place the control is polled while
     // downloading; check it again around the FFmpeg steps, which can take
@@ -3357,6 +3956,107 @@ mod tests {
         // supported now, so they are no longer an unsupported reason.
         assert!(unsupported_hls_reason("#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\",BYTERANGE=\"100@0\"\n#EXT-X-ENDLIST").is_none());
         assert!(unsupported_hls_reason("#EXTM3U\n#EXT-X-BYTERANGE:10@0\nseg.ts\n#EXT-X-ENDLIST").is_none());
+    }
+
+    // --- Slice 4: AES-128 ---
+
+    #[test]
+    fn hls_aes128_media_playlist_parses_key_and_default_iv() {
+        let base = Url::parse("https://cdn.example.test/hls/media.m3u8").unwrap();
+        // Explicit IV rides on the key; the second segment's key has no
+        // IV, so its IV is its media sequence number (MEDIA-SEQUENCE 7 +
+        // index 1 = 8) as a 16-byte big-endian integer.
+        let playlist = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n#EXT-X-MEDIA-SEQUENCE:7\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\",IV=0x000102030405060708090a0b0c0d0e0f\nseg0.ts\n#EXT-X-KEY:METHOD=AES-128,URI=\"key2.bin\"\nseg1.ts\n#EXT-X-KEY:METHOD=NONE\nseg2.ts\n#EXT-X-ENDLIST\n";
+        let parsed = super::parse_hls_media_playlist(playlist, &base).unwrap();
+        assert_eq!(parsed.segments.len(), 3);
+        let key0 = parsed.segments[0].key.as_ref().expect("segment 0 has a key");
+        assert_eq!(key0.uri, "https://cdn.example.test/hls/key.bin");
+        assert_eq!(key0.iv, Some([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]));
+        let key1 = parsed.segments[1].key.as_ref().expect("segment 1 has a key");
+        assert_eq!(key1.uri, "https://cdn.example.test/hls/key2.bin");
+        let mut expected_iv = [0u8; 16];
+        expected_iv[15] = 8;
+        assert_eq!(key1.iv, Some(expected_iv));
+        // METHOD=NONE clears the key for the segments after it.
+        assert!(parsed.segments[2].key.is_none());
+    }
+
+    #[test]
+    fn hls_aes128_media_playlist_rejects_protected_methods_and_bad_keys() {
+        let base = Url::parse("https://cdn.example.test/hls/media.m3u8").unwrap();
+        // SAMPLE-AES is protected content: refused, never attempted.
+        let sample_aes = "#EXTM3U\n#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"key.bin\"\nseg0.ts\n#EXT-X-ENDLIST\n";
+        assert!(super::parse_hls_media_playlist(sample_aes, &base).is_err());
+        // AES-128 without a URI has no key to fetch.
+        let no_uri = "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128\nseg0.ts\n#EXT-X-ENDLIST\n";
+        assert!(super::parse_hls_media_playlist(no_uri, &base).is_err());
+        // A malformed IV is a playlist error, not a guess.
+        let bad_iv = "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\",IV=0x1234\nseg0.ts\n#EXT-X-ENDLIST\n";
+        assert!(super::parse_hls_media_playlist(bad_iv, &base).is_err());
+    }
+
+    #[test]
+    fn hls_aes128_reason_no_longer_flags_aes128_but_flags_sample_aes() {
+        // AES-128 is downloadable in-engine now, so it is no longer an
+        // unsupported reason; SAMPLE-AES still is.
+        assert!(unsupported_hls_reason("#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\nseg0.ts\n#EXT-X-ENDLIST").is_none());
+        assert!(unsupported_hls_reason("#EXTM3U\n#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"key.bin\"\nseg0.ts\n#EXT-X-ENDLIST").is_some());
+    }
+
+    #[test]
+    fn hls_segment_identity_ignores_signed_url_query() {
+        // The same segment under a rotated signature is the same segment
+        // (resume must not restart); a different path is a different one.
+        let segment = |url: &str| super::HlsSegmentRef { url: url.to_string(), range: None, key: None };
+        assert_eq!(segment("https://cdn.example.test/seg0.ts?token=aaa"), segment("https://cdn.example.test/seg0.ts?token=bbb"));
+        assert_ne!(segment("https://cdn.example.test/seg0.ts?token=aaa"), segment("https://cdn.example.test/seg1.ts?token=aaa"));
+        // A fragment is never sent to the server, so it is not part of
+        // the identity either.
+        assert_eq!(segment("https://cdn.example.test/seg0.ts"), segment("https://cdn.example.test/seg0.ts#frag"));
+        assert_eq!(segment("https://cdn.example.test/seg0.ts"), segment("https://cdn.example.test/seg0.ts"));
+        assert_ne!(
+            super::HlsSegmentRef { url: "https://cdn.example.test/seg0.ts".into(), range: Some((0, 100)), key: None },
+            super::HlsSegmentRef { url: "https://cdn.example.test/seg0.ts".into(), range: Some((100, 100)), key: None },
+        );
+    }
+
+    #[tokio::test]
+    async fn hls_aes128_segment_decrypts_to_exact_bytes() {
+        use aes::Aes128;
+        use cbc::{cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit}, Encryptor};
+        let key = [0x2b_u8; 16];
+        let iv = [0x10_u8; 16];
+        // Plaintext spanning several blocks, plus a short tail so the
+        // padding path is exercised (1000 bytes = 62 blocks + 8 bytes).
+        let plaintext: Vec<u8> = (0..1000).map(|index| (index % 251) as u8).collect();
+        let encryptor = Encryptor::<Aes128>::new_from_slices(&key, &iv).unwrap();
+        let ciphertext = encryptor.encrypt_padded_vec_mut::<Pkcs7>(&plaintext);
+        assert_eq!(ciphertext.len() % 16, 0);
+        assert_ne!(ciphertext, plaintext);
+
+        let directory = std::env::temp_dir().join(format!("thunderload-aes128-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let raw = directory.join("seg.raw");
+        let out = directory.join("seg.ts");
+        tokio::fs::write(&raw, &ciphertext).await.unwrap();
+        let decrypted = super::decrypt_aes128_segment(&raw, &out, &key, &iv).await.unwrap();
+        assert_eq!(decrypted, plaintext.len() as u64);
+        assert_eq!(tokio::fs::read(&out).await.unwrap(), plaintext);
+
+        // Corrupt padding: the last byte lies about the pad length.
+        let mut bad_padding = ciphertext.clone();
+        let last = bad_padding.len() - 1;
+        bad_padding[last] = bad_padding[last].wrapping_add(1);
+        let bad_raw = directory.join("bad.raw");
+        let bad_out = directory.join("bad.ts");
+        tokio::fs::write(&bad_raw, &bad_padding).await.unwrap();
+        assert!(super::decrypt_aes128_segment(&bad_raw, &bad_out, &key, &iv).await.is_err());
+
+        // Truncated ciphertext (not a multiple of 16) is an error.
+        let truncated = directory.join("trunc.raw");
+        tokio::fs::write(&truncated, &ciphertext[..ciphertext.len() - 1]).await.unwrap();
+        assert!(super::decrypt_aes128_segment(&truncated, &out, &key, &iv).await.is_err());
+        tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 
     #[test]
@@ -4452,10 +5152,15 @@ mod tests {
 
     #[tokio::test]
     async fn dash_error_interrupted_download_resumes_from_disk_checkpoint() {
-        // The last six segments are absent (404) on the first call, so the
+        // The last four segments are absent (404) on the first call, so the
         // download errors after the first batch — keeping its checkpoint
         // and the finished segments. Which segments finished is read from
-        // disk afterwards, never assumed.
+        // disk afterwards, never assumed. The first failing segment (9)
+        // sits past the first full batch of concurrent segments (8,
+        // DEFAULT_RESUMABLE_CONNECTIONS — init + seg 1-7), so at least
+        // one segment completes — and its file is written — before the
+        // failure aborts the download: with the old concurrency of 6 the
+        // fixture used 6 for the same reason.
         let segment_count = 12;
         let routes: Arc<RwLock<HashMap<String, Vec<u8>>>> = Arc::new(RwLock::new(HashMap::new()));
         let (base, counts, _range_counts, shutdown, server) =
@@ -4469,7 +5174,7 @@ mod tests {
             for index in 1..=segment_count {
                 let body = format!("SEGMENT-{index:03}-DATA").into_bytes();
                 expected.extend_from_slice(&body);
-                if index <= 6 {
+                if index <= 8 {
                     map.insert(format!("/v1/seg-{index:03}.m4s"), body);
                 } else {
                     missing.push((format!("/v1/seg-{index:03}.m4s"), body));
@@ -4510,6 +5215,226 @@ mod tests {
             assert_eq!(counts_after_resume.get(&key), counts_after_error.get(&key),
                 "segment {key} was re-requested after the error-interrupted resume");
         }
+        stop_dash_server(shutdown, server);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    // --- Slice 4: signed-URL refresh ---
+
+    /// A test server that simulates signed-URL expiry for DASH: the MPD
+    /// it serves embeds segment URLs with a `?token=N` query. A segment
+    /// request succeeds only when its token is the latest one the MPD has
+    /// issued AND that token is not the first one (token 0 is always
+    /// expired — the URLs the first resolve returns are already stale).
+    /// The first resolve therefore 403s every segment; the refresh
+    /// re-resolves, gets token 1, and completes. When `never_valid` is
+    /// set, no token is ever accepted, so the refreshes are exhausted
+    /// and the download fails. `mpd_fetches` counts MPD GETs;
+    /// `segment_counts` counts segment GETs per path.
+    fn spawn_signed_dash_server(
+        segment_count: usize,
+        never_valid: bool,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>, Arc<Mutex<HashMap<String, usize>>>, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let epoch = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mpd_fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let segment_counts = Arc::new(Mutex::new(HashMap::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_epoch = epoch.clone();
+        let thread_fetches = mpd_fetches.clone();
+        let thread_counts = segment_counts.clone();
+        let thread_shutdown = shutdown.clone();
+        let handle = std::thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => {
+                        let _ = connection.0.set_nonblocking(false);
+                        connection
+                    },
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let epoch = thread_epoch.clone();
+                let fetches = thread_fetches.clone();
+                let counts = thread_counts.clone();
+                std::thread::spawn(move || loop {
+                    let mut raw = Vec::new();
+                    let mut buffer = [0_u8; 1024];
+                    let head_complete = loop {
+                        match stream.read(&mut buffer) {
+                            Ok(0) => break false,
+                            Ok(count) => {
+                                raw.extend_from_slice(&buffer[..count]);
+                                if raw.windows(4).any(|window| window == b"\r\n\r\n") { break true; }
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(_) => break false,
+                        }
+                    };
+                    if !head_complete { return; }
+                    let request = String::from_utf8_lossy(&raw);
+                    let target = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let path = target.split('?').next().unwrap_or(&target).to_string();
+                    let token = target.split("token=").nth(1)
+                        .and_then(|value| value.split('&').next())
+                        .and_then(|value| value.parse::<usize>().ok());
+                    if path == "/video.mpd" {
+                        let issued = epoch.fetch_add(1, Ordering::Relaxed);
+                        fetches.fetch_add(1, Ordering::Relaxed);
+                        let mpd = format!(r#"<MPD type="static" mediaPresentationDuration="PT{segment_count}S">
+                          <Period duration="PT{segment_count}S">
+                            <AdaptationSet contentType="video" mimeType="video/mp4">
+                              <SegmentTemplate timescale="1" startNumber="1" initialization="init.mp4" media="seg-$Number$.m4s?token={issued}">
+                                <SegmentTimeline><S t="0" d="1" r="{}"/></SegmentTimeline>
+                              </SegmentTemplate>
+                              <Representation id="v1" bandwidth="900000" width="640" height="360"/>
+                            </AdaptationSet>
+                          </Period>
+                        </MPD>"#, segment_count - 1);
+                        let body = mpd.into_bytes();
+                        let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n", body.len()).as_bytes());
+                        let _ = stream.write_all(&body);
+                        continue;
+                    }
+                    if path == "/init.mp4" {
+                        let body = b"FAKEINIT";
+                        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: keep-alive\r\n\r\n");
+                        let _ = stream.write_all(body);
+                        continue;
+                    }
+                    if let Some(number) = path.strip_prefix("/seg-").and_then(|rest| rest.strip_suffix(".m4s")).and_then(|value| value.parse::<usize>().ok()) {
+                        {
+                            let mut counts = counts.lock().unwrap();
+                            *counts.entry(path.clone()).or_insert(0) += 1;
+                        }
+                        let latest = epoch.load(Ordering::Relaxed).saturating_sub(1);
+                        let valid = !never_valid && token == Some(latest) && latest >= 1;
+                        if valid {
+                            let body = format!("SEGMENT-{number:03}-DATA").into_bytes();
+                            let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n", body.len()).as_bytes());
+                            let _ = stream.write_all(&body);
+                        } else {
+                            let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n");
+                        }
+                        continue;
+                    }
+                    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    return;
+                });
+            }
+        });
+        (format!("http://{address}"), mpd_fetches, segment_counts, shutdown, handle)
+    }
+
+    #[tokio::test]
+    async fn dash_segment_url_refresh_on_403_recovers() {
+        let segment_count = 4;
+        let (base, mpd_fetches, segment_counts, shutdown, server) =
+            spawn_signed_dash_server(segment_count, false);
+        let directory = dash_test_dir("refresh");
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("movie.mp4")).await.unwrap();
+        let url = format!("{base}/video.mpd");
+        let (_control_tx, control_rx) = fresh_dash_control();
+        let outcome = run_dash_resumable(&url, &target, control_rx).await.unwrap();
+        assert_eq!(outcome, DownloadOutcome::Completed);
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        let mut expected = b"FAKEINIT".to_vec();
+        for index in 1..=segment_count {
+            expected.extend_from_slice(format!("SEGMENT-{index:03}-DATA").as_bytes());
+        }
+        assert_eq!(bytes, expected);
+        // Exactly one refresh: the first MPD's token-0 URLs were all
+        // refused, the second MPD's token-1 URLs served every segment.
+        assert_eq!(mpd_fetches.load(Ordering::Relaxed), 2, "expected exactly one playlist refresh");
+        let counts = segment_counts.lock().unwrap();
+        for index in 1..=segment_count {
+            assert_eq!(counts.get(&format!("/seg-{index}.m4s")), Some(&2),
+                "segment {index} should be fetched twice: once refused, once served");
+        }
+        stop_dash_server(shutdown, server);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dash_refresh_exhaustion_fails_after_two_refreshes() {
+        let segment_count = 4;
+        let (base, mpd_fetches, _segment_counts, shutdown, server) =
+            spawn_signed_dash_server(segment_count, true);
+        let directory = dash_test_dir("refresh-exhaust");
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("movie.mp4")).await.unwrap();
+        let url = format!("{base}/video.mpd");
+        let (_control_tx, control_rx) = fresh_dash_control();
+        let result = run_dash_resumable(&url, &target, control_rx).await;
+        assert!(result.is_err(), "a manifest whose URLs never become valid must fail");
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("expired"), "expected the expiry error, got: {message}");
+        // Initial resolve + exactly two refreshes, then give up — never
+        // a loop.
+        assert_eq!(mpd_fetches.load(Ordering::Relaxed), 3, "expected initial resolve + 2 refreshes");
+        // The checkpoint is kept, so a retry resumes instead of restarting.
+        assert!(tokio::fs::try_exists(partial_download_metadata_path(&target)).await.unwrap());
+        stop_dash_server(shutdown, server);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    // --- Slice 4: prompt pause/cancel (Gemini claim 5) ---
+
+    #[tokio::test]
+    async fn dash_pause_is_prompt_during_slow_segment() {
+        // Every response takes 3 s (response_delay). With the old bare
+        // `join_next()` wait, a pause sent 300 ms in would return only
+        // after the first in-flight segment finished (~3 s). With the
+        // select! on control.changed() it returns in well under a second.
+        let segment_count = 4;
+        let routes: Arc<RwLock<HashMap<String, Vec<u8>>>> = Arc::new(RwLock::new(HashMap::new()));
+        let (base, _counts, _range_counts, shutdown, server) =
+            spawn_dash_server_with_delay(routes.clone(), Arc::new(HashSet::new()), Duration::from_secs(3));
+        {
+            let mut map = routes.write().unwrap();
+            map.insert("/v1/init.mp4".into(), b"FAKEINIT".to_vec());
+            for index in 1..=segment_count {
+                map.insert(format!("/v1/seg-{index:03}.m4s"), format!("SEGMENT-{index:03}-DATA").into_bytes());
+            }
+            map.insert("/video.mpd".into(), dash_segment_template_mpd(segment_count).into_bytes());
+        }
+        let directory = dash_test_dir("prompt-pause");
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("movie.mp4")).await.unwrap();
+        let url = format!("{base}/video.mpd");
+        let (control_tx, control_rx) = fresh_dash_control();
+        let task_target = target.clone();
+        let task_url = url.clone();
+        let task = tokio::spawn(async move { run_dash_resumable(&task_url, &task_target, control_rx).await });
+        // The response delay applies to the MPD fetch too, so the pause
+        // must wait until the manifest is resolved and the track loop has
+        // started: the checkpoint sidecar is written right before the
+        // first segment is fetched, so its appearance means the slow
+        // segment fetches are in flight.
+        let meta_path = partial_download_metadata_path(&target);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if tokio::fs::try_exists(&meta_path).await.unwrap_or(false) { break; }
+            assert!(tokio::time::Instant::now() < deadline, "checkpoint never appeared");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let started = tokio::time::Instant::now();
+        control_tx.send(DownloadControl::Paused).unwrap();
+        let outcome = task.await.unwrap().unwrap();
+        assert_eq!(outcome, DownloadOutcome::Paused);
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_secs(2),
+            "pause took {elapsed:?} — it must return promptly during a slow segment, not after it finishes");
         stop_dash_server(shutdown, server);
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
@@ -4769,7 +5694,7 @@ mod hls_download_tests {
     use super::{
         download_hls_resumable, ffmpeg_available, hidden_command, hls_output_extension, hls_work_dir,
         partial_download_metadata_path, validate_hls_content_range,
-        DownloadControl, DownloadOutcome, GlobalRateLimiter, SessionHeaders,
+        DownloadControl, DownloadOutcome, GlobalRateLimiter, HlsSelection, SessionHeaders,
     };
     use crate::download::reserve_download_path;
     use std::{
@@ -4801,6 +5726,98 @@ mod hls_download_tests {
         /// header value or the server answers 403 (exercises the
         /// session handoff: playlist + segment fetches all need it).
         require_cookie: Option<String>,
+        /// When set, tracks how many requests are being served
+        /// concurrently and the peak (proves the segment-fetch
+        /// concurrency: the client must fill all of the engine's
+        /// connections, no more).
+        in_flight: Option<Arc<InFlightTracker>>,
+        /// When set, segment requests wait at this barrier until
+        /// `target` of them have arrived (or the timeout passes) before
+        /// being served. Without it the peak-concurrency measurement is a
+        /// race against scheduling jitter: on a loaded machine the eighth
+        /// request can arrive after the first segment finished, so the
+        /// peak reads 7 for a correct engine. With the barrier the peak
+        /// is a synchronization proof instead — if the engine only ever
+        /// opens 6 connections, the barrier times out and the peak stays
+        /// 6. The barrier applies to segment paths only, never to the
+        /// playlist fetch.
+        barrier: Option<Arc<ConcurrencyBarrier>>,
+    }
+
+    /// Barrier for the concurrency proof: segment handlers wait until
+    /// `target` of them have arrived before serving, so the peak
+    /// in-flight count is deterministic instead of a scheduling race.
+    /// A target that is never reached times out (no deadlock) and the
+    /// handlers serve anyway, so the peak honestly reports how many
+    /// connections the client actually opened.
+    struct ConcurrencyBarrier {
+        target: usize,
+        arrived: AtomicUsize,
+    }
+
+    impl ConcurrencyBarrier {
+        fn wait_for_all(&self, timeout: Duration) {
+            let arrived = self.arrived.fetch_add(1, Ordering::Relaxed) + 1;
+            if arrived >= self.target {
+                return;
+            }
+            let deadline = std::time::Instant::now() + timeout;
+            while self.arrived.load(Ordering::Relaxed) < self.target {
+                if std::time::Instant::now() >= deadline {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    /// Concurrent-request tracker for the test servers: `current` is the
+    /// number of requests being served right now, `max` the peak seen.
+    /// `peak_paths` is the set of request paths that were in flight when
+    /// the peak was recorded, so a surprising peak can be diagnosed
+    /// instead of guessed at.
+    struct InFlightTracker {
+        current: AtomicUsize,
+        max: AtomicUsize,
+        paths: Mutex<std::collections::HashSet<String>>,
+        peak_paths: Mutex<Vec<String>>,
+    }
+
+    impl InFlightTracker {
+        fn enter(&self, path: &str) -> InFlightGuard<'_> {
+            let current = self.current.fetch_add(1, Ordering::Relaxed) + 1;
+            {
+                let mut paths = self.paths.lock().unwrap();
+                paths.insert(path.to_string());
+                if current > self.max.load(Ordering::Relaxed) {
+                    self.max.store(current, Ordering::Relaxed);
+                    *self.peak_paths.lock().unwrap() = paths.iter().cloned().collect();
+                }
+            }
+            InFlightGuard { tracker: self, path: path.to_string() }
+        }
+
+        fn max(&self) -> usize {
+            self.max.load(Ordering::Relaxed)
+        }
+
+        fn peak_paths(&self) -> Vec<String> {
+            let mut paths = self.peak_paths.lock().unwrap().clone();
+            paths.sort();
+            paths
+        }
+    }
+
+    struct InFlightGuard<'a> {
+        tracker: &'a InFlightTracker,
+        path: String,
+    }
+
+    impl Drop for InFlightGuard<'_> {
+        fn drop(&mut self) {
+            self.tracker.current.fetch_sub(1, Ordering::Relaxed);
+            self.tracker.paths.lock().unwrap().remove(&self.path);
+        }
     }
 
     /// Static-route HTTP/1.1 fixture mirroring the keep-alive style of the
@@ -4820,7 +5837,7 @@ mod hls_download_tests {
         let range_206 = Arc::new(AtomicUsize::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
         let routes = Arc::new(routes);
-        let HlsServerOptions { fail_from_index, ignore_range_paths, content_range_overrides, require_cookie } = options;
+        let HlsServerOptions { fail_from_index, ignore_range_paths, content_range_overrides, require_cookie, in_flight, barrier } = options;
         let routes = Arc::new(routes);
         let thread_counts = counts.clone();
         let thread_range = range_206.clone();
@@ -4845,6 +5862,8 @@ mod hls_download_tests {
                 let ignore_range_paths = ignore_range_paths.clone();
                 let content_range_overrides = content_range_overrides.clone();
                 let require_cookie = require_cookie.clone();
+                let in_flight = in_flight.clone();
+                let barrier = barrier.clone();
                 thread::spawn(move || loop {
                     let mut raw = Vec::new();
                     let mut buffer = [0_u8; 1024];
@@ -4874,6 +5893,18 @@ mod hls_download_tests {
                     {
                         let mut counts = counts.lock().unwrap();
                         *counts.entry(path_only.clone()).or_insert(0) += 1;
+                    }
+                    // The request is being served from here until its
+                    // body is fully written (or the handler returns
+                    // early): the guard covers every response path.
+                    let _in_flight = in_flight.as_ref().map(|tracker| tracker.enter(&path_only));
+                    // Segment requests wait at the concurrency barrier
+                    // (see the option's doc comment); the playlist fetch
+                    // is never gated.
+                    if let Some(barrier) = &barrier {
+                        if path_only.starts_with("/seg") && path_only.ends_with(".ts") {
+                            barrier.wait_for_all(Duration::from_secs(10));
+                        }
                     }
                     if let Some(required) = &require_cookie {
                         let cookie = request.lines().find_map(|line| {
@@ -4955,8 +5986,18 @@ mod hls_download_tests {
         control_rx: watch::Receiver<DownloadControl>,
         session: Option<SessionHeaders>,
     ) -> anyhow::Result<DownloadOutcome> {
+        run_resumable_with_selection_and_session(url, target, control_rx, HlsSelection::none(), session).await
+    }
+
+    async fn run_resumable_with_selection_and_session(
+        url: &str,
+        target: &std::path::Path,
+        control_rx: watch::Receiver<DownloadControl>,
+        selection: HlsSelection,
+        session: Option<SessionHeaders>,
+    ) -> anyhow::Result<DownloadOutcome> {
         let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
-        download_hls_resumable(url, target, session.as_ref(), control_rx, progress_tx, Arc::new(GlobalRateLimiter::new())).await
+        download_hls_resumable(url, &selection, target, session.as_ref(), control_rx, progress_tx, Arc::new(GlobalRateLimiter::new())).await
     }
 
     fn fresh_control() -> (watch::Sender<DownloadControl>, watch::Receiver<DownloadControl>) {
@@ -5105,8 +6146,8 @@ mod hls_download_tests {
         routes.insert("/fmp4.m3u8".into(), fmp4_media_playlist("init.mp4", &["seg0.m4s".to_string(), "seg1.m4s".to_string()]).into_bytes());
         let (base, _counts, _range_206, shutdown, server) =
             spawn_hls_server(routes, Duration::ZERO, HlsServerOptions::default());
-        assert_eq!(hls_output_extension(&format!("{base}/ts.m3u8"), None).await.unwrap(), "ts");
-        assert_eq!(hls_output_extension(&format!("{base}/fmp4.m3u8"), None).await.unwrap(), "mp4");
+        assert_eq!(hls_output_extension(&format!("{base}/ts.m3u8"), &HlsSelection::none(), None).await.unwrap(), "ts");
+        assert_eq!(hls_output_extension(&format!("{base}/fmp4.m3u8"), &HlsSelection::none(), None).await.unwrap(), "mp4");
         stop_server(shutdown, server);
     }
 
@@ -5212,14 +6253,18 @@ mod hls_download_tests {
     async fn hls_error_interrupted_download_resumes_from_disk_checkpoint() {
         let (mut routes, bodies) = segment_routes(12, 8192);
         routes.insert("/media.m3u8".into(), media_playlist(12).into_bytes());
-        // Deterministic failure: segments 0-5 always succeed, segments
-        // 6+ always fail with 500. The failure is decided per request by
+        // Deterministic failure: segments 0-9 always succeed, segments
+        // 10+ always fail with 500. The failure is decided per request by
         // the fixture, so it cannot race with the test thread the way a
         // flipped flag could (a flag flipped after the checkpoint wait
         // regularly landed too late — the remaining requests had already
         // been read by the server — and the download completed instead
-        // of erroring).
-        let fail_from_index = Arc::new(AtomicUsize::new(6));
+        // of erroring). The failing index sits past the first full batch
+        // of concurrent segments (8, DEFAULT_RESUMABLE_CONNECTIONS), so
+        // at least one segment completes — and its checkpoint entry is
+        // written — before the failure aborts the download: with the old
+        // concurrency of 6 the fixture used 6 for the same reason.
+        let fail_from_index = Arc::new(AtomicUsize::new(10));
         let options = HlsServerOptions {
             fail_from_index: Some(fail_from_index.clone()),
             ..Default::default()
@@ -5237,7 +6282,7 @@ mod hls_download_tests {
         let task = tokio::spawn(async move { run_resumable(&task_url, &task_target, control_rx).await });
         let done_before_error = wait_for_checkpoint_progress(&target, 1).await;
         assert!(!done_before_error.is_empty() && done_before_error.len() < 12);
-        // Segments 6+ fail deterministically, so the download must error
+        // Segments 10+ fail deterministically, so the download must error
         // while keeping its checkpoint on disk.
         let result = task.await.unwrap();
         assert!(result.is_err(), "expected the failing server to abort the download");
@@ -5595,6 +6640,489 @@ mod hls_download_tests {
         assert!(!tokio::fs::try_exists(&target).await.unwrap());
         assert!(!tokio::fs::try_exists(hls_work_dir(&target)).await.unwrap());
         assert!(!tokio::fs::try_exists(partial_download_metadata_path(&target)).await.unwrap());
+        stop_server(shutdown, server);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    // --- Slice 4: AES-128 end-to-end, selection, refresh, concurrency ---
+
+    #[tokio::test]
+    async fn hls_aes128_download_completes_with_exact_bytes() {
+        // Four TS segments encrypted with one AES-128 key (fixed key/IV,
+        // no explicit IV in the playlist — the default IV is the media
+        // sequence number). The key is served only to requests carrying
+        // the session cookie, so the test also proves the key fetch uses
+        // the same session as the playlist and segment fetches.
+        use aes::Aes128;
+        use cbc::{cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit}, Encryptor};
+        let key = [0x2b_u8; 16];
+        let segment_count = 4;
+        let mut routes = HashMap::new();
+        let mut expected = Vec::new();
+        let mut playlist = String::from("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n");
+        for index in 0..segment_count {
+            let plaintext: Vec<u8> = (0..512).map(|byte| ((index * 37 + byte) % 251) as u8).collect();
+            expected.extend_from_slice(&plaintext);
+            // Default IV for segment `index` is its media sequence
+            // number (index) as a 16-byte big-endian integer.
+            let mut iv = [0u8; 16];
+            iv[15] = index as u8;
+            let encryptor = Encryptor::<Aes128>::new_from_slices(&key, &iv).unwrap();
+            let ciphertext = encryptor.encrypt_padded_vec_mut::<Pkcs7>(&plaintext);
+            routes.insert(format!("/seg{index}.ts"), ciphertext);
+            playlist.push_str("#EXTINF:10.0,\n");
+            playlist.push_str(&format!("seg{index}.ts\n"));
+        }
+        playlist.push_str("#EXT-X-ENDLIST\n");
+        routes.insert("/media.m3u8".into(), playlist.into_bytes());
+        routes.insert("/key.bin".into(), key.to_vec());
+        let options = HlsServerOptions {
+            require_cookie: Some("sessionid=abc123".to_string()),
+            ..Default::default()
+        };
+        let (base, counts, _range_206, shutdown, server) =
+            spawn_hls_server(routes, Duration::ZERO, options);
+        let directory = std::env::temp_dir().join(format!("thunderload-hls-aes128-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("movie.ts")).await.unwrap();
+        let url = format!("{base}/media.m3u8");
+        let session = SessionHeaders {
+            cookies: Some("sessionid=abc123".to_string()),
+            referer: None,
+            user_agent: None,
+            origin: SessionHeaders::origin_of(&url),
+        };
+        let (_control_tx, control_rx) = fresh_control();
+        let outcome = run_resumable_with_session(&url, &target, control_rx, Some(session)).await.unwrap();
+        assert_eq!(outcome, DownloadOutcome::Completed);
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(bytes, expected, "decrypted output must be the exact plaintext");
+        // The key was fetched exactly once (cached per URI), not once
+        // per segment.
+        assert_eq!(counts.lock().unwrap().get("/key.bin"), Some(&1));
+        stop_server(shutdown, server);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hls_selected_variant_downloads_with_audio() {
+        // Master with two variants sharing one audio rendition. The user
+        // picks the 360p variant: the download must fetch ONLY the 360p
+        // segments + the audio, never the 720p segments (the old code
+        // always took the first variant and silently dropped the audio
+        // when given a child playlist — Gemini claim 4).
+        let ffmpeg = ffmpeg_available().await;
+        let directory = std::env::temp_dir().join(format!("thunderload-hls-select-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let mut routes = HashMap::new();
+        let (high_segments, low_segments, audio_segments): (Vec<String>, Vec<String>, Vec<String>);
+        if ffmpeg {
+            let high_dir = directory.join("gen-high");
+            let low_dir = directory.join("gen-low");
+            let audio_dir = directory.join("gen-audio");
+            let (high_init, high_parts) = generate_fmp4_track(&high_dir, true).await
+                .expect("ffmpeg is available but could not generate the high test track");
+            let (low_init, low_parts) = generate_fmp4_track(&low_dir, true).await
+                .expect("ffmpeg is available but could not generate the low test track");
+            let (audio_init, audio_parts) = generate_fmp4_track(&audio_dir, false).await
+                .expect("ffmpeg is available but could not generate the audio test track");
+            routes.insert("/h-init.mp4".into(), high_init);
+            routes.insert("/l-init.mp4".into(), low_init);
+            routes.insert("/a-init.mp4".into(), audio_init);
+            high_segments = high_parts.iter().enumerate().map(|(index, _)| format!("h{index}.m4s")).collect();
+            low_segments = low_parts.iter().enumerate().map(|(index, _)| format!("l{index}.m4s")).collect();
+            audio_segments = audio_parts.iter().enumerate().map(|(index, _)| format!("a{index}.m4s")).collect();
+            for (index, body) in high_parts.iter().enumerate() {
+                routes.insert(format!("/h{index}.m4s"), body.clone());
+            }
+            for (index, body) in low_parts.iter().enumerate() {
+                routes.insert(format!("/l{index}.m4s"), body.clone());
+            }
+            for (index, body) in audio_parts.iter().enumerate() {
+                routes.insert(format!("/a{index}.m4s"), body.clone());
+            }
+        } else {
+            let mut init = Vec::new();
+            init.extend_from_slice(&24_u32.to_be_bytes());
+            init.extend_from_slice(b"ftypisomiso2");
+            init.extend_from_slice(&[0_u8; 8]);
+            routes.insert("/h-init.mp4".into(), init.clone());
+            routes.insert("/l-init.mp4".into(), init.clone());
+            routes.insert("/a-init.mp4".into(), init);
+            high_segments = vec!["h0.m4s".into(), "h1.m4s".into()];
+            low_segments = vec!["l0.m4s".into(), "l1.m4s".into()];
+            audio_segments = vec!["a0.m4s".into(), "a1.m4s".into()];
+            for index in 0..2 {
+                routes.insert(format!("/h{index}.m4s"), format!("high-fragment-{index}").into_bytes());
+                routes.insert(format!("/l{index}.m4s"), format!("low-fragment-{index}").into_bytes());
+                routes.insert(format!("/a{index}.m4s"), format!("audio-fragment-{index}").into_bytes());
+            }
+        }
+        let master = "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio-en\",LANGUAGE=\"en\",NAME=\"English\",DEFAULT=YES,URI=\"audio.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=2400000,RESOLUTION=1280x720,AUDIO=\"audio-en\"\nhigh.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360,AUDIO=\"audio-en\"\nlow.m3u8\n";
+        routes.insert("/master.m3u8".into(), master.as_bytes().to_vec());
+        routes.insert("/high.m3u8".into(), fmp4_media_playlist("h-init.mp4", &high_segments).into_bytes());
+        routes.insert("/low.m3u8".into(), fmp4_media_playlist("l-init.mp4", &low_segments).into_bytes());
+        routes.insert("/audio.m3u8".into(), fmp4_media_playlist("a-init.mp4", &audio_segments).into_bytes());
+        let (base, counts, _range_206, shutdown, server) =
+            spawn_hls_server(routes, Duration::ZERO, HlsServerOptions::default());
+        let target = reserve_download_path(&directory.join("movie.mp4")).await.unwrap();
+        let selection = HlsSelection {
+            media_url: Some(format!("{base}/low.m3u8")),
+            audio_group: Some("audio-en".to_string()),
+        };
+        let (_control_tx, control_rx) = fresh_control();
+        let result = run_resumable_with_selection_and_session(&format!("{base}/master.m3u8"), &target, control_rx, selection, None).await;
+        // The 360p segments and the audio were fetched exactly once; the
+        // 720p segments were never requested at all.
+        let counts = counts.lock().unwrap().clone();
+        for name in low_segments.iter().chain(audio_segments.iter()) {
+            assert_eq!(counts.get(&format!("/{name}")), Some(&1), "expected exactly one request for {name}");
+        }
+        for name in &high_segments {
+            assert_eq!(counts.get(&format!("/{name}")), None, "the unselected 720p segment {name} must never be fetched");
+        }
+        if ffmpeg {
+            let outcome = result.unwrap();
+            assert_eq!(outcome, DownloadOutcome::Completed);
+            match probe_stream_types(&target).await {
+                Some(streams) => {
+                    assert!(streams.iter().any(|stream| stream == "video"), "muxed output has no video stream: {streams:?}");
+                    assert!(streams.iter().any(|stream| stream == "audio"), "muxed output has no audio stream: {streams:?}");
+                }
+                None => {
+                    let bytes = tokio::fs::read(&target).await.unwrap();
+                    assert_eq!(&bytes[4..8], b"ftyp", "muxed output should be an MP4 starting with an ftyp box");
+                }
+            }
+        } else {
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("FFmpeg"), "expected a clear FFmpeg error, got: {error}");
+        }
+        stop_server(shutdown, server);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hls_selected_variant_missing_is_an_error() {
+        let master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2400000,RESOLUTION=1280x720\nhigh.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360\nlow.m3u8\n";
+        let mut routes = HashMap::new();
+        routes.insert("/master.m3u8".into(), master.as_bytes().to_vec());
+        routes.insert("/high.m3u8".into(), fmp4_media_playlist("h-init.mp4", &["h0.m4s".to_string()]).into_bytes());
+        routes.insert("/low.m3u8".into(), fmp4_media_playlist("l-init.mp4", &["l0.m4s".to_string()]).into_bytes());
+        let (base, _counts, _range_206, shutdown, server) =
+            spawn_hls_server(routes, Duration::ZERO, HlsServerOptions::default());
+        let selection = HlsSelection {
+            media_url: Some(format!("{base}/gone.m3u8")),
+            audio_group: None,
+        };
+        let error = super::resolve_hls_plan(&format!("{base}/master.m3u8"), &selection, None).await.unwrap_err();
+        assert!(error.to_string().contains("no longer listed"), "expected the stale-selection error, got: {error}");
+        // A stale audio group is the same kind of error, not a silent
+        // fall back to a different track.
+        let selection = HlsSelection {
+            media_url: Some(format!("{base}/low.m3u8")),
+            audio_group: Some("audio-missing".to_string()),
+        };
+        let error = super::resolve_hls_plan(&format!("{base}/master.m3u8"), &selection, None).await.unwrap_err();
+        assert!(error.to_string().contains("no longer listed"), "expected the stale-audio error, got: {error}");
+        stop_server(shutdown, server);
+    }
+
+    /// A test server that simulates signed-URL expiry for HLS: the media
+    /// playlist it serves embeds segment URLs with a `?token=N` query. A
+    /// segment request succeeds only when its token is the latest one the
+    /// playlist has issued AND that token is not the first one (token 0
+    /// is always expired — the URLs the first resolve returns are already
+    /// stale). The first resolve therefore 403s every segment; the
+    /// refresh re-resolves, gets token 1, and completes. When
+    /// `never_valid` is set, no token is ever accepted, so the refreshes
+    /// are exhausted and the download fails. `playlist_fetches` counts
+    /// playlist GETs; `segment_counts` counts segment GETs per path.
+    /// `chunk_delay` paces each 1 KiB of a segment body (zero for an
+    /// instant server): a slow server lets a test pause mid-download
+    /// deterministically instead of racing the last batch.
+    fn spawn_signed_hls_server(
+        segment_count: usize,
+        never_valid: bool,
+        chunk_delay: Duration,
+    ) -> (String, Arc<AtomicUsize>, Arc<Mutex<HashMap<String, usize>>>, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let epoch = Arc::new(AtomicUsize::new(0));
+        let playlist_fetches = Arc::new(AtomicUsize::new(0));
+        let segment_counts = Arc::new(Mutex::new(HashMap::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_epoch = epoch.clone();
+        let thread_fetches = playlist_fetches.clone();
+        let thread_counts = segment_counts.clone();
+        let thread_shutdown = shutdown.clone();
+        let handle = thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => {
+                        let _ = connection.0.set_nonblocking(false);
+                        connection
+                    },
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let epoch = thread_epoch.clone();
+                let fetches = thread_fetches.clone();
+                let counts = thread_counts.clone();
+                thread::spawn(move || loop {
+                    let mut raw = Vec::new();
+                    let mut buffer = [0_u8; 1024];
+                    let head_complete = loop {
+                        match stream.read(&mut buffer) {
+                            Ok(0) => break false,
+                            Ok(count) => {
+                                raw.extend_from_slice(&buffer[..count]);
+                                if raw.windows(4).any(|window| window == b"\r\n\r\n") { break true; }
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(_) => break false,
+                        }
+                    };
+                    if !head_complete { return; }
+                    let request = String::from_utf8_lossy(&raw);
+                    let target = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let path = target.split('?').next().unwrap_or(&target).to_string();
+                    let token = target.split("token=").nth(1)
+                        .and_then(|value| value.split('&').next())
+                        .and_then(|value| value.parse::<usize>().ok());
+                    if path == "/media.m3u8" {
+                        let issued = epoch.fetch_add(1, Ordering::Relaxed);
+                        fetches.fetch_add(1, Ordering::Relaxed);
+                        let mut playlist = String::from("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n#EXT-X-ENDLIST\n");
+                        for index in 0..segment_count {
+                            playlist.push_str("#EXTINF:10.0,\n");
+                            playlist.push_str(&format!("/seg{index}.ts?token={issued}\n"));
+                        }
+                        let body = playlist.into_bytes();
+                        let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n", body.len()).as_bytes());
+                        let _ = stream.write_all(&body);
+                        continue;
+                    }
+                    if let Some(index) = path.strip_prefix("/seg").and_then(|rest| rest.strip_suffix(".ts")).and_then(|value| value.parse::<usize>().ok()) {
+                        {
+                            let mut counts = counts.lock().unwrap();
+                            *counts.entry(path.clone()).or_insert(0) += 1;
+                        }
+                        let latest = epoch.load(Ordering::Relaxed).saturating_sub(1);
+                        let valid = !never_valid && token == Some(latest) && latest >= 1;
+                        if valid {
+                            let body = vec![(index % 251) as u8; 8192];
+                            let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n", body.len()).as_bytes());
+                            for chunk in body.chunks(1024) {
+                                if stream.write_all(chunk).is_err() { return; }
+                                if !chunk_delay.is_zero() { thread::sleep(chunk_delay); }
+                            }
+                        } else {
+                            let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n");
+                        }
+                        continue;
+                    }
+                    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    return;
+                });
+            }
+        });
+        (format!("http://{address}"), playlist_fetches, segment_counts, shutdown, handle)
+    }
+
+    #[tokio::test]
+    async fn hls_segment_url_refresh_on_403_recovers() {
+        let segment_count = 4;
+        let (base, playlist_fetches, segment_counts, shutdown, server) =
+            spawn_signed_hls_server(segment_count, false, Duration::ZERO);
+        let directory = std::env::temp_dir().join(format!("thunderload-hls-refresh-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("movie.ts")).await.unwrap();
+        let url = format!("{base}/media.m3u8");
+        let (_control_tx, control_rx) = fresh_control();
+        let outcome = run_resumable(&url, &target, control_rx).await.unwrap();
+        assert_eq!(outcome, DownloadOutcome::Completed);
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        let mut expected = Vec::new();
+        for index in 0..segment_count {
+            expected.extend_from_slice(&vec![(index % 251) as u8; 8192]);
+        }
+        assert_eq!(bytes, expected);
+        // Exactly one refresh: the first playlist's token-0 URLs were all
+        // refused, the second playlist's token-1 URLs served every segment.
+        assert_eq!(playlist_fetches.load(Ordering::Relaxed), 2, "expected exactly one playlist refresh");
+        let counts = segment_counts.lock().unwrap();
+        for index in 0..segment_count {
+            assert_eq!(counts.get(&format!("/seg{index}.ts")), Some(&2),
+                "segment {index} should be fetched twice: once refused, once served");
+        }
+        stop_server(shutdown, server);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hls_refresh_exhaustion_fails_after_two_refreshes() {
+        let segment_count = 4;
+        let (base, playlist_fetches, _segment_counts, shutdown, server) =
+            spawn_signed_hls_server(segment_count, true, Duration::ZERO);
+        let directory = std::env::temp_dir().join(format!("thunderload-hls-refresh-exhaust-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("movie.ts")).await.unwrap();
+        let url = format!("{base}/media.m3u8");
+        let (_control_tx, control_rx) = fresh_control();
+        let result = run_resumable(&url, &target, control_rx).await;
+        assert!(result.is_err(), "a playlist whose URLs never become valid must fail");
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("expired"), "expected the expiry error, got: {message}");
+        // Initial resolve + exactly two refreshes, then give up — never
+        // a loop.
+        assert_eq!(playlist_fetches.load(Ordering::Relaxed), 3, "expected initial resolve + 2 refreshes");
+        // The checkpoint is kept, so a retry resumes instead of restarting.
+        assert!(tokio::fs::try_exists(partial_download_metadata_path(&target)).await.unwrap());
+        stop_server(shutdown, server);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hls_resume_after_rotation_uses_fresh_urls_without_refresh() {
+        // Regression test for the Slice 4 re-audit MINOR: on resume the
+        // saved checkpoint's stale segment URLs were kept and the fresh
+        // URLs from the resume-time resolve discarded, so the first
+        // missing segment 403'd and burned one of the two refreshes.
+        // The fix swaps the fresh URLs into the reused checkpoint state
+        // (done-sets unchanged). Proof: the resume costs exactly one
+        // playlist fetch (its own resolve) and no refresh — 3 fetches
+        // total (initial resolve + first refresh + resume resolve). With
+        // the stale URLs, the resume would 403 and refresh once more: 4.
+        // Segments trickle (8 ms per KiB) so the pause lands
+        // deterministically mid-download instead of racing the last batch.
+        let segment_count = 12;
+        let (base, playlist_fetches, _segment_counts, shutdown, server) =
+            spawn_signed_hls_server(segment_count, false, Duration::from_millis(8));
+        let directory = std::env::temp_dir().join(format!("thunderload-hls-resume-rotate-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("movie.ts")).await.unwrap();
+        let url = format!("{base}/media.m3u8");
+
+        // First call: token-0 URLs 403, one refresh gets token 1, the
+        // download proceeds. Pause after at least one segment completes.
+        let (control_tx, control_rx) = fresh_control();
+        let task_target = target.clone();
+        let task_url = url.clone();
+        let task = tokio::spawn(async move { run_resumable(&task_url, &task_target, control_rx).await });
+        let done_before_pause = wait_for_checkpoint_progress(&target, 1).await;
+        assert!(!done_before_pause.is_empty() && done_before_pause.len() < segment_count,
+            "expected a partial download before the pause, got {} of {}", done_before_pause.len(), segment_count);
+        control_tx.send(DownloadControl::Paused).unwrap();
+        let outcome = task.await.unwrap().unwrap();
+        assert_eq!(outcome, DownloadOutcome::Paused);
+        assert_eq!(playlist_fetches.load(Ordering::Relaxed), 2, "first call: initial resolve + one refresh");
+        drop(control_tx);
+
+        // Resume (fresh process equivalent): its own resolve issues
+        // token 2. The resumed download must use those fresh URLs
+        // directly — no 403, no refresh — and complete with the segments
+        // it already had.
+        let (_control_tx, control_rx) = fresh_control();
+        let outcome = run_resumable(&url, &target, control_rx).await.unwrap();
+        assert_eq!(outcome, DownloadOutcome::Completed);
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        let mut expected = Vec::new();
+        for index in 0..segment_count {
+            expected.extend_from_slice(&vec![(index % 251) as u8; 8192]);
+        }
+        assert_eq!(bytes, expected);
+        assert_eq!(playlist_fetches.load(Ordering::Relaxed), 3,
+            "resume must cost exactly its own resolve — a 4th fetch means it 403'd on stale URLs and refreshed");
+        stop_server(shutdown, server);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hls_pause_is_prompt_during_slow_segment() {
+        // Four 512 KiB segments, each taking ~4 s to trickle in (1 KiB
+        // chunks at 8 ms). With the old bare `join_next()` wait, a pause
+        // sent mid-segment would return only after the first in-flight
+        // segment finished (~4 s). With the select! on control.changed()
+        // it returns in well under two seconds.
+        let (mut routes, _bodies) = segment_routes(4, 512 * 1024);
+        routes.insert("/media.m3u8".into(), media_playlist(4).into_bytes());
+        let (base, _counts, _range_206, shutdown, server) =
+            spawn_hls_server(routes, Duration::from_millis(8), HlsServerOptions::default());
+        let directory = std::env::temp_dir().join(format!("thunderload-hls-prompt-pause-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("movie.ts")).await.unwrap();
+        let url = format!("{base}/media.m3u8");
+        let (control_tx, control_rx) = fresh_control();
+        let task_target = target.clone();
+        let task_url = url.clone();
+        let task = tokio::spawn(async move { run_resumable(&task_url, &task_target, control_rx).await });
+        // The playlist fetch is instant (tiny body); the segments take
+        // seconds, so a short sleep puts the pause squarely mid-segment.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let started = tokio::time::Instant::now();
+        control_tx.send(DownloadControl::Paused).unwrap();
+        let outcome = task.await.unwrap().unwrap();
+        assert_eq!(outcome, DownloadOutcome::Paused);
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_secs(2),
+            "pause took {elapsed:?} — it must return promptly during a slow segment, not after it finishes");
+        stop_server(shutdown, server);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hls_parallel_fetch_uses_eight_concurrent_segments() {
+        // 24 segments of 128 KiB, each taking ~1 s to trickle in (1 KiB
+        // chunks at 8 ms). The engine must fill all of its connections —
+        // 8, DEFAULT_RESUMABLE_CONNECTIONS — and no more: the peak
+        // in-flight count on the server is exactly 8. The segments are
+        // deliberately slow (~1 s each) so the overlap window dwarfs any
+        // scheduling jitter on a loaded machine: with 32 KiB segments the
+        // peak sometimes read 7 under full-suite parallel load.
+        let segment_count = 24;
+        let (mut routes, bodies) = segment_routes(segment_count, 128 * 1024);
+        routes.insert("/media.m3u8".into(), media_playlist(segment_count).into_bytes());
+        let tracker = Arc::new(InFlightTracker { current: AtomicUsize::new(0), max: AtomicUsize::new(0), paths: Mutex::new(std::collections::HashSet::new()), peak_paths: Mutex::new(Vec::new()) });
+        let barrier = Arc::new(ConcurrencyBarrier { target: 8, arrived: AtomicUsize::new(0) });
+        let options = HlsServerOptions {
+            in_flight: Some(tracker.clone()),
+            barrier: Some(barrier),
+            ..Default::default()
+        };
+        let (base, counts, _range_206, shutdown, server) =
+            spawn_hls_server(routes, Duration::from_millis(8), options);
+        let directory = std::env::temp_dir().join(format!("thunderload-hls-concurrency-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("movie.ts")).await.unwrap();
+        let url = format!("{base}/media.m3u8");
+        let (_control_tx, control_rx) = fresh_control();
+        let outcome = run_resumable(&url, &target, control_rx).await.unwrap();
+        assert_eq!(outcome, DownloadOutcome::Completed);
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(bytes, bodies.concat());
+        // The peak is counted in SEGMENT requests, not total requests:
+        // the server sleeps `chunk_delay` after writing even the last
+        // chunk of a response, so the playlist handler's guard can still
+        // be held when the first segment batch arrives (total peak 9).
+        // That overlap is a fixture artifact, not a ninth connection —
+        // the engine opens exactly 8 segment fetches, which the barrier
+        // proves by holding all 8 in flight at once.
+        assert!(tracker.max() >= 8, "total peak should be at least the 8 segment fetches");
+        let peak_segments = tracker.peak_paths().iter()
+            .filter(|path| path.starts_with("/seg") && path.ends_with(".ts"))
+            .count();
+        assert_eq!(peak_segments, 8, "expected the engine to fill exactly 8 concurrent segment fetches; in flight at the peak: {:?}", tracker.peak_paths());
+        let counts = counts.lock().unwrap();
+        for index in 0..segment_count {
+            assert_eq!(counts.get(&format!("/seg{index}.ts")), Some(&1));
+        }
         stop_server(shutdown, server);
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }

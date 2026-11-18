@@ -58,7 +58,7 @@ use std::time::{Duration, Instant};
 use thunderload_engine::{
     download_dash_resumable, download_hls_resumable, download_url,
     download_url_resumable_with_connections, partial_download_metadata_path,
-    DownloadControl, DownloadOutcome, GlobalRateLimiter,
+    DownloadControl, DownloadOutcome, GlobalRateLimiter, HlsSelection,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -535,6 +535,7 @@ async fn bench_hls(runs: usize) -> anyhow::Result<BenchResult> {
         let start = Instant::now();
         let outcome = download_hls_resumable(
             &url,
+            &HlsSelection::none(),
             &target,
             None,
             control_rx,

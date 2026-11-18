@@ -1900,7 +1900,13 @@ pub async fn download_url_resumable(
 /// Connections used by `download_url_resumable` when the caller does not
 /// choose: 8 matches the segmented fast path's usual setting and keeps the
 /// segment count small enough that per-segment checkpoint writes stay cheap.
-const DEFAULT_RESUMABLE_CONNECTIONS: usize = 8;
+///
+/// This is the engine's ONE connections value: the HLS and DASH segment
+/// fetchers use it too (Slice 4), so direct files and media segments all
+/// run at the same concurrency. The desktop Settings UI still labels the
+/// setting "one stream" while the engine uses 8 — that UI lie is Slice
+/// 7b's to fix, not this constant's; do not add a second setting here.
+pub(crate) const DEFAULT_RESUMABLE_CONNECTIONS: usize = 8;
 
 /// Minimum object size for the segmented checkpointed path, mirroring the
 /// fast path's threshold in `download_url`: segmenting a small object buys

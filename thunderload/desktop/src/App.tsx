@@ -570,7 +570,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           // reuses its on-disk checkpoint instead of reserving a fresh
           // target and restarting from scratch. The returned path is
           // stored so Cancel works while the job is running.
-          const targetPath = await invoke<string>("start_hls_download", { jobId: item.id, url: item.url, filename: item.name, targetPath: item.targetPath || null, scheduledAt: null });
+          const targetPath = await invoke<string>("start_hls_download", { jobId: item.id, url: item.url, representationId: item.representationId || null, audioRepresentationId: item.audioRepresentationId || null, filename: item.name, targetPath: item.targetPath || null, scheduledAt: null });
           setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, targetPath } : entry));
         } else if (item.kind === "dash") {
           // Pass the paused/failed job's target back so the backend
@@ -1148,7 +1148,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           {variants.length > 0 && <div className="variants"><div className="variants-heading"><h3>Available streams</h3><span>{variants.length} OPTIONS</span></div>
             {variants.map((variant, index) => <div className="variant" key={variant.url + index}>
               <div><strong>{variant.quality}</strong><small>{variant.kind.toUpperCase()}{variant.width && variant.height ? " · " + variant.width + " × " + variant.height : ""}{variant.bandwidth ? " · " + Math.round(variant.bandwidth / 1000) + " kbps" : ""}</small>{variant.note && <p>{variant.note}</p>}</div>
-              <button className="secondary-button" disabled={!variant.downloadable} onClick={() => add(variant.kind === "dash" ? videoUrl : variant.url, variant.kind === "ytdlp" ? (videoTitle ? videoTitle + ".mp4" : "video.mp4") : "video.mp4", variant.kind === "hls" ? "hls" : variant.kind === "dash" ? "dash" : variant.kind === "ytdlp" ? "ytdlp" : "direct", variant.representationId, variant.audioRepresentationId)}>{variant.downloadable ? "Download" : "Unavailable"}</button>
+              <button className="secondary-button" disabled={!variant.downloadable} onClick={() => add(variant.kind === "dash" || variant.kind === "hls" ? videoUrl : variant.url, variant.kind === "ytdlp" ? (videoTitle ? videoTitle + ".mp4" : "video.mp4") : "video.mp4", variant.kind === "hls" ? "hls" : variant.kind === "dash" ? "dash" : variant.kind === "ytdlp" ? "ytdlp" : "direct", variant.kind === "hls" ? variant.url : variant.representationId, variant.audioRepresentationId)}>{variant.downloadable ? "Download" : "Unavailable"}</button>
             </div>)}
           </div>}
           <div className="rule" />
