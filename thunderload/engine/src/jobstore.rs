@@ -530,14 +530,17 @@ impl JobStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(imported),
             Err(error) => return Err(error),
         };
-        // Collect first: meta files (real checkpoints) before bare
-        // partial files, so a `.part` whose meta exists is never
-        // imported twice.
+        // Only real checkpoints are imported: a checkpoint sidecar
+        // carries the URL (and session) a resume needs. A bare
+        // `.thunderload.part` file has no sidecar and therefore no URL
+        // anywhere — importing it as an Interrupted job offered a Resume
+        // button that could only fail with a confusing request error
+        // (Slice 7a, Gemini 15d). The partial file itself is left on
+        // disk untouched; it is simply not a resumable job.
         let mut metas: Vec<(PathBuf, String)> = Vec::new();
-        let mut partials: Vec<(PathBuf, String)> = Vec::new();
         for entry in entries.flatten() {
-            // Only regular files are checkpoints/partials; a directory
-            // that happens to share the suffix is never a job.
+            // Only regular files are checkpoints; a directory that
+            // happens to share the suffix is never a job.
             if !entry.file_type().map(|kind| kind.is_file()).unwrap_or(false) {
                 continue;
             }
@@ -545,10 +548,6 @@ impl JobStore {
             if let Some(target) = name.strip_suffix(".thunderload.part.meta.json") {
                 if !target.is_empty() {
                     metas.push((entry.path(), target.to_string()));
-                }
-            } else if let Some(target) = name.strip_suffix(".thunderload.part") {
-                if !target.is_empty() {
-                    partials.push((entry.path(), target.to_string()));
                 }
             }
         }
@@ -560,46 +559,11 @@ impl JobStore {
             let Some(record) = self.orphan_from_meta(&meta_path, &target) else {
                 continue;
             };
-            self.jobs.push(record.clone());
-            imported.push(record);
-        }
-        for (part_path, target_name) in partials {
-            let target = download_dir.join(&target_name);
-            if self.has_target(&target) {
+            // A checkpoint that deserializes with an empty URL is the
+            // same defect as a bare partial: nothing to resume from.
+            if record.url.is_empty() {
                 continue;
             }
-            let downloaded = fs::metadata(&part_path).map(|meta| meta.len()).unwrap_or(0);
-            let now = now_ms();
-            let created = fs::metadata(&part_path)
-                .and_then(|meta| meta.modified())
-                .ok()
-                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                .map(|duration| duration.as_millis() as u64)
-                .unwrap_or(now);
-            let record = JobRecord {
-                id: uuid::Uuid::new_v4().to_string(),
-                name: JobRecord::name_for_target(&target),
-                url: String::new(),
-                kind: JobKind::Direct,
-                live: false,
-                origin: JobOrigin::Desktop,
-                state: JobState::Interrupted,
-                downloaded,
-                total: None,
-                percent: None,
-                segments_done: None,
-                segments_total: None,
-                target_path: Some(target.to_string_lossy().to_string()),
-                checkpoint_path: None,
-                representation_id: None,
-                audio_representation_id: None,
-                scheduled_at_ms: None,
-                session: None,
-                detail: "Found a partial file without a checkpoint · resume restarts the download".to_string(),
-                error: None,
-                created_at_ms: created,
-                updated_at_ms: now,
-            };
             self.jobs.push(record.clone());
             imported.push(record);
         }
@@ -1202,20 +1166,41 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// A bare `.part` file has no checkpoint and therefore no URL
+    /// anywhere, so it can never be resumed: it is not imported as a
+    /// job (Slice 7a, Gemini 15d). The file itself is left on disk
+    /// untouched. Before the fix this imported an Interrupted row with
+    /// an empty URL whose Resume button could only fail.
     #[test]
-    fn import_partial_without_checkpoint_is_still_listed() {
+    fn import_skips_partial_without_checkpoint() {
         let dir = test_dir("import-partial-only");
         let downloads = dir.join("downloads");
         fs::create_dir_all(&downloads).unwrap();
         fs::write(downloads.join("lonely.bin.thunderload.part"), vec![0u8; 77]).unwrap();
         let (mut store, _) = store_in(&dir);
-        let imported = store.import_orphans(&downloads).unwrap();
-        assert_eq!(imported.len(), 1);
-        assert_eq!(imported[0].kind, JobKind::Direct);
-        assert_eq!(imported[0].state, JobState::Interrupted);
-        assert_eq!(imported[0].downloaded, 77);
-        assert_eq!(imported[0].checkpoint_path, None);
-        assert!(imported[0].detail.contains("without a checkpoint"));
+        assert!(store.import_orphans(&downloads).unwrap().is_empty());
+        assert!(store.all().is_empty());
+        // The partial file is never deleted by import.
+        assert!(downloads.join("lonely.bin.thunderload.part").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A checkpoint sidecar that deserializes with an empty URL is the
+    /// same defect as a bare partial: nothing to resume from.
+    #[test]
+    fn import_skips_checkpoint_with_empty_url() {
+        let dir = test_dir("import-empty-url");
+        let downloads = dir.join("downloads");
+        fs::create_dir_all(&downloads).unwrap();
+        fs::write(
+            downloads.join("empty.bin.thunderload.part.meta.json"),
+            r#"{"url":"","total":10}"#,
+        )
+        .unwrap();
+        fs::write(downloads.join("empty.bin.thunderload.part"), vec![0u8; 10]).unwrap();
+        let (mut store, _) = store_in(&dir);
+        assert!(store.import_orphans(&downloads).unwrap().is_empty());
+        assert!(store.all().is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 

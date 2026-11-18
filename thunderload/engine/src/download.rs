@@ -570,6 +570,12 @@ impl GlobalRateLimiter {
 
     /// Reserves bytes in the aggregate transfer timeline and returns the delay
     /// required before writing/consuming them without exceeding the global cap.
+    ///
+    /// Idle time cannot bank burst allowance (Slice 7a, Gemini 15a): bytes
+    /// already reserved are "spent" by `epoch + reserved/limit`, so when
+    /// that instant is in the past — the downloader was idle — the epoch
+    /// is clamped forward to end now. Without the clamp, 60 s idle at a
+    /// 1 MB/s limit left ~50 MB unthrottled on the next reserve.
     pub async fn reserve(&self, bytes: u64) -> std::time::Duration {
         let limit = self.limit.load(Ordering::Relaxed);
         let mut state = self.state.lock().await;
@@ -579,6 +585,11 @@ impl GlobalRateLimiter {
             state.reserved = 0;
         }
         if limit == 0 || bytes == 0 { return std::time::Duration::ZERO; }
+        let now = Instant::now();
+        let spent_until = state.epoch + std::time::Duration::from_secs_f64(state.reserved as f64 / limit as f64);
+        if spent_until < now {
+            state.epoch = now - std::time::Duration::from_secs_f64(state.reserved as f64 / limit as f64);
+        }
         state.reserved = state.reserved.saturating_add(bytes);
         let target = state.epoch + std::time::Duration::from_secs_f64(state.reserved as f64 / limit as f64);
         target.saturating_duration_since(Instant::now())
@@ -3161,6 +3172,24 @@ mod rate_limit_tests {
         assert!(second > first);
         limiter.set_limit(0);
         assert_eq!(limiter.reserve(1_000_000).await, std::time::Duration::ZERO);
+    }
+
+    /// Idle time must not bank burst allowance (Slice 7a, Gemini 15a):
+    /// after 2 s idle at a 1 MB/s limit, reserving 1 MB must still cost
+    /// ~1 s, not ~0 s. Before the fix the 2 s of idle banked 2 MB, so
+    /// this reserve returned zero delay.
+    #[tokio::test]
+    async fn global_limiter_idle_time_cannot_bank_burst() {
+        let limiter = GlobalRateLimiter::new();
+        limiter.set_limit(1_000_000);
+        // One byte starts the timeline; its own delay is ~0 either way.
+        let _ = limiter.reserve(1).await;
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let wait = limiter.reserve(1_000_000).await;
+        assert!(
+            wait.as_millis() >= 700,
+            "1 MB at a 1 MB/s limit after 2 s idle must cost ~1 s, got {wait:?}"
+        );
     }
 }
 
