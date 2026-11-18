@@ -12,12 +12,15 @@ type SubtitleVariant = { language: string; name?: string; url: string; format: s
 type Variant = { kind: string; quality: string; width?: number; height?: number; bandwidth?: number; url: string; downloadable: boolean; note?: string; representationId?: string; audioRepresentationId?: string; audioOnly?: boolean; isLive?: boolean; fps?: number; subtitles?: SubtitleVariant[] };
 type GrabItem = { url: string; kind: string; name: string };
 type GrabResult = { items: GrabItem[]; truncated: boolean };
-type Progress = { downloaded: number; total?: number; percent?: number; phase: string };
+type Progress = { downloaded: number; total?: number; percent?: number; phase: string; segments_done?: number; segments_total?: number };
 type Item = { id: string; name: string; url: string; kind: Kind; status: Status; percent: number; downloaded: number; total?: number; detail: string; error?: string; createdAt: number; targetPath?: string; scheduledAt?: number; source?: "native"; representationId?: string; audioRepresentationId?: string; segmentsDone?: number; segmentsTotal?: number; live?: boolean };
 type StoredJob = { id: string; name: string; url: string; kind: string; origin: string; state: string; downloaded: number; total?: number; percent?: number; segmentsDone?: number; segmentsTotal?: number; targetPath?: string; checkpointPath?: string; representationId?: string; audioRepresentationId?: string; scheduledAtMs?: number; detail: string; error?: string; createdAtMs: number; updatedAtMs: number; live?: boolean };
 
 const HISTORY_KEY = "thunderload.history.v2";
-const CONNECTIONS_KEY = "thunderload.connections.v1";
+// Slice 7b (Gemini claim 7): v2 key — the v1 control was disabled and
+// never a user choice, and v1 stored 1, which was never the engine's
+// real value. v2 starts fresh at the engine default, 8.
+const CONNECTIONS_KEY = "thunderload.connections.v2";
 const PARALLEL_KEY = "thunderload.parallel.v1";
 const SPEED_LIMIT_KEY = "thunderload.speed-limit.v1";
 const NATIVE_IDS_KEY = "thunderload.native-extension-ids.v1";
@@ -71,6 +74,22 @@ function bytes(value: number): string {
   const units = ["B", "KB", "MB", "GB", "TB"];
   const unit = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1);
   return (value / Math.pow(1024, unit)).toFixed(unit ? 1 : 0) + " " + units[unit];
+}
+
+// Slice 7b (Gemini claim 14): one speed sample per job — the rate comes
+// from the bytes moved since the previous sample, never from a single
+// absolute value (the Motrix rule). `rate: null` means only one sample
+// exists so far and the rate is still unknown.
+type SpeedSample = { downloaded: number; at: number; rate: number | null };
+function recordSpeedSample(samples: Map<string, SpeedSample>, jobId: string, downloaded: number, now: number): void {
+  const prev = samples.get(jobId);
+  if (prev) {
+    const dt = (now - prev.at) / 1000;
+    const rate = dt > 0 ? Math.max(0, (downloaded - prev.downloaded) / dt) : prev.rate;
+    samples.set(jobId, { downloaded, at: now, rate });
+  } else {
+    samples.set(jobId, { downloaded, at: now, rate: null });
+  }
 }
 function readItems(): Item[] {
   try {
@@ -249,7 +268,7 @@ export default function App() {
   const [grabTruncated, setGrabTruncated] = useState(false);
   const [grabbing, setGrabbing] = useState(false);
   const [grabNotice, setGrabNotice] = useState("");
-  const [connections, setConnections] = useState(() => readSetting(CONNECTIONS_KEY, 1, [1]));
+  const [connections, setConnections] = useState(() => readSetting(CONNECTIONS_KEY, 8, [1, 2, 4, 8]));
   const [parallel, setParallel] = useState(() => readSetting(PARALLEL_KEY, 2, [1, 2, 3, 4]));
   const [speedLimit, setSpeedLimit] = useState(() => readSetting(SPEED_LIMIT_KEY, 0, [0, 262144, 524288, 1048576, 2097152, 5242880, 10485760]));
   const [clock, setClock] = useState(Date.now());
@@ -304,7 +323,7 @@ export default function App() {
   // "0 B/s"; a stale or missing sample shows muted "–"; anything that
   // is not actively downloading shows a blank cell. `rate: null` means
   // only one sample exists so far — the rate is still unknown.
-  const speedSamples = useRef(new Map<string, { downloaded: number; at: number; rate: number | null }>());
+  const speedSamples = useRef(new Map<string, SpeedSample>());
 
   // Live transfer rate for one job: a number when a fresh rate is
   // known, null when the rate is unknown, undefined when the cell does
@@ -523,6 +542,7 @@ export default function App() {
           percent?: number; downloaded?: number; total?: number | null; detail?: string;
           error?: string; createdAt?: number; targetPath?: string;
           representationId?: string; audioRepresentationId?: string;
+          segmentsDone?: number; segmentsTotal?: number;
           live?: boolean;
         }>>("get_native_downloads");
         if (disposed) return;
@@ -542,11 +562,25 @@ export default function App() {
           representationId: job.representationId,
           audioRepresentationId: job.audioRepresentationId,
           source: "native",
+          segmentsDone: job.segmentsDone,
+          segmentsTotal: job.segmentsTotal,
           // Slice 6 fix (MAJOR): carry the companion's live flag, or
           // a browser-started live recording shows Resume/Cancel
           // buttons that destroy it.
           live: job.live ? true : undefined
         }));
+        // Slice 7b (Gemini claim 14): native jobs are polled, never
+        // pushed, so the poll is where their speed samples come from —
+        // the same helper the local download-progress listener uses.
+        // Samples for jobs that stopped downloading (or vanished) are
+        // dropped, so a finished job never shows a stale rate.
+        const now = Date.now();
+        for (const item of external) {
+          if (item.status === "Downloading") recordSpeedSample(speedSamples.current, item.id, item.downloaded, now);
+        }
+        for (const id of Array.from(speedSamples.current.keys())) {
+          if (id.startsWith("native-") && !external.some((item) => item.id === id && item.status === "Downloading")) speedSamples.current.delete(id);
+        }
         setItems((current) => {
           const merged = new Map(current.filter((item) => item.source !== "native").map((item) => [item.id, item]));
           for (const item of external) merged.set(item.id, item);
@@ -581,23 +615,18 @@ export default function App() {
           setYtdlpToolProgress({ tool: payload.tool, percent: payload.percent });
         }),
         listen<{ jobId: string; progress: Progress }>("download-progress", ({ payload }) => {
-          // Record a speed sample for the Motrix rule: the rate comes
-          // from the bytes moved since the previous event, never from
-          // a single absolute value.
-          const now = Date.now();
-          const prev = speedSamples.current.get(payload.jobId);
-          if (prev) {
-            const dt = (now - prev.at) / 1000;
-            const rate = dt > 0 ? Math.max(0, (payload.progress.downloaded - prev.downloaded) / dt) : prev.rate;
-            speedSamples.current.set(payload.jobId, { downloaded: payload.progress.downloaded, at: now, rate });
-          } else {
-            speedSamples.current.set(payload.jobId, { downloaded: payload.progress.downloaded, at: now, rate: null });
-          }
+          // Slice 7b: the shared sampler — the native poll feeds the
+          // same helper, so local and native jobs measure speed the
+          // same way. Segment counts ride the same event and are kept
+          // when the transfer reports them.
+          recordSpeedSample(speedSamples.current, payload.jobId, payload.progress.downloaded, Date.now());
           setItems((current) => current.map((item) => item.id !== payload.jobId ? item : {
             ...item,
             downloaded: payload.progress.downloaded,
             total: payload.progress.total,
             percent: Math.max(0, Math.min(100, payload.progress.percent ?? item.percent)),
+            segmentsDone: payload.progress.segments_done ?? item.segmentsDone,
+            segmentsTotal: payload.progress.segments_total ?? item.segmentsTotal,
             detail: item.kind === "hls"
               ? "Downloading media segments · " + Math.round(payload.progress.percent ?? 0) + "%"
               : bytes(payload.progress.downloaded) + (payload.progress.total ? " of " + bytes(payload.progress.total) : " downloaded")
@@ -694,7 +723,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           // — Cancel is never offered for live).
           const targetPath = item.live
             ? await invoke<string>("start_hls_live_download", { jobId: item.id, url: item.url, representationId: item.representationId || null, audioRepresentationId: item.audioRepresentationId || null, filename: item.name, targetPath: item.targetPath || null, scheduledAt: null })
-            : await invoke<string>("start_hls_download", { jobId: item.id, url: item.url, representationId: item.representationId || null, audioRepresentationId: item.audioRepresentationId || null, filename: item.name, targetPath: item.targetPath || null, scheduledAt: null });
+            : await invoke<string>("start_hls_download", { jobId: item.id, url: item.url, representationId: item.representationId || null, audioRepresentationId: item.audioRepresentationId || null, filename: item.name, targetPath: item.targetPath || null, connections, scheduledAt: null });
           setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, targetPath } : entry));
         } else if (item.kind === "dash") {
           // Pass the paused/failed job's target back so the backend
@@ -704,7 +733,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           const targetPath = await invoke<string>("start_dash_download", {
             jobId: item.id, url: item.url, representationId: item.representationId,
             audioRepresentationId: item.audioRepresentationId || null, filename: item.name,
-            targetPath: item.targetPath || null, scheduledAt: null
+            targetPath: item.targetPath || null, connections, scheduledAt: null
           });
           setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, targetPath } : entry));
         } else {
@@ -721,9 +750,12 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     });
   }, [items, active, parallel, connections, clock]);
 
-  async function add(value: string, saveAs?: string, requestedKind?: Kind, representationId?: string, audioRepresentationId?: string, live?: boolean) {
+  // Returns true when a job was queued, false when nothing was queued
+  // (invalid URL, past schedule, yt-dlp page routed to the grabber,
+  // webpage verdict) — downloadGrabbed counts on this.
+  async function add(value: string, saveAs?: string, requestedKind?: Kind, representationId?: string, audioRepresentationId?: string, live?: boolean): Promise<boolean> {
     const clean = value.trim();
-    if (!/^https?:\/\//i.test(clean)) { setNotice("Enter a valid HTTP or HTTPS URL."); return; }
+    if (!/^https?:\/\//i.test(clean)) { setNotice("Enter a valid HTTP or HTTPS URL."); return false; }
     let kind: Kind = requestedKind || "direct";
     try {
       if (!requestedKind) {
@@ -731,11 +763,11 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
         if (pathname.endsWith(".m3u8")) kind = "hls";
         else if (pathname.endsWith(".mpd")) kind = "dash";
       }
-    } catch { setNotice("That URL is not valid."); return; }
+    } catch { setNotice("That URL is not valid."); return false; }
     const scheduledAt = scheduleAt ? new Date(scheduleAt).getTime() : undefined;
     if (scheduledAt !== undefined && (!Number.isFinite(scheduledAt) || scheduledAt <= Date.now())) {
       setNotice("Choose a future start time, or clear the schedule field.");
-      return;
+      return false;
     }
     // Paste path only (no requestedKind): a YouTube/social page routes
     // to the yt-dlp inspect flow — the grabber opens and the formats are
@@ -755,7 +787,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
         setAddOpen(false);
         setGrabberOpen(true);
         void inspectYtDlp(clean);
-        return;
+        return false;
       }
       setNotice("Checking link…");
       try {
@@ -766,7 +798,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       } catch (error) {
         if (String(error).includes("is a webpage")) {
           setNotice(YOUTUBE_PAGE_MESSAGE);
-          return;
+          return false;
         }
       }
     }
@@ -784,9 +816,13 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       createdAt: Date.now(),
       scheduledAt
     };
-    const updated = [item, ...items];
-    try { localStorage.setItem(HISTORY_KEY, JSON.stringify(updated)); } catch { /* Queue effect retries persistence. */ }
-    setItems(updated);
+    // Slice 7b (Gemini claim 2): a functional update — the render
+    // closure's `items` goes stale when several adds land before a
+    // re-render (the grabber's Download selected fires one add per
+    // item without awaiting), so [item, ...items] kept only the last
+    // item while the notice counted every call. Persistence rides on
+    // the items effect, which writes the real list on every change.
+    setItems((current) => [item, ...current]);
     // Slice 5: record the queued job in the durable store immediately,
     // so it survives a restart even if it never gets a download slot
     // before the app closes.
@@ -798,6 +834,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
         .catch((error) => setNotice("Queued locally, but a scheduled wake task could not be registered: " + String(error)));
     }
     setUrl(""); setFilename(""); setScheduleAt("");
+    return true;
   }
   async function pause(item: Item) {
     try {
@@ -1110,24 +1147,28 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           variants.sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bandwidth || 0) - (a.bandwidth || 0));
           const best = variants[0];
           if (!best) { failed += 1; continue; }
-          add(item.url, item.name, "dash", best.representationId, best.audioRepresentationId);
+          // Slice 7b (Gemini claim 2): await the add and count what
+          // actually queued — the old fire-and-forget call counted
+          // every item while only the last survived the stale closure.
+          if (await add(item.url, item.name, "dash", best.representationId, best.audioRepresentationId)) queued += 1; else failed += 1;
         } else if (item.kind === "hls") {
           // Inspect first, like DASH: a live playlist must queue
           // through the live recorder, not the VOD path (which
           // rejects it). If the inspect fails, queue it exactly as
           // before — the start call surfaces the real error then.
+          let ok: boolean;
           try {
             const result = await invoke<Variant[]>("inspect_video_url", { url: item.url, referer: grabUrl.trim() });
             const variants = result.filter((variant) => variant.downloadable && variant.url);
             variants.sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bandwidth || 0) - (a.bandwidth || 0));
             const best = variants[0];
-            if (best?.isLive) add(item.url, item.name, "hls", best.url, best.audioRepresentationId, true);
-            else add(item.url, item.name, "hls");
-          } catch { add(item.url, item.name, "hls"); }
+            if (best?.isLive) ok = await add(item.url, item.name, "hls", best.url, best.audioRepresentationId, true);
+            else ok = await add(item.url, item.name, "hls");
+          } catch { ok = await add(item.url, item.name, "hls"); }
+          if (ok) queued += 1; else failed += 1;
         } else {
-          add(item.url, item.name, "direct");
+          if (await add(item.url, item.name, "direct")) queued += 1; else failed += 1;
         }
-        queued += 1;
       } catch { failed += 1; }
     }
     setGrabNotice(failed
@@ -1294,7 +1335,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           <div><dt>Segments</dt><dd>{item.segmentsDone !== undefined && item.segmentsTotal !== undefined ? item.segmentsDone + " of " + item.segmentsTotal + " done" : "This transfer does not report per-segment progress."}</dd></div>
           <div><dt>Downloaded</dt><dd>{bytes(item.downloaded)}{item.total ? " of " + bytes(item.total) : ""}</dd></div>
         </dl>
-        <p className="footnote">Checkpoint-safe downloads currently use one stream. Multi-connection resume is still being developed.</p>
+        <p className="footnote">Connections come from Settings → Connections per file. Segment counts show while a segmented transfer runs; a transfer that does not report segments says so above.</p>
       </div>}
       {inspectorTab === "activity" && <div className="inspector-body">
         <ul className="activity-list">
@@ -1480,7 +1521,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
 
         {page === "settings" && <section className="panel settings-panel">
           <div className="settings-section"><div><h2>Transfer behaviour</h2><p>Saved locally. Applies to new downloads.</p></div>
-            <label className="setting-row"><span><strong>Connections per file</strong><small>Checkpoint-safe downloads currently use one stream. Multi-connection resume is still being developed.</small></span><select className="select-field" value={connections} disabled><option value={1}>1 connection</option></select></label>
+            <label className="setting-row"><span><strong>Connections per file</strong><small>Parallel connections per file, for direct, HLS and DASH downloads. Applies to new downloads; a resumed direct download keeps the connections it started with; HLS/DASH resumes use the current setting.</small></span><select className="select-field" value={connections} onChange={(event) => setConnections(Number(event.target.value))}>{[1, 2, 4, 8].map((n) => <option key={n} value={n}>{n} {n === 1 ? "connection" : "connections"}</option>)}</select></label>
             <label className="setting-row"><span><strong>Simultaneous downloads</strong><small>Maximum number of active queue items.</small></span><select className="select-field" value={parallel} onChange={(event) => setParallel(Number(event.target.value))}>{[1, 2, 3, 4].map((n) => <option key={n} value={n}>{n} {n === 1 ? "download" : "downloads"}</option>)}</select></label>
             <label className="setting-row"><span><strong>Speed limit</strong><small>Applies to active direct, HLS and DASH transfers in each ThunderLoad process. Browser companion and desktop share this saved setting; each process enforces its own aggregate cap. Zero means unlimited.</small></span><select className="select-field" value={speedLimit} onChange={(event) => setSpeedLimit(Number(event.target.value))}>
               <option value={0}>Unlimited</option><option value={262144}>256 KB/s</option><option value={524288}>512 KB/s</option><option value={1048576}>1 MB/s</option><option value={2097152}>2 MB/s</option><option value={5242880}>5 MB/s</option><option value={10485760}>10 MB/s</option>
@@ -1571,7 +1612,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
             <p className="footnote">Tools folder: {ytdlpTools ? ytdlpTools.toolsDir : "…"}</p>
           </div>
           <div className="rule" />
-          <div className="settings-section"><div><h2>About</h2><p>Local desktop transfer engine · Version 0.3.4</p></div><div className="about-line"><span>Supported media</span><strong>Direct files · HLS VOD · Live HLS recording · Static DASH VOD · YouTube &amp; social (yt-dlp)</strong></div><div className="about-line"><span>Direct downloads</span><strong>Pause · Resume · Cancel · Speed limit · Schedule</strong></div><div className="about-line"><span>Still in development</span><strong>Multi-connection resume · Live DASH</strong></div></div>
+          <div className="settings-section"><div><h2>About</h2><p>Local desktop transfer engine · Version 0.3.4</p></div><div className="about-line"><span>Supported media</span><strong>Direct files · HLS VOD · Live HLS recording · Static DASH VOD · YouTube &amp; social (yt-dlp)</strong></div><div className="about-line"><span>Direct downloads</span><strong>Pause · Resume · Cancel · Speed limit · Schedule</strong></div><div className="about-line"><span>Still in development</span><strong>Live DASH</strong></div></div>
         </section>}
 
       </div>
