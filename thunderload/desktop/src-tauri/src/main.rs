@@ -722,7 +722,7 @@ async fn start_download(
                 let _ = progress_app.emit("download-progress", json!({ "jobId": progress_id, "progress": progress }));
             }
         });
-        let result = download_url_resumable_with_connections(&url, &task_target, session.as_ref(), control_rx, limit, progress_tx, connections).await;
+        let result = download_url_resumable_with_connections(&url, &task_target, session.as_ref(), connections, control_rx, limit, progress_tx).await;
         let cancelled_while_finishing = *transition_rx.borrow() == DownloadControl::Cancelled;
         finish_desktop_download(&app_for_task, &job_for_task, &task_target, result.map_err(|error| error_text(&error)), cancelled_while_finishing).await;
     });
