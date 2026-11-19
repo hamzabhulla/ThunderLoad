@@ -1444,15 +1444,23 @@ mod config_dir_tests {
     /// native items for one cycle; rename-over replaces atomically.
     #[test]
     fn native_job_state_save_never_leaves_a_missing_file_window() {
-        use super::save_native_job_state;
+        use super::{default_download_dir, save_native_job_state};
         use serde_json::json;
         let home = std::env::temp_dir().join(format!("thunderload-host-atomic-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&home).unwrap();
         let original_home = std::env::var_os("HOME");
+        let original_userprofile = std::env::var_os("USERPROFILE");
         std::env::set_var("HOME", &home);
-        let destination = home
-            .join("Downloads")
-            .join("ThunderLoad")
+        // Windows resolves the download dir from USERPROFILE, not
+        // HOME (engine default_download_dir) — set both so the saves
+        // land under the temp dir on every OS. Without this the 501
+        // saves succeed under the real profile's Downloads while the
+        // test reads a temp-HOME path that was never created.
+        std::env::set_var("USERPROFILE", &home);
+        // Derive the destination from the same function the saves
+        // use, so the test can never read a different path than the
+        // production code writes.
+        let destination = default_download_dir()
             .join(".native-jobs")
             .join("atomic-test.json");
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1504,6 +1512,10 @@ mod config_dir_tests {
         match original_home {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
+        }
+        match original_userprofile {
+            Some(value) => std::env::set_var("USERPROFILE", value),
+            None => std::env::remove_var("USERPROFILE"),
         }
         let _ = std::fs::remove_dir_all(&home);
     }
