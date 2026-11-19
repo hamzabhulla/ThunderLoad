@@ -35,6 +35,7 @@ button{cursor:pointer}.secondary{min-height:30px;padding:0 10px;border:1px solid
    downloads intercepted while the desktop app was down. */
 .quality-sub-head{color:#aebdce;font-size:11px;font-weight:600}
 .intercept-note{padding:8px;color:#aebdce;font-size:10px;line-height:1.5}
+.truncated-note{padding:8px;color:#aebdce;font-size:10px;line-height:1.5}
 .ytdlp-note{padding:8px;color:#aebdce;font-size:10px;line-height:1.5}
 .ytdlp-consent{display:grid;gap:8px}
 .secondary-btn{min-height:30px;padding:0 12px;border:1px solid #16a34a;border-radius:6px;background:transparent;color:#4ade80;font-size:11px;font-weight:600}.secondary-btn:hover{background:rgba(22,163,74,.15)}.secondary-btn:disabled{opacity:.5;cursor:wait}

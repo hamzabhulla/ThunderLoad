@@ -183,6 +183,22 @@ function safeFilenameFromUrl(url, fallback = "download.bin") {
   } catch (_) { return fallback; }
 }
 
+// Slice 7c (Gemini claim 9): only a KNOWN media/subtitle extension is
+// replaced — the old `name.replace(/\.[^.]+$/, "")` stripped whatever
+// followed the last dot, so "my.video" became "my.mp4". A name with no
+// extension, or one ending in something that is not a media extension,
+// keeps its full name and gains the extension ("my.video.mp4").
+// Mirrored in popup.js (same helper, same cases).
+const KNOWN_FILE_EXTENSIONS = new Set(["mp4", "mkv", "webm", "mov", "avi", "m4v", "ts", "m2ts", "mp3", "m4a", "aac", "opus", "flac", "wav", "ogg", "oga", "wmv", "flv", "3gp", "m3u8", "mpd", "vtt", "srt", "ass", "ssa"]);
+function withExtension(name, extension) {
+  const trimmed = name.replace(/\.+$/, "");
+  const dot = trimmed.lastIndexOf(".");
+  if (dot > 0 && KNOWN_FILE_EXTENSIONS.has(trimmed.slice(dot + 1).toLowerCase())) {
+    return trimmed.slice(0, dot) + "." + extension;
+  }
+  return trimmed + "." + extension;
+}
+
 async function quickDownloadMedia({ url, kind, pageUrl, filename, selectedVariant }) {
   const name = filename || safeFilenameFromUrl(url, kind === "HLS playlist" ? "video.mp4" : "download.bin");
 
@@ -218,7 +234,7 @@ async function quickDownloadMedia({ url, kind, pageUrl, filename, selectedVarian
     // with the selected variant + audio instead of downloading the child
     // media playlist alone (which drops the audio track).
     masterUrl: url,
-    filename: selected.kind === "hls" || selected.kind === "dash" ? (name.replace(/\.[^.]+$/, "") + ".mp4") : name,
+    filename: selected.kind === "hls" || selected.kind === "dash" ? withExtension(name, "mp4") : name,
     referer: pageUrl || "",
     representationId: selected.representationId,
     audioRepresentationId: selected.audioRepresentationId || "",

@@ -5,7 +5,7 @@ mod session;
 mod video;
 mod ytdlp;
 
-pub use download::{default_download_dir, download_url, download_url_resumable, download_url_resumable_with_connections, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, DownloadControl, DownloadOutcome, DownloadProgress, GlobalRateLimiter, DEFAULT_RESUMABLE_CONNECTIONS};
+pub use download::{default_download_dir, download_url, download_url_resumable, download_url_resumable_with_connections, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, with_extension, DownloadControl, DownloadOutcome, DownloadProgress, GlobalRateLimiter, DEFAULT_RESUMABLE_CONNECTIONS};
 pub use grabber::{extract_page_media, grab_page_media, grab_page_media_with_session, GrabKind, PageMedia, PageMediaList, MAX_ITEMS as GRAB_MAX_ITEMS};
 pub use jobstore::{now_ms, store_file_name, JobKind, JobOrigin, JobRecord, JobState, JobStore};
 pub use session::{auth_failure_label, error_text, map_auth_error, SessionHeaders, AUTH_REQUIRED_MESSAGE};

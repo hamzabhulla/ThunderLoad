@@ -121,9 +121,11 @@ async fn save_native_job_state(state: &Value) -> Result<()> {
     let temporary = root.join(format!("{id}.json.tmp"));
     let bytes = serde_json::to_vec(state)?;
     tokio::fs::write(&temporary, bytes).await?;
-    if tokio::fs::try_exists(&destination).await.unwrap_or(false) {
-        tokio::fs::remove_file(&destination).await?;
-    }
+    // Atomic replace: rename over the destination in one step (this
+    // replaces the file on Windows and Unix alike). The old code
+    // removed the destination first, leaving a microsecond window in
+    // which the desktop's 1.5 s poll saw the file missing and dropped
+    // the native items for one cycle (Gemini claim 13 flicker).
     tokio::fs::rename(&temporary, &destination).await?;
     Ok(())
 }
@@ -287,6 +289,25 @@ fn load_desktop_settings() -> bool {
     has_saved_ffmpeg
 }
 
+/// Sets THUNDERLOAD_FFMPEG only when the value actually changed, so
+/// the 2 s desktop-settings watcher does not rewrite the process
+/// environment on every tick. (Gemini claim 12: the watcher, the
+/// desktop's set_ffmpeg_path and the engine's var_os reads all touch
+/// the same variable; an unchanged value must not be re-written.)
+fn set_ffmpeg_env(value: Option<&str>) {
+    if ffmpeg_env_needs_update(std::env::var_os("THUNDERLOAD_FFMPEG").as_deref(), value) {
+        match value {
+            Some(value) => std::env::set_var("THUNDERLOAD_FFMPEG", value),
+            None => std::env::remove_var("THUNDERLOAD_FFMPEG"),
+        }
+    }
+}
+
+/// Whether the wanted ffmpeg env value differs from the current one.
+fn ffmpeg_env_needs_update(current: Option<&std::ffi::OsStr>, wanted: Option<&str>) -> bool {
+    current != wanted.map(std::ffi::OsStr::new)
+}
+
 fn start_desktop_settings_watcher(mut has_saved_ffmpeg: bool) {
     let limiter = rate_limiter();
     tokio::spawn(async move {
@@ -303,16 +324,16 @@ fn start_desktop_settings_watcher(mut has_saved_ffmpeg: bool) {
             }
             match std::fs::read_to_string(config_dir.join("ffmpeg.path")) {
                 Ok(value) if !value.trim().is_empty() => {
-                    std::env::set_var("THUNDERLOAD_FFMPEG", value.trim());
+                    set_ffmpeg_env(Some(value.trim()));
                     has_saved_ffmpeg = true;
                 }
                 Ok(_) => {
-                    std::env::remove_var("THUNDERLOAD_FFMPEG");
+                    set_ffmpeg_env(None);
                     has_saved_ffmpeg = false;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound && has_saved_ffmpeg => {
                     // The user cleared the saved setting while this companion was running.
-                    std::env::remove_var("THUNDERLOAD_FFMPEG");
+                    set_ffmpeg_env(None);
                     has_saved_ffmpeg = false;
                 }
                 Err(_) => {}
@@ -351,7 +372,10 @@ async fn main() -> Result<()> {
         let action = message.get("action").and_then(Value::as_str).unwrap_or("");
         match action {
             "ping" => {
-                let _ = outgoing_tx.send(json!({"id": id, "ok": true, "data": {"name": "ThunderLoad Native Host", "version": "0.1.0"}}));
+                // Slice 7c (Gemini claim 13): the version is the package
+                // version, not a hardcoded string that rots (it said
+                // "0.1.0" while the repo was already 0.3.4).
+                let _ = outgoing_tx.send(json!({"id": id, "ok": true, "data": {"name": "ThunderLoad Native Host", "version": env!("CARGO_PKG_VERSION")}}));
             }
             "video.inspect" => {
                 let url = message.get("url").and_then(Value::as_str).unwrap_or("").to_string();
@@ -1362,5 +1386,125 @@ mod config_dir_tests {
             error_text(&anyhow!("Download server returned HTTP 500")),
             "Download server returned HTTP 500"
         );
+    }
+
+    /// Slice 7c (Gemini claim 12): the watcher must not rewrite the
+    /// environment when the value did not change — repeated ticks with
+    /// an unchanged ffmpeg.path are no-ops.
+    #[test]
+    fn ffmpeg_env_guard_only_writes_when_changed() {
+        use super::ffmpeg_env_needs_update;
+        use std::ffi::OsStr;
+        assert!(!ffmpeg_env_needs_update(None, None));
+        assert!(ffmpeg_env_needs_update(None, Some("/usr/bin/ffmpeg")));
+        assert!(!ffmpeg_env_needs_update(
+            Some(OsStr::new("/usr/bin/ffmpeg")),
+            Some("/usr/bin/ffmpeg")
+        ));
+        assert!(ffmpeg_env_needs_update(
+            Some(OsStr::new("/usr/bin/ffmpeg")),
+            Some("/bin/ffmpeg")
+        ));
+        assert!(ffmpeg_env_needs_update(
+            Some(OsStr::new("/usr/bin/ffmpeg")),
+            None
+        ));
+    }
+
+    /// Slice 7c (Gemini claim 12): the guard itself, end to end —
+    /// a repeated "write" of the same value leaves the variable
+    /// untouched, a changed value lands, clearing removes it.
+    #[test]
+    fn ffmpeg_env_set_only_applies_changes() {
+        use super::set_ffmpeg_env;
+        let original = std::env::var_os("THUNDERLOAD_FFMPEG");
+        std::env::set_var("THUNDERLOAD_FFMPEG", "/usr/bin/ffmpeg");
+        set_ffmpeg_env(Some("/usr/bin/ffmpeg"));
+        assert_eq!(
+            std::env::var_os("THUNDERLOAD_FFMPEG").as_deref(),
+            Some(std::ffi::OsStr::new("/usr/bin/ffmpeg"))
+        );
+        set_ffmpeg_env(Some("/bin/ffmpeg"));
+        assert_eq!(
+            std::env::var_os("THUNDERLOAD_FFMPEG").as_deref(),
+            Some(std::ffi::OsStr::new("/bin/ffmpeg"))
+        );
+        set_ffmpeg_env(None);
+        assert!(std::env::var_os("THUNDERLOAD_FFMPEG").is_none());
+        match original {
+            Some(value) => std::env::set_var("THUNDERLOAD_FFMPEG", value),
+            None => std::env::remove_var("THUNDERLOAD_FFMPEG"),
+        }
+    }
+
+    /// Slice 7c (Gemini claim 13): a concurrent reader must never see
+    /// the state file missing while saves are in flight. The old code
+    /// removed the destination before renaming the temp over it, so a
+    /// reader polling every 1.5 s could catch the gap and drop the
+    /// native items for one cycle; rename-over replaces atomically.
+    #[test]
+    fn native_job_state_save_never_leaves_a_missing_file_window() {
+        use super::save_native_job_state;
+        use serde_json::json;
+        let home = std::env::temp_dir().join(format!("thunderload-host-atomic-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).unwrap();
+        let original_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+        let destination = home
+            .join("Downloads")
+            .join("ThunderLoad")
+            .join(".native-jobs")
+            .join("atomic-test.json");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // Prime the file BEFORE the reader starts, so a miss can only
+        // come from a save — the gap under test only exists on re-saves.
+        runtime.block_on(async {
+            save_native_job_state(&json!({"id": "atomic-test", "n": 0})).await.unwrap();
+        });
+        let reader_destination = destination.clone();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_reader = stop.clone();
+        let missing = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let missing_reader = missing.clone();
+        let reader = std::thread::spawn(move || {
+            while !stop_reader.load(std::sync::atomic::Ordering::Relaxed) {
+                match std::fs::read(&reader_destination) {
+                    Ok(bytes) => {
+                        // Every read that lands must be a complete,
+                        // valid state file — never a torn write.
+                        let value: serde_json::Value =
+                            serde_json::from_slice(&bytes).expect("state file must stay valid JSON");
+                        assert_eq!(value["id"], "atomic-test");
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        missing_reader.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(_) => {}
+                }
+            }
+        });
+        runtime.block_on(async {
+            for n in 1..=500 {
+                save_native_job_state(&json!({"id": "atomic-test", "n": n})).await.unwrap();
+            }
+        });
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        reader.join().unwrap();
+        let final_state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&destination).unwrap()).unwrap();
+        assert_eq!(final_state["n"], 500);
+        assert_eq!(
+            missing.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the destination file must never be missing during saves"
+        );
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

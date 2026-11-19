@@ -1556,6 +1556,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
                 <option value="chrome">Google Chrome</option>
                 <option value="edge">Microsoft Edge</option>
                 <option value="brave">Brave</option>
+                <option value="opera">Opera</option>
                 <option value="firefox">Firefox</option>
               </select></label>
               <label><span>Extension ID</span><input className="field" value={nativeExtensionId} onChange={(event) => setNativeExtensionId(event.target.value)} placeholder={nativeBrowser === "firefox" ? "thunderload@example.com" : "32 characters a–p"} /></label>

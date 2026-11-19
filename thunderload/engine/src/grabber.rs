@@ -26,7 +26,7 @@ use crate::session::SessionHeaders;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::download::safe_filename;
+use crate::download::{safe_filename, with_extension};
 
 /// Maximum media items reported for one page. The extension popup uses
 /// the same cap, so both surfaces agree.
@@ -119,18 +119,10 @@ fn name_for(url: &Url, kind: GrabKind) -> String {
         // A playlist assembles to one MP4 file, so the item is named
         // after the playlist stem with an .mp4 extension — the same
         // name the extension popup derives for the same stream.
-        GrabKind::Hls | GrabKind::Dash => {
-            let stem = decoded
-                .rsplit_once('.')
-                .map(|(stem, _)| stem)
-                .unwrap_or(&decoded);
-            let stem = safe_filename(stem, "video");
-            if stem == "video" {
-                "video.mp4".to_string()
-            } else {
-                format!("{stem}.mp4")
-            }
-        }
+        // Slice 7c (Gemini claim 9): only a known media extension is
+        // replaced, so "my.video" keeps its name ("my.video.mp4")
+        // instead of losing ".video" to "my.mp4".
+        GrabKind::Hls | GrabKind::Dash => with_extension(&safe_filename(&decoded, "video"), "mp4"),
     }
 }
 

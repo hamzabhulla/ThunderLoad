@@ -2,6 +2,10 @@
   if (globalThis.__thunderLoadScannerInstalled) return;
   globalThis.__thunderLoadScannerInstalled = true;
 
+  // Same alias as popup.js/background.js: `browser` in Firefox,
+  // `chrome` in Chrome. (Slice 7c, Gemini claim 9 — consistency only.)
+  const api = globalThis.browser ?? chrome;
+
   const found = new Map();
   // Same media set as the engine grabber (engine/src/grabber.rs) so
   // both surfaces agree on what counts. Playlists first, then files.
@@ -50,7 +54,7 @@
   function notifyTruncated() {
     if (truncatedNotified) return;
     truncatedNotified = true;
-    chrome.runtime.sendMessage({ type: "VIDEO_SOURCES_FOUND", sources: [], truncated: true }).catch(() => {});
+    api.runtime.sendMessage({ type: "VIDEO_SOURCES_FOUND", sources: [], truncated: true }).catch(() => {});
   }
   let scanScheduled = false;
   let activeVideo = null;
@@ -124,7 +128,7 @@
     if (found.size >= MAX_FOUND) { truncated = true; notifyTruncated(); return; }
     const item = { url, kind, label: label || kind, discoveredAt: Date.now() };
     found.set(url, item);
-    chrome.runtime.sendMessage({ type: "VIDEO_SOURCES_FOUND", sources: [item], truncated }).catch(() => {});
+    api.runtime.sendMessage({ type: "VIDEO_SOURCES_FOUND", sources: [item], truncated }).catch(() => {});
   }
 
   function ensureOverlay() {
@@ -352,14 +356,14 @@
     progressSection();
     try {
       if (subtitle.format === "m3u8") {
-        const result = await chrome.runtime.sendMessage({
+        const result = await api.runtime.sendMessage({
           type: "NATIVE_REQUEST",
           action: "hls.subtitles.download",
           payload: { playlistUrl: subtitle.url, url: subtitle.url, filename: (subtitle.language || "subtitles") + ".vtt", referer: location.href }
         });
         if (!result?.ok) throw new Error(result?.error || "Could not download subtitles.");
       } else {
-        const result = await chrome.runtime.sendMessage({
+        const result = await api.runtime.sendMessage({
           type: "BROWSER_DOWNLOAD",
           url: subtitle.url,
           filename: (subtitle.language || "subtitles") + "." + (subtitle.format || "vtt")
@@ -380,7 +384,7 @@
   // against duplicates across re-renders.
   function appendInterceptNote(panel) {
     if (!panel) return;
-    chrome.runtime.sendMessage({ type: "GET_INTERCEPT_STATUS" }).then((result) => {
+    api.runtime.sendMessage({ type: "GET_INTERCEPT_STATUS" }).then((result) => {
       const pending = Array.isArray(result?.pending) ? result.pending : [];
       if (!pending.length) return;
       if (!panel.isConnected || panel.querySelector(".p-intercept-note")) return;
@@ -617,7 +621,7 @@
       connect.disabled = true;
       note.classList.remove("show");
       try {
-        const result = await chrome.runtime.sendMessage({ type: "REQUEST_NATIVE_PERMISSION" });
+        const result = await api.runtime.sendMessage({ type: "REQUEST_NATIVE_PERMISSION" });
         applyConnectNote(result?.granted
           ? "Desktop app connected. You can download now."
           : MANUAL_PERMISSION_STEPS);
@@ -668,7 +672,7 @@
   async function tryGenericInspect(target) {
     let result;
     try {
-      result = await chrome.runtime.sendMessage({ type: "YTDLP_INSPECT_GENERIC", pageUrl: location.href });
+      result = await api.runtime.sendMessage({ type: "YTDLP_INSPECT_GENERIC", pageUrl: location.href });
     } catch (_) { return; }
     if (panelTarget !== target || panelPrimary !== null || !panelEl()?.classList.contains("show")) return;
     if (!result?.ok) return;
@@ -735,7 +739,7 @@
       downloadBtn.disabled = true;
       note.classList.remove("show");
       try {
-        const result = await chrome.runtime.sendMessage({ type: "YTDLP_ENSURE_TOOL", tool });
+        const result = await api.runtime.sendMessage({ type: "YTDLP_ENSURE_TOOL", tool });
         if (result?.ok) {
           if (typeof onDone === "function") onDone();
         } else {
@@ -754,7 +758,7 @@
     manual.className = "p-link";
     manual.textContent = "or download it yourself";
     manual.addEventListener("click", () => {
-      chrome.runtime.sendMessage({ type: "YTDLP_OPEN_MANUAL_PAGE", tool }).catch(() => {});
+      api.runtime.sendMessage({ type: "YTDLP_OPEN_MANUAL_PAGE", tool }).catch(() => {});
     });
     frag.append(downloadBtn, progress, note, manual);
     return frag;
@@ -840,7 +844,7 @@
     renderYtDlpPanel();
     (async () => {
       try {
-        const result = await chrome.runtime.sendMessage({ type: "YTDLP_INSPECT", pageUrl: location.href });
+        const result = await api.runtime.sendMessage({ type: "YTDLP_INSPECT", pageUrl: location.href });
         if (panelTarget !== target || !panelEl()?.classList.contains("show")) return;
         if (!result?.ok) {
           panelYtDlp = result?.toolsMissing
@@ -864,7 +868,7 @@
             // means YouTube fell back to fewer formats — offer the
             // download right here instead of failing silently.
             try {
-              const toolStatus = await chrome.runtime.sendMessage({ type: "YTDLP_TOOLS_STATUS" });
+              const toolStatus = await api.runtime.sendMessage({ type: "YTDLP_TOOLS_STATUS" });
               if (toolStatus?.ok && toolStatus.deno && toolStatus.deno.present === false) ytdlpDenoMissing = true;
             } catch (_) { /* Tools status is best-effort here. */ }
           }
@@ -897,7 +901,7 @@
         ? variant.representationId + "+" + variant.audioRepresentationId
         : variant.representationId;
       const filename = panelYtDlp?.title ? panelYtDlp.title + ".mp4" : "video.mp4";
-      const result = await chrome.runtime.sendMessage({
+      const result = await api.runtime.sendMessage({
         type: "YTDLP_DOWNLOAD",
         pageUrl: location.href,
         formatSelector,
@@ -1031,7 +1035,7 @@
 
   async function inspectPanelVariants(source, target) {
     try {
-      const result = await chrome.runtime.sendMessage({
+      const result = await api.runtime.sendMessage({
         type: "INSPECT_MEDIA",
         url: source.url,
         pageUrl: location.href
@@ -1075,7 +1079,7 @@
     progressSection();
     button.disabled = true;
     try {
-      const result = await chrome.runtime.sendMessage({
+      const result = await api.runtime.sendMessage({
         type: "QUICK_DOWNLOAD_MEDIA",
         url: source.url,
         kind: source.kind,
@@ -1250,7 +1254,7 @@
     });
   }
 
-  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  api.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type === "SCAN_NOW") {
       sendResponse({ ok: true, count: scan(), truncated });
       return false;
