@@ -67,6 +67,8 @@
   // bridge — a URL already announced is never announced again).
   const MAX_SENT_URLS = 500;
   const sentUrls = new Set();
+  const pendingFindings = [];
+  let handshakeCompleted = false;
   function postUrlFinding(url) {
     if (!url || typeof url !== "string") return;
     let absolute = url;
@@ -76,7 +78,11 @@
     if (sentUrls.has(absolute)) return;
     if (sentUrls.size >= MAX_SENT_URLS) return;
     sentUrls.add(absolute);
-    post("THUNDERLOAD_HOOK_FINDING", { url: absolute, kind });
+    const finding = { url: absolute, kind };
+    if (!handshakeCompleted && pendingFindings.length < MAX_SENT_URLS) {
+      pendingFindings.push(finding);
+    }
+    post("THUNDERLOAD_HOOK_FINDING", finding);
   }
   function recordFetchUrl(input) {
     try {
@@ -98,6 +104,13 @@
       const data = event.data;
       if (!data || data.__thunderLoadHook !== true || data.type !== "THUNDERLOAD_HOOK_PING") return;
       post("THUNDERLOAD_HOOK_HELLO", { nonce: data.nonce });
+      handshakeCompleted = true;
+      if (pendingFindings.length) {
+        const queued = pendingFindings.splice(0, pendingFindings.length);
+        for (const item of queued) {
+          post("THUNDERLOAD_HOOK_FINDING", item);
+        }
+      }
     } catch (_) {}
   });
   post("THUNDERLOAD_HOOK_HELLO", {});

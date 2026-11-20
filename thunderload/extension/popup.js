@@ -3,8 +3,14 @@ const sourceList = document.getElementById("sourceList");
 const toast = document.getElementById("toast");
 const rescanBtn = document.getElementById("rescanBtn");
 const interceptToggle = document.getElementById("interceptToggle");
+const interceptRow = document.getElementById("interceptRow");
 let pageUrl = "";
+let activeTabId = null;
 let sources = [];
+// H7: false when the browser reports <all_urls> host access revoked
+// (about:addons toggle) — content scripts and webRequest silently
+// stop, so the popup must say so instead of "No media found".
+let hostPermissionGranted = true;
 // Slice 7c (Gemini claim 8): the background caps the list at
 // MAX_SOURCES_PER_TAB and reports it as `truncated` — the popup must
 // say so instead of silently showing a partial list.
@@ -30,6 +36,18 @@ function isYtDlpPageUrl(url) {
     const host = new URL(url).hostname.toLowerCase();
     return YTDLP_HOSTS.some((listed) => host === listed || host.endsWith("." + listed));
   } catch (_) { return false; }
+}
+function normalizeMissingTool(missing) {
+  if (Array.isArray(missing)) return typeof missing[0] === "string" && missing[0] ? missing[0] : null;
+  return typeof missing === "string" && missing ? missing : null;
+}
+function sanitizeSubtitleFilename(name) {
+  const cleaned = String(name || "subtitles.vtt").replace(/[\u0000-\u001f\\/:*?"<>|]+/g, "_");
+  const dot = cleaned.lastIndexOf(".");
+  if (dot > 0) {
+    return (cleaned.slice(0, dot).slice(0, 180) || "subtitles") + cleaned.slice(dot);
+  }
+  return cleaned.slice(0, 180) || "subtitles.vtt";
 }
 
 const INTERCEPT_SETTING_KEY = "interceptBrowserDownloads";
@@ -136,14 +154,14 @@ async function downloadSubtitle(subtitle) {
       const result = await api.runtime.sendMessage({
         type: "NATIVE_REQUEST",
         action: "hls.subtitles.download",
-        payload: { playlistUrl: subtitle.url, url: subtitle.url, filename: (subtitle.language || "subtitles") + ".vtt", referer: pageUrl }
+        payload: { playlistUrl: subtitle.url, url: subtitle.url, filename: sanitizeSubtitleFilename((subtitle.language || "subtitles") + ".vtt"), referer: pageUrl }
       });
       if (!result?.ok) throw new Error(result?.error || "Could not download subtitles.");
     } else {
       const result = await api.runtime.sendMessage({
         type: "BROWSER_DOWNLOAD",
         url: subtitle.url,
-        filename: (subtitle.language || "subtitles") + "." + (subtitle.format || "vtt")
+        filename: sanitizeSubtitleFilename((subtitle.language || "subtitles") + "." + (subtitle.format || "vtt"))
       });
       if (!result?.ok) throw new Error(result?.error || "Could not download subtitles.");
     }
@@ -163,6 +181,35 @@ function appendInterceptNote() {
     pendingIntercepts.length === 1
       ? "1 download is waiting for the desktop app."
       : pendingIntercepts.length + " downloads are waiting for the desktop app."));
+}
+// H7: when host access was revoked, detection is silently dead —
+// the notice names the cause and offers a re-enable tap. The request
+// runs directly from this click handler first, so the user gesture
+// survives; the background REQUEST_HOST_PERMISSION message is the
+// fallback when the permissions API is unavailable here. Either way
+// a denied/failed prompt leaves the notice up (with the manual path
+// in the text) instead of erroring.
+function appendHostPermissionNote() {
+  if (hostPermissionGranted) return;
+  const note = el("div", "intercept-note", "Site access is off — ThunderLoad can't see media on this page. Turn it back on in the browser's extension settings, or tap below.");
+  const button = el("button", "secondary", "Enable site access");
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    try {
+      if (typeof api.permissions?.request === "function") {
+        const granted = await api.permissions.request({ origins: ["<all_urls>"] });
+        if (granted) { hostPermissionGranted = true; render(); return; }
+      }
+    } catch (_) { /* Fall through to the background path. */ }
+    try {
+      const result = await api.runtime.sendMessage({ type: "REQUEST_HOST_PERMISSION" });
+      hostPermissionGranted = result?.granted === true;
+    } catch (_) { /* Stays revoked; the notice remains. */ }
+    button.disabled = false;
+    render();
+  });
+  note.append(button);
+  sourceList.append(note);
 }
 function appendTruncatedNote() {
   if (!sourcesTruncated || !sources.length) return;
@@ -220,6 +267,7 @@ function renderOtherMedia(others) {
 }
 function render() {
   sourceList.replaceChildren();
+  appendHostPermissionNote();
   primarySource = null;
   primaryVariants = null;
   // Slice 3: a yt-dlp page gets the yt-dlp card as its primary —
@@ -321,15 +369,16 @@ function renderYtDlpQualityRows(list, variants) {
 // anywhere. The tap itself is the consent: nothing is fetched until
 // the user presses this button. The manual link is only the backup.
 function ytdlpToolDownloadButton(tool, onDone) {
+  const toolId = normalizeMissingTool(tool) || "ytdlp";
   const wrap = el("div", "ytdlp-consent");
-  const name = tool === "deno" ? "Deno" : "yt-dlp";
+  const name = toolId === "deno" ? "Deno" : "yt-dlp";
   const button = el("button", "secondary-btn", "Download " + name);
   const progress = el("div", "ytdlp-progress" + (ytdlpToolProgressText ? "" : " hidden"), ytdlpToolProgressText);
   const manual = el("button", "ytdlp-manual", "or download it yourself");
   button.addEventListener("click", async () => {
     button.disabled = true;
     try {
-      const result = await api.runtime.sendMessage({ type: "YTDLP_ENSURE_TOOL", tool });
+      const result = await api.runtime.sendMessage({ type: "YTDLP_ENSURE_TOOL", tool: toolId });
       if (!result?.ok) throw new Error(result?.error || "Download failed.");
       if (typeof onDone === "function") onDone();
     } catch (error) {
@@ -338,7 +387,7 @@ function ytdlpToolDownloadButton(tool, onDone) {
     }
   });
   manual.addEventListener("click", () => {
-    api.runtime.sendMessage({ type: "YTDLP_OPEN_MANUAL_PAGE", tool }).catch(() => {});
+    api.runtime.sendMessage({ type: "YTDLP_OPEN_MANUAL_PAGE", tool: toolId }).catch(() => {});
   });
   wrap.append(button, progress, manual);
   return wrap;
@@ -355,9 +404,9 @@ async function startYtDlpVariant(variant) {
 async function inspectYtDlpPage() {
   ytdlpInspecting = true;
   try {
-    const result = await api.runtime.sendMessage({ type: "YTDLP_INSPECT", pageUrl });
+    const result = await api.runtime.sendMessage({ type: "YTDLP_INSPECT", pageUrl, tabId: activeTabId });
     if (!result?.ok) {
-      ytdlpToolsMissing = result?.toolsMissing || null;
+      ytdlpToolsMissing = normalizeMissingTool(result?.toolsMissing);
       if (!ytdlpToolsMissing) showToast(result?.error || "Could not inspect this page.");
       ytdlpVariants = null;
       // Slice 6 fix (MINOR 1): the normal inspect found nothing
@@ -496,8 +545,12 @@ async function scanActiveTab() {
     const result = await api.runtime.sendMessage({ type: "GET_ACTIVE_SOURCES" });
     if (!result?.ok) throw new Error(result?.error || "Cannot scan this page");
     pageUrl = result.pageUrl || "";
+    activeTabId = result.tabId ?? null;
     sources = result.sources || [];
     sourcesTruncated = result.truncated === true;
+    // H7: undefined (an older background without the field) means
+    // granted — only an explicit false counts as revoked.
+    hostPermissionGranted = result.hostPermissionGranted !== false;
     // Slice 6: downloads intercepted while the desktop app was down.
     pendingIntercepts = Array.isArray(result.pendingIntercepts) ? result.pendingIntercepts : [];
     if (result.ytdlp) {
@@ -556,10 +609,21 @@ async function inspectGenericPage(run) {
   } catch (_) { /* A failed generic inspect leaves the empty state. */ }
 }
 async function loadInterceptToggle() {
+  // M12: no flicker. The toggle ships hidden + disabled with NO
+  // hardcoded checked state (popup.html) and is only revealed once
+  // the stored value is applied below — the user never sees it flip
+  // from the hardcoded `checked` to the stored false. An inline
+  // script in popup.html could not do this instead: MV3 extension
+  // pages block inline scripts under the default CSP, so
+  // hide-until-loaded from the external script is the correct fix.
+  // The unhide runs on every path (including the catch), so a
+  // storage failure can never leave the toggle hidden forever.
   try {
     const stored = await api.storage.local.get({ [INTERCEPT_SETTING_KEY]: true });
     interceptToggle.checked = stored?.[INTERCEPT_SETTING_KEY] !== false;
   } catch (_) { interceptToggle.checked = true; }
+  interceptToggle.disabled = false;
+  if (interceptRow) interceptRow.hidden = false;
 }
 rescanBtn.addEventListener("click", scanActiveTab);
 interceptToggle.addEventListener("change", () => {

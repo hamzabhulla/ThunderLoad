@@ -17,11 +17,14 @@ Prerequisites: Rust stable + Cargo, Node.js 20+, npm. Windows also needs Microso
 ```sh
 git clone https://github.com/hamzabhulla/ThunderLoad.git
 cd ThunderLoad/thunderload
+node scripts/package-extensions.mjs
 cargo build --release -p thunderload-host
 npm install --prefix desktop
 npm run build --prefix desktop
 npm run tauri --prefix desktop -- build
 ```
+
+Package the browser extensions **first**, before any `cargo` or `tauri` step that touches the desktop crate: `tauri.conf.json` bundles `dist/extensions/ThunderLoad-Chromium.zip` and `dist/extensions/ThunderLoad-Firefox.xpi` as resources, and the Tauri build script rejects the build when they are missing. (On Windows, `.\scripts\package-extensions.ps1` does the same thing.)
 
 On Linux and macOS, copy the host binary first, or the build rejects the missing resource:
 
@@ -58,12 +61,16 @@ Browser downloads need one manual setup per browser — after that, ThunderLoad 
 - Scheduled starts with a one-time OS wake task — Task Scheduler on Windows, systemd user timer on Linux, launchd agent on macOS.
 
 **Video: HLS and DASH**
-- HLS VOD with pause/resume/cancel, byte-range slices, fMP4 (init + fragments), and separate audio renditions muxed with FFmpeg.
+- HLS VOD with pause/resume/cancel, byte-range slices, fMP4 (init + fragments), AES-128-encrypted segments decrypted in-engine, and separate audio renditions muxed with FFmpeg.
+- Live HLS streams can be recorded as they arrive — stopping keeps the partial recording (Pause is terminal for a live recording; there is no resume from a partial live file).
 - DASH VOD with SegmentTemplate, SegmentList, SegmentBase (sidx), and multi-period MPDs; pause/resume/cancel backed by an on-disk checkpoint; separate audio/video muxed with FFmpeg.
-- Live playlists, dynamic MPDs, and DRM are not supported — DRM never, by design.
+- Dynamic/live DASH MPDs, SAMPLE-AES and other non-AES-128 HLS encryption, encrypted live HLS, and DRM are not supported — DRM never, by design.
+
+**YouTube and social video (yt-dlp)**
+- YouTube, Instagram, TikTok, X, Facebook, Reddit, Twitch, and Vimeo pages are inspected and downloaded with yt-dlp; Deno runs the JavaScript yt-dlp needs for YouTube's full quality. Neither tool is bundled with the installer — each downloads once from its GitHub Releases page (yt-dlp 2026.10.26, Deno 2.9.8) when you click its Download button in Settings, with visible progress, and is SHA256-verified against a pinned hash before use. Without Deno, YouTube falls back to fewer formats.
 
 **Browser integration**
-- Chrome/Firefox extension (Chromium ZIP + Firefox XPI) with automatic media detection, an in-player Download control, and a site grabber: tick what you want from the active page, up to 100 items per batch.
+- Chrome/Firefox extension (Chromium ZIP + Firefox XPI) with automatic media detection, an in-player Download control, and a site grabber: the popup lists what it found on the active tab, each row with its own Download button. Multi-select checkboxes exist only in the desktop app's Video grabber dialog ("Grab a page", first 100 items).
 - The desktop app controls browser-started jobs of every kind — pause, resume, and cancel from one queue — via the local native-messaging host.
 - Cookie/header handoff: the extension passes the download URL's cookies (that URL only), referer, and user-agent to the engine, so cookie-bound and signed URLs work. Cookies are sent only to their own origin, never follow a cross-origin redirect, and are never logged.
 
@@ -94,7 +101,7 @@ One Rust engine does all the transferring; thin clients drive it. The desktop ap
 ```
 thunderload/
 ├── engine/      Rust transfer engine: HTTP ranges, HLS, DASH, job store, session handoff
-├── desktop/     Tauri 2 + React client (Downloads, Queue, Video Grabber, Settings)
+├── desktop/     Tauri 2 + React client (Downloads, Queues, Scheduler, Settings pages; Video Grabber is a dialog, not a page)
 ├── extension/   Chromium + Firefox extension (media detection, grabber, popup)
 ├── native-host/ Rust native-messaging bridge between extension and desktop
 └── docs/        Browser distribution, store submission, and privacy notes
@@ -112,7 +119,7 @@ Stated plainly, because a README that hides them is worse than useless:
 - **No real-machine smoke test yet.** CI is green on all three platforms, but no one has run the built installers on a real Windows, Linux, or macOS machine.
 - **Store listings not submitted.** Chrome Web Store, Edge Add-ons, and AMO review are all pending.
 - **FFmpeg is required** for HLS/DASH audio muxing and is not bundled — set its path in Settings.
-- **No live or DRM content.** Live HLS playlists, dynamic/live DASH, and encrypted/DRM streams are not supported, by design.
+- **No live DASH or DRM content.** Live/dynamic DASH MPDs, SAMPLE-AES and other non-AES-128 HLS encryption, encrypted live HLS, and DRM are not supported, by design. Live HLS recording and AES-128 HLS VOD are supported (see Features).
 - **Release packaging is Windows-only for now.** Tagged releases build the Windows NSIS installer and extension packages; Linux/macOS release packaging is a follow-up.
 
 ## License

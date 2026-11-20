@@ -54,24 +54,69 @@ use tokio::sync::{mpsc, watch};
 pub const YTDLP_VERSION: &str = "2026.10.26";
 /// SHA256 of yt-dlp.exe 2026.10.26 (Windows x64 standalone), from the
 /// release's published SHA2-256SUMS — verified live 2026-11-17.
+/// The Linux/macOS assets are different bytes with different hashes;
+/// their pins are the `YTDLP_LINUX_SHA256` / `YTDLP_MACOS_SHA256`
+/// consts below — see `YtDlpTool::pinned_sha256`.
 pub const YTDLP_EXE_SHA256: &str =
     "f5389d3698ecde4ef06f4e6b1ce0294fe9ac1396228c8990b8d3416d6d177a7d";
+/// SHA256 of yt-dlp_linux 2026.10.26, from the release's published
+/// SHA2-256SUMS — verified live 2026-11-19: the asset was downloaded
+/// from the release and hashed, and the hash matches the sums file.
+pub const YTDLP_LINUX_SHA256: &str =
+    "767ba9dce7052aa196f8b12652f433d76de128ba168966fa84b6394d5e6c6795";
+/// SHA256 of yt-dlp_macos 2026.10.26, same source and verification
+/// as the Linux pin (asset downloaded and hashed 2026-11-19).
+pub const YTDLP_MACOS_SHA256: &str =
+    "0f922c15ccc0b83eefa1c8bc9104e434318c4bf16e408e1ee93b7745a6efe0aa";
 /// Pinned Deno release (the JS runtime yt-dlp uses for YouTube's
 /// signature deciphering since 2025.11.12).
 pub const DENO_VERSION: &str = "2.9.8";
 /// SHA256 of deno-x86_64-pc-windows-msvc.zip v2.9.8, from the release's
 /// published .sha256sum file (PowerShell Get-FileHash format) —
-/// verified live 2026-11-17.
+/// verified live 2026-11-17. The Linux/macOS zips are different bytes
+/// with different hashes; their pins are the `DENO_ZIP_*` consts
+/// below — see `YtDlpTool::pinned_sha256`.
 pub const DENO_ZIP_SHA256: &str =
     "cba84b26e0df5ae7f74fc66b86a95b866872a86292ebd84fa1e959927edd93bf";
+/// SHA256 of deno-x86_64-unknown-linux-gnu.zip v2.9.8, from the
+/// release's published .sha256sum file — verified live 2026-11-19:
+/// the asset was downloaded from the release and hashed, and the
+/// hash matches the .sha256sum file.
+pub const DENO_ZIP_LINUX_SHA256: &str =
+    "e890975bc2549807bbcc0b584ffafda72cc7c93349dd99c80483dd784f6c4609";
+/// SHA256 of deno-aarch64-apple-darwin.zip v2.9.8, same source and
+/// verification as the Linux pin (asset downloaded and hashed
+/// 2026-11-19).
+pub const DENO_ZIP_MACOS_AARCH64_SHA256: &str =
+    "9f0bf660393da2eaff044cdc7444cb08c73f235849b61d224d825a194ce7c98e";
+/// SHA256 of deno-x86_64-apple-darwin.zip v2.9.8, same source and
+/// verification as the Linux pin (asset downloaded and hashed
+/// 2026-11-19).
+pub const DENO_ZIP_MACOS_X86_64_SHA256: &str =
+    "4b2f5edd2639b7470f034238b321d7002d8dfb4726d8558f52c17afac370eb2c";
 /// Player-client fallback chain, best quality first. See the module
 /// docs for the live measurement behind this order.
 pub const PLAYER_CLIENT_CHAIN: &str = "default,android_vr,tv,ios,web_safari";
 
-const YTDLP_DOWNLOAD_URL: &str =
+/// Per-OS download URLs (P0-13b): the old code returned the Windows
+/// asset URL on every platform, so a Linux/macOS download fetched a
+/// `.exe` / Windows zip it could never run. yt-dlp ships one
+/// standalone binary per OS (`yt-dlp.exe`, `yt-dlp_linux`,
+/// `yt-dlp_macos`); Deno ships one zip per OS+arch.
+const YTDLP_DOWNLOAD_URL_WINDOWS: &str =
     "https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.26/yt-dlp.exe";
-const DENO_DOWNLOAD_URL: &str =
+const YTDLP_DOWNLOAD_URL_LINUX: &str =
+    "https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.26/yt-dlp_linux";
+const YTDLP_DOWNLOAD_URL_MACOS: &str =
+    "https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.26/yt-dlp_macos";
+const DENO_DOWNLOAD_URL_WINDOWS: &str =
     "https://github.com/denoland/deno/releases/download/v2.9.8/deno-x86_64-pc-windows-msvc.zip";
+const DENO_DOWNLOAD_URL_LINUX: &str =
+    "https://github.com/denoland/deno/releases/download/v2.9.8/deno-x86_64-unknown-linux-gnu.zip";
+const DENO_DOWNLOAD_URL_MACOS_AARCH64: &str =
+    "https://github.com/denoland/deno/releases/download/v2.9.8/deno-aarch64-apple-darwin.zip";
+const DENO_DOWNLOAD_URL_MACOS_X86_64: &str =
+    "https://github.com/denoland/deno/releases/download/v2.9.8/deno-x86_64-apple-darwin.zip";
 /// Approximate download sizes (bytes) shown with the consent UI so
 /// the user knows what the tap fetches. Exact sizes come from the
 /// download itself; these are the published release sizes.
@@ -104,25 +149,94 @@ impl YtDlpTool {
             YtDlpTool::Deno => "Deno",
         }
     }
+    /// On-disk file name for this platform (P0-13b): the `.exe`
+    /// suffix is Windows-only — Linux/macOS ship plain `yt-dlp`
+    /// and `deno` binaries.
     pub fn file_name(self) -> &'static str {
         match self {
-            YtDlpTool::YtDlp => "yt-dlp.exe",
-            YtDlpTool::Deno => "deno.exe",
+            YtDlpTool::YtDlp => {
+                if cfg!(target_os = "windows") {
+                    "yt-dlp.exe"
+                } else {
+                    "yt-dlp"
+                }
+            }
+            YtDlpTool::Deno => {
+                if cfg!(target_os = "windows") {
+                    "deno.exe"
+                } else {
+                    "deno"
+                }
+            }
         }
     }
+    /// Download URL for this platform's release asset (P0-13b).
     pub fn download_url(self) -> &'static str {
         match self {
-            YtDlpTool::YtDlp => YTDLP_DOWNLOAD_URL,
-            YtDlpTool::Deno => DENO_DOWNLOAD_URL,
+            YtDlpTool::YtDlp => {
+                if cfg!(target_os = "windows") {
+                    YTDLP_DOWNLOAD_URL_WINDOWS
+                } else if cfg!(target_os = "macos") {
+                    YTDLP_DOWNLOAD_URL_MACOS
+                } else {
+                    YTDLP_DOWNLOAD_URL_LINUX
+                }
+            }
+            YtDlpTool::Deno => {
+                if cfg!(target_os = "windows") {
+                    DENO_DOWNLOAD_URL_WINDOWS
+                } else if cfg!(target_os = "macos") {
+                    if cfg!(target_arch = "aarch64") {
+                        DENO_DOWNLOAD_URL_MACOS_AARCH64
+                    } else {
+                        DENO_DOWNLOAD_URL_MACOS_X86_64
+                    }
+                } else {
+                    DENO_DOWNLOAD_URL_LINUX
+                }
+            }
         }
     }
-    /// The pinned SHA256 the downloaded file must match. Deno's is
-    /// the hash of the ZIP (verified before extraction).
-    pub fn sha256(self) -> &'static str {
-        match self {
-            YtDlpTool::YtDlp => YTDLP_EXE_SHA256,
-            YtDlpTool::Deno => DENO_ZIP_SHA256,
-        }
+    /// The pinned SHA256 for this platform's download. Every
+    /// platform has a pin now: the Windows pins were verified live
+    /// 2026-11-17 and the Linux/macOS pins 2026-11-19 (each asset
+    /// downloaded from its GitHub Release and hashed — the hashes
+    /// match the releases' published .sha256sum files). A first
+    /// install is therefore verified against the release hash on
+    /// every platform, never trusted on first use. (The one
+    /// remaining trust-on-first-use case is Deno's EXTRACTED exe:
+    /// its pin is the ZIP's hash, never the exe's, so a manual
+    /// Deno drop with no sidecar is still recorded at first use —
+    /// see `read_expected_tool_hash`.) A platform pin must never be
+    /// "borrowed" for another platform's asset: the bytes differ,
+    /// so the check would fail every download on that platform.
+    /// `None` is only the fallback for a future platform with no
+    /// pin recorded yet — today it is unreachable.
+    pub fn pinned_sha256(self) -> Option<&'static str> {
+        Some(match self {
+            YtDlpTool::YtDlp => {
+                if cfg!(target_os = "windows") {
+                    YTDLP_EXE_SHA256
+                } else if cfg!(target_os = "macos") {
+                    YTDLP_MACOS_SHA256
+                } else {
+                    YTDLP_LINUX_SHA256
+                }
+            }
+            YtDlpTool::Deno => {
+                if cfg!(target_os = "windows") {
+                    DENO_ZIP_SHA256
+                } else if cfg!(target_os = "macos") {
+                    if cfg!(target_arch = "aarch64") {
+                        DENO_ZIP_MACOS_AARCH64_SHA256
+                    } else {
+                        DENO_ZIP_MACOS_X86_64_SHA256
+                    }
+                } else {
+                    DENO_ZIP_LINUX_SHA256
+                }
+            }
+        })
     }
     pub fn approx_size_bytes(self) -> u64 {
         match self {
@@ -209,7 +323,9 @@ pub async fn tool_status(tool: YtDlpTool) -> ToolStatus {
     } else {
         false
     };
-    let version = if present {
+    let version = if present && verified {
+        // Already verified above: run --version without hashing the
+        // binary a second time.
         run_tool_version(tool).await
     } else {
         None
@@ -223,17 +339,42 @@ pub async fn tool_status(tool: YtDlpTool) -> ToolStatus {
     }
 }
 
+fn hidden_tokio_command<S: AsRef<std::ffi::OsStr>>(program: S) -> TokioCommand {
+    #[cfg(target_os = "windows")]
+    let std_command = {
+        use std::os::windows::process::CommandExt;
+        let mut std_command = std::process::Command::new(program);
+        std_command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        std_command
+    };
+    #[cfg(unix)]
+    let std_command = {
+        use std::os::unix::process::CommandExt;
+        let mut std_command = std::process::Command::new(program);
+        std_command.process_group(0);
+        std_command
+    };
+    #[cfg(not(any(target_os = "windows", unix)))]
+    let std_command = std::process::Command::new(program);
+    let mut command = TokioCommand::from(std_command);
+    command.kill_on_drop(true);
+    command
+}
+
+/// Run `<tool> --version` and return its output. Callers must have
+/// verified the tool first (`verify_tool_on_disk`): a binary swapped
+/// in after install must not run, even for --version. Times out: a
+/// hung tool must not hang the caller (Settings, the update check)
+/// forever. Kept separate from verification so `tool_status` hashes
+/// the binary once, not twice.
 async fn run_tool_version(tool: YtDlpTool) -> Option<String> {
-    // Never execute a tool that failed verification: a binary swapped
-    // in after install must not run, even for --version.
-    if verify_tool_on_disk(tool).await.is_err() {
-        return None;
-    }
-    let output = TokioCommand::new(tool_path(tool))
-        .arg("--version")
-        .output()
-        .await
-        .ok()?;
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        hidden_tokio_command(tool_path(tool)).arg("--version").output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -264,13 +405,21 @@ pub struct ToolDownloadProgress {
 /// the tool.
 /// Check a downloaded tool file against its pinned SHA256 before it
 /// is installed. A mismatch refuses the file outright — the temp file
-/// is discarded by the caller, nothing is installed.
+/// is discarded by the caller, nothing is installed. Every platform
+/// has a pin now (see `pinned_sha256`), so a first install is
+/// verified against the release hash, not trusted on first use. The
+/// `None` arm below is only the fallback for a future platform with
+/// no pin recorded yet: there the digest is accepted and recorded in
+/// the sidecar at install time, so later launches still verify the
+/// file — trust on first use, not trust forever.
 fn verify_tool_digest(tool: YtDlpTool, digest: &str) -> Result<()> {
-    if digest != tool.sha256() {
-        return Err(anyhow!(
-            "The {} download failed verification (SHA256 mismatch) — the file was discarded, nothing was installed",
-            tool.display_name()
-        ));
+    if let Some(pin) = tool.pinned_sha256() {
+        if digest != pin {
+            return Err(anyhow!(
+                "The {} download failed verification (SHA256 mismatch) — the file was discarded, nothing was installed",
+                tool.display_name()
+            ));
+        }
     }
     Ok(())
 }
@@ -284,7 +433,8 @@ fn verify_tool_digest(tool: YtDlpTool, digest: &str) -> Result<()> {
 /// the expected hash:
 /// - a `.sha256` sidecar next to the tool (written at download time,
 ///   and rewritten by the updater after `yt-dlp -U`), if one exists;
-/// - else the pinned hash for yt-dlp;
+/// - else the pinned hash for yt-dlp (recorded for every platform —
+///   a yt-dlp file with no sidecar is checked against the pin);
 /// - Deno has no pinned hash for the extracted exe (the pin is the
 ///   ZIP's hash), so a Deno file with no sidecar is trusted on FIRST
 ///   use and its hash is recorded in a sidecar then — a later swap
@@ -301,7 +451,7 @@ fn read_expected_tool_hash(tool: YtDlpTool) -> Option<String> {
         }
     }
     match tool {
-        YtDlpTool::YtDlp => Some(YTDLP_EXE_SHA256.to_string()),
+        YtDlpTool::YtDlp => tool.pinned_sha256().map(str::to_string),
         YtDlpTool::Deno => None,
     }
 }
@@ -367,6 +517,12 @@ pub async fn download_tool(
     let temp = dir.join(format!(".{}-download.tmp", tool.file_name()));
     let client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 ThunderLoad/0.1")
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .read_timeout(std::time::Duration::from_secs(30))
+        .redirect(crate::session::validated_redirect_policy())
+        .dns_resolver(std::sync::Arc::new(
+            crate::session::ValidatingResolver::from_env(),
+        ))
         .build()
         .context("Could not build the download client")?;
     let response = client
@@ -418,6 +574,15 @@ pub async fn download_tool(
             tokio::fs::rename(&temp, &target)
                 .await
                 .with_context(|| format!("Cannot install {}", temp.display()))?;
+            // Unix binaries need the executable bit: a freshly
+            // renamed download is 0644, and yt-dlp would fail to
+            // spawn with "permission denied" on every launch.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+                    .with_context(|| format!("Could not make {} executable", target.display()))?;
+            }
             // The digest was just verified against the pin: record it
             // so every later launch can re-verify this file.
             write_tool_hash_sidecar(tool, &digest);
@@ -427,7 +592,8 @@ pub async fn download_tool(
             let _ = tokio::fs::remove_file(&temp).await;
             if !target.is_file() {
                 return Err(anyhow!(
-                    "The Deno download unpacked but deno.exe was not found in it"
+                    "The Deno download unpacked but {} was not found in it",
+                    tool.file_name()
                 ));
             }
             // The zip was verified; record the EXTRACTED exe's hash —
@@ -453,11 +619,12 @@ fn powershell_quote(value: &str) -> String {
 
 /// Extract the verified Deno zip. Windows uses PowerShell's
 /// Expand-Archive (always present); elsewhere `unzip` is used. The
-/// zip holds deno.exe at its top level.
+/// zip holds the Deno binary at its top level (`deno.exe` on
+/// Windows, `deno` elsewhere).
 async fn extract_deno_zip(zip: &Path, dir: &Path) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
-        let status = TokioCommand::new("powershell")
+        let status = hidden_tokio_command("powershell")
             .args([
                 "-NoProfile",
                 "-NonInteractive",
@@ -478,10 +645,10 @@ async fn extract_deno_zip(zip: &Path, dir: &Path) -> Result<()> {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let status = TokioCommand::new("unzip")
+        let status = hidden_tokio_command("unzip")
             .args(["-o", "-j"])
             .arg(zip)
-            .arg("deno.exe")
+            .arg(YtDlpTool::Deno.file_name())
             .arg("-d")
             .arg(dir)
             .status()
@@ -523,11 +690,15 @@ pub async fn ensure_tool(
 pub async fn check_ytdlp_update() -> Result<String> {
     // Verify before executing: a swapped binary must not run -U.
     verify_tool_on_disk(YtDlpTool::YtDlp).await?;
-    let output = TokioCommand::new(tool_path(YtDlpTool::YtDlp))
-        .arg("-U")
-        .output()
-        .await
-        .context("Could not run the yt-dlp updater")?;
+    // -U downloads a new binary, so this gets a generous timeout
+    // instead of hanging the caller forever on a stalled network.
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        hidden_tokio_command(tool_path(YtDlpTool::YtDlp)).arg("-U").output(),
+    )
+    .await
+    .map_err(|_| anyhow!("The yt-dlp update timed out after 120 seconds"))?
+    .context("Could not run the yt-dlp updater")?;
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -537,10 +708,14 @@ pub async fn check_ytdlp_update() -> Result<String> {
     if output.status.success() {
         // -U replaced the binary on disk: record its new hash so
         // later launches still verify, and report the version that
-        // is actually installed now.
+        // is actually installed now. Re-verify the new binary against
+        // the hash just recorded before running it — the update
+        // itself is the window a swap would use.
         if let Ok(hash) = hash_tool_file(YtDlpTool::YtDlp).await {
             write_tool_hash_sidecar(YtDlpTool::YtDlp, &hash);
         }
+        verify_tool_on_disk(YtDlpTool::YtDlp).await
+            .context("The yt-dlp update produced a binary that failed verification")?;
         let on_disk = run_tool_version(YtDlpTool::YtDlp)
             .await
             .unwrap_or_else(|| YTDLP_VERSION.to_string());
@@ -602,22 +777,31 @@ struct TempCookiesFile {
 
 impl TempCookiesFile {
     async fn write(session: &SessionHeaders, url: &str) -> Result<Option<Self>> {
+        if !session.cookies_apply_to(url) {
+            return Ok(None);
+        }
         let cookies = match &session.cookies {
             Some(cookies) if !cookies.trim().is_empty() => cookies.clone(),
             _ => return Ok(None),
         };
-        let origin = session.origin.clone().unwrap_or_else(|| {
-            url::Url::parse(url)
-                .map(|parsed| parsed.origin().ascii_serialization())
-                .unwrap_or_default()
-        });
-        let domain = url::Url::parse(&origin)
+        let Some(origin) = &session.origin else {
+            return Ok(None);
+        };
+        let domain = url::Url::parse(origin)
             .ok()
             .and_then(|parsed| parsed.host_str().map(str::to_string))
             .unwrap_or_default();
         if domain.is_empty() {
             return Ok(None);
         }
+        let secure = if url
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+        {
+            "TRUE"
+        } else {
+            "FALSE"
+        };
         let expiry = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() + 3600)
@@ -637,15 +821,37 @@ impl TempCookiesFile {
             if name.contains(['\t', '\n', '\r']) || value.contains(['\t', '\n', '\r']) {
                 continue;
             }
-            text.push_str(&format!("{domain}\tTRUE\t/\tFALSE\t{expiry}\t{name}\t{value}\n"));
+            // The second field is "include subdomains": FALSE keeps
+            // these cookies exact-origin, matching the session policy
+            // that only ever sends them to the page's own origin.
+            // TRUE used to widen them to every subdomain.
+            text.push_str(&format!("{domain}\tFALSE\t/\t{secure}\t{expiry}\t{name}\t{value}\n"));
         }
         let path = std::env::temp_dir().join(format!(
             "thunderload-cookies-{}.txt",
             uuid::Uuid::new_v4()
         ));
-        tokio::fs::write(&path, text)
-            .await
-            .context("Could not write the temporary cookies file")?;
+        #[cfg(unix)]
+        {
+            let mut options = tokio::fs::OpenOptions::new();
+            options.create_new(true).write(true).mode(0o600);
+            let mut file = options
+                .open(&path)
+                .await
+                .context("Could not write the temporary cookies file")?;
+            file.write_all(text.as_bytes())
+                .await
+                .context("Could not write the temporary cookies file")?;
+            file.flush()
+                .await
+                .context("Could not write the temporary cookies file")?;
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::fs::write(&path, text)
+                .await
+                .context("Could not write the temporary cookies file")?;
+        }
         Ok(Some(Self { path }))
     }
 }
@@ -705,6 +911,8 @@ pub async fn inspect_page_with(
     session: Option<&SessionHeaders>,
     force_generic: bool,
 ) -> Result<YtDlpInspect> {
+    // N2: the full public-URL validator, not a scheme-only check.
+    crate::session::validate_public_http_url(url).context("Invalid page URL")?;
     // Verified before executing: missing → ToolsMissing (consent UI),
     // swapped → a plain refusal. Never run an unverified binary.
     verify_tool_on_disk(YtDlpTool::YtDlp).await?;
@@ -712,13 +920,12 @@ pub async fn inspect_page_with(
         Some(session) => TempCookiesFile::write(session, url).await?,
         None => None,
     };
-    let mut command = TokioCommand::new(tool_path(YtDlpTool::YtDlp));
+    let mut command = hidden_tokio_command(tool_path(YtDlpTool::YtDlp));
     command
         .arg("-j")
         .arg("--no-download")
         .arg("--no-playlist")
-        .arg("--no-warnings")
-        .arg(url);
+        .arg("--no-warnings");
     if force_generic {
         command.arg("--force-generic-extractor");
     }
@@ -737,6 +944,7 @@ pub async fn inspect_page_with(
             command.arg("--user-agent").arg(user_agent);
         }
     }
+    command.arg("--").arg(url);
     command.env("PATH", child_path_with_tools());
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
@@ -772,8 +980,10 @@ pub async fn inspect_page_with(
     let status = tokio::select! {
         status = child.wait() => status.context("Could not run yt-dlp")?,
         _ = tokio::time::sleep(inspect_timeout()) => {
-            let _ = child.kill().await;
+            kill_process_tree(&mut child).await;
             let _ = child.wait().await;
+            stdout_task.abort();
+            stderr_task.abort();
             return Err(anyhow!(
                 "Getting formats took too long — the site may be slow or blocking the request"
             ));
@@ -1117,7 +1327,7 @@ async fn kill_process_tree(child: &mut tokio::process::Child) {
     };
     #[cfg(target_os = "windows")]
     {
-        let _ = TokioCommand::new("taskkill")
+        let _ = hidden_tokio_command("taskkill")
             .args(["/T", "/F", "/PID"])
             .arg(pid.to_string())
             .output()
@@ -1126,9 +1336,46 @@ async fn kill_process_tree(child: &mut tokio::process::Child) {
     }
     #[cfg(not(target_os = "windows"))]
     {
+        let _ = TokioCommand::new("kill")
+            .args(["-9", &format!("-{pid}")])
+            .status()
+            .await;
         let _ = child.kill().await;
-        let _ = pid;
     }
+}
+
+fn is_audio_only_selector(selector: &str) -> bool {
+    if selector.contains('+') {
+        return false;
+    }
+    let lower = selector.to_ascii_lowercase();
+    let first = lower.split('/').next().unwrap_or(&lower).trim();
+    let base = first.split('[').next().unwrap_or(first).trim();
+    matches!(
+        base,
+        "bestaudio"
+            | "bestaudio*"
+            | "worstaudio"
+            | "worstaudio*"
+            | "ba"
+            | "ba*"
+            | "wa"
+            | "wa*"
+            | "139"
+            | "140"
+            | "141"
+            | "233"
+            | "234"
+            | "249"
+            | "250"
+            | "251"
+            | "599"
+            | "600"
+    ) || first.contains("vcodec=none")
+        || base.starts_with("audio")
+        || base.ends_with("-audio")
+        || base.ends_with("_audio")
+        || base.contains("audio_only")
 }
 
 /// Download one page URL with yt-dlp, directly (not extract-only).
@@ -1151,8 +1398,16 @@ pub async fn download_page(
     mut control: watch::Receiver<DownloadControl>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
 ) -> Result<(DownloadOutcome, Option<PathBuf>)> {
-    if format_selector.trim().is_empty() {
+    // N2: the full public-URL validator, not a scheme-only check.
+    crate::session::validate_public_http_url(url).context("Invalid page URL")?;
+    let trimmed_selector = format_selector.trim();
+    if trimmed_selector.is_empty() {
         return Err(anyhow!("No format was selected for this download"));
+    }
+    if trimmed_selector.starts_with('-')
+        || format_selector.chars().any(|c| matches!(c, '\r' | '\n' | '\0'))
+    {
+        return Err(anyhow!("Invalid format selector"));
     }
     // Verified before executing: missing → ToolsMissing (consent UI),
     // swapped → a plain refusal. Never run an unverified binary.
@@ -1172,11 +1427,12 @@ pub async fn download_page(
             let _ = tokio::fs::remove_file(&target).await;
         }
     }
-    let outtmpl = format!("{}.%(ext)s", stem.to_string_lossy());
-    let mut command = TokioCommand::new(tool_path(YtDlpTool::YtDlp));
+    let escaped_stem = stem.to_string_lossy().replace('%', "%%");
+    let outtmpl = format!("{escaped_stem}.%(ext)s");
+    let mut command = hidden_tokio_command(tool_path(YtDlpTool::YtDlp));
     command
         .arg("-f")
-        .arg(format_selector)
+        .arg(trimmed_selector)
         .arg("-o")
         .arg(&outtmpl)
         .arg("--newline")
@@ -1187,12 +1443,25 @@ pub async fn download_page(
         .arg("--retries")
         .arg("10")
         .arg("--fragment-retries")
-        .arg("10")
-        .arg("--merge-output-format")
-        .arg("mp4")
-        .arg("--remux-video")
-        .arg("mp4")
-        .arg(url);
+        .arg("10");
+    if !is_audio_only_selector(trimmed_selector) {
+        command
+            .arg("--merge-output-format")
+            .arg("mp4");
+        // `--remux-video mp4` only when the target container actually
+        // needs it (an .mp4 target) and FFmpeg is present to do it. A
+        // muxed WebM row (a .webm target, requires_ffmpeg None) must
+        // never get it — remuxing WebM to MP4 fails — and without
+        // FFmpeg the flag only makes yt-dlp error out.
+        let target_is_mp4 = target.extension().and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("mp4"));
+        if target_is_mp4 && crate::video::ffmpeg_available().await {
+            command.arg("--remux-video").arg("mp4");
+        }
+    }
+    if let Some(ffmpeg_path) = crate::video::configured_ffmpeg_path() {
+        command.arg("--ffmpeg-location").arg(ffmpeg_path);
+    }
     if is_youtube_url(url) {
         command.arg("--extractor-args");
         command.arg(format!("youtube:player-client={PLAYER_CLIENT_CHAIN}"));
@@ -1208,9 +1477,20 @@ pub async fn download_page(
             command.arg("--user-agent").arg(user_agent);
         }
     }
+    command.arg("--").arg(url);
     command.env("PATH", child_path_with_tools());
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
+    // A pause/cancel that arrived while the tool was being verified
+    // or the cookies written must stop the spawn, not start a child
+    // the loop below would only notice after its first line.
+    if *control.borrow() == DownloadControl::Cancelled {
+        cleanup_partial(&stem).await;
+        return Ok((DownloadOutcome::Cancelled, None));
+    }
+    if *control.borrow() == DownloadControl::Paused {
+        return Ok((DownloadOutcome::Paused, None));
+    }
     let mut child = command
         .spawn()
         .context("Could not start yt-dlp")?;
@@ -1220,7 +1500,7 @@ pub async fn download_page(
     // stderr pipe would hang forever, and its text is the failure
     // label when the run fails.
     let stderr_text = Arc::new(std::sync::Mutex::new(String::new()));
-    let stderr_task = {
+    let mut stderr_task = {
         let stderr_text = Arc::clone(&stderr_text);
         tokio::spawn(async move {
             if let Some(stderr) = stderr {
@@ -1279,7 +1559,7 @@ pub async fn download_page(
                         // stdout closed; the child is finishing.
                         match child.try_wait() {
                             Ok(Some(status)) => {
-                                break finish_download(status, target, &stem, &stderr_text, last_progress.clone()).await;
+                                break finish_download(status, target, &stem, &stderr_text, &mut stderr_task, last_progress.clone()).await;
                             }
                             Ok(None) => {
                                 // stdout closed but the child lives on
@@ -1293,7 +1573,7 @@ pub async fn download_page(
                                     tokio::select! {
                                         result = child.wait() => {
                                             break match result {
-                                                Ok(status) => finish_download(status, target, &stem, &stderr_text, last_progress.clone()).await,
+                                                Ok(status) => finish_download(status, target, &stem, &stderr_text, &mut stderr_task, last_progress.clone()).await,
                                                 Err(error) => Err(anyhow!(error)),
                                             };
                                         }
@@ -1338,7 +1618,7 @@ pub async fn download_page(
             // the loop breaks, so it cannot help here either.
             result = child.wait() => {
                 break match result {
-                    Ok(status) => finish_download(status, target, &stem, &stderr_text, last_progress.clone()).await,
+                    Ok(status) => finish_download(status, target, &stem, &stderr_text, &mut stderr_task, last_progress.clone()).await,
                     Err(error) => Err(anyhow!(error)),
                 };
             }
@@ -1382,6 +1662,7 @@ async fn finish_download(
     target: &Path,
     stem: &Path,
     stderr_text: &Arc<std::sync::Mutex<String>>,
+    stderr_task: &mut tokio::task::JoinHandle<()>,
     last_progress: Option<DownloadProgress>,
 ) -> Result<(DownloadOutcome, Option<PathBuf>)> {
     if status.success() {
@@ -1402,6 +1683,11 @@ async fn finish_download(
                 .unwrap_or_default()
         ));
     }
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        stderr_task,
+    )
+    .await;
     let stderr = stderr_text
         .lock()
         .map(|text| text.clone())
@@ -1409,17 +1695,40 @@ async fn finish_download(
     Err(anyhow!("{}", failure_label(&stderr)))
 }
 
+/// Media containers yt-dlp can produce for a download. Sibling files
+/// that share the stem but are not media (`.vtt` subtitles, `.jpg`
+/// thumbnails, `.info.json`) must never shadow the finished file.
+const MEDIA_EXTENSIONS: [&str; 13] = [
+    "mp4", "webm", "mkv", "mov", "m4v", "ts", "m4a", "mp3", "opus", "ogg", "wav", "flac", "aac",
+];
+
 /// The single finished file for a stem: files in the same directory
 /// whose stem matches, excluding .part files. The caller reserved a
 /// unique name, so there is at most one.
 async fn produced_file_for_stem(stem: &Path) -> Option<PathBuf> {
-    let parent = stem.parent()?;
+    let parent = match stem.parent()? {
+        p if p.as_os_str().is_empty() => Path::new("."),
+        p => p,
+    };
     let wanted = stem.file_name()?.to_str()?;
     let mut found: Vec<PathBuf> = Vec::new();
     let mut entries = tokio::fs::read_dir(parent).await.ok()?;
     while let Ok(Some(entry)) = entries.next_entry().await {
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.ends_with(".part") || name.contains(".part.") {
+        if name.ends_with(".part")
+            || name.contains(".part.")
+            || name.ends_with(".ytdl")
+            || name.contains(".temp.")
+        {
+            continue;
+        }
+        // Only media files count: a sibling `stem.vtt` or `stem.jpg`
+        // used to make `found.len() > 1` and return None for a
+        // download that had actually finished.
+        let Some(extension) = Path::new(&name).extension().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !MEDIA_EXTENSIONS.iter().any(|media| media.eq_ignore_ascii_case(extension)) {
             continue;
         }
         if let Some(file_stem) = Path::new(&name).file_stem().and_then(|s| s.to_str()) {
@@ -1428,25 +1737,40 @@ async fn produced_file_for_stem(stem: &Path) -> Option<PathBuf> {
             }
         }
     }
-    if found.len() == 1 {
-        found.into_iter().next()
-    } else {
-        None
-    }
+    // Prefer the container yt-dlp most commonly produces, so two media
+    // files sharing a stem (e.g. an .mp4 next to a leftover .webm)
+    // still resolve instead of failing the finished download.
+    found.sort_by_key(|path| {
+        path.extension()
+            .and_then(|value| value.to_str())
+            .and_then(|value| MEDIA_EXTENSIONS.iter().position(|media| media.eq_ignore_ascii_case(value)))
+            .unwrap_or(usize::MAX)
+    });
+    found.into_iter().next()
 }
 
 async fn cleanup_partial(stem: &Path) {
-    // yt-dlp's .part files sit next to the stem; remove them and any
-    // reserved/partial target so Cancel leaves nothing behind.
+    // yt-dlp's .part / .ytdl / .temp. files sit next to the stem;
+    // only remove yt-dlp's own partial artifacts so unrelated files
+    // sharing the same stem (e.g. video.pdf, video.jpg) are never touched.
     if let Some(parent) = stem.parent() {
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
         if let Some(wanted) = stem.file_name().and_then(|name| name.to_str()) {
+            let prefix = format!("{wanted}.");
             if let Ok(mut entries) = tokio::fs::read_dir(parent).await {
                 while let Ok(Some(entry)) = entries.next_entry().await {
                     let name = entry.file_name().to_string_lossy().to_string();
-                    if let Some(file_stem) = Path::new(&name).file_stem().and_then(|s| s.to_str()) {
-                        if file_stem == wanted {
-                            let _ = tokio::fs::remove_file(entry.path()).await;
-                        }
+                    if name.starts_with(&prefix)
+                        && (name.ends_with(".part")
+                            || name.contains(".part-Frag")
+                            || name.ends_with(".ytdl")
+                            || name.contains(".temp."))
+                    {
+                        let _ = tokio::fs::remove_file(entry.path()).await;
                     }
                 }
             }
@@ -1628,28 +1952,75 @@ mod tests {
         std::env::set_var("THUNDERLOAD_TOOLS_DIR", "/tmp/thunderload-tools-test");
         assert_eq!(
             tool_path(YtDlpTool::YtDlp),
-            PathBuf::from("/tmp/thunderload-tools-test/yt-dlp.exe")
+            PathBuf::from("/tmp/thunderload-tools-test").join(YtDlpTool::YtDlp.file_name())
         );
         assert_eq!(
             tool_path(YtDlpTool::Deno),
-            PathBuf::from("/tmp/thunderload-tools-test/deno.exe")
+            PathBuf::from("/tmp/thunderload-tools-test").join(YtDlpTool::Deno.file_name())
         );
         std::env::remove_var("THUNDERLOAD_TOOLS_DIR");
     }
 
-    #[tokio::test]
-    async fn sha256_verification_accepts_good_and_rejects_bad() {
-        let dir = std::env::temp_dir().join("thunderload-sha-test");
-        let _ = tokio::fs::create_dir_all(&dir).await;
-        let file = dir.join("abc.bin");
-        tokio::fs::write(&file, b"abc").await.unwrap();
-        // SHA256("abc") — the standard test vector.
-        let expected = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
-        let bytes = tokio::fs::read(&file).await.unwrap();
-        let mut hasher = Sha256::new();
-        hasher.update(&bytes);
-        assert_eq!(format!("{:x}", hasher.finalize()), expected);
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+    #[test]
+    fn tool_file_names_and_download_urls_are_per_os() {
+        // P0-13b: no `.exe` and no Windows asset URL off Windows.
+        if cfg!(target_os = "windows") {
+            assert_eq!(YtDlpTool::YtDlp.file_name(), "yt-dlp.exe");
+            assert_eq!(YtDlpTool::Deno.file_name(), "deno.exe");
+            assert!(YtDlpTool::YtDlp.download_url().ends_with("yt-dlp.exe"));
+            assert!(YtDlpTool::Deno
+                .download_url()
+                .ends_with("deno-x86_64-pc-windows-msvc.zip"));
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(YtDlpTool::YtDlp.file_name(), "yt-dlp");
+            assert_eq!(YtDlpTool::Deno.file_name(), "deno");
+            assert!(YtDlpTool::YtDlp.download_url().ends_with("yt-dlp_macos"));
+            assert!(YtDlpTool::Deno.download_url().contains("apple-darwin"));
+        } else {
+            assert_eq!(YtDlpTool::YtDlp.file_name(), "yt-dlp");
+            assert_eq!(YtDlpTool::Deno.file_name(), "deno");
+            assert!(YtDlpTool::YtDlp.download_url().ends_with("yt-dlp_linux"));
+            assert!(YtDlpTool::Deno
+                .download_url()
+                .ends_with("deno-x86_64-unknown-linux-gnu.zip"));
+        }
+        assert!(YtDlpTool::YtDlp.download_url().contains(YTDLP_VERSION));
+        assert!(YtDlpTool::Deno.download_url().contains(DENO_VERSION));
+    }
+
+    #[test]
+    fn sha256_verification_accepts_good_and_rejects_bad() {
+        // The old version of this test hashed the literal b"abc" and
+        // never called the function under test. This one exercises
+        // verify_tool_digest itself; SHA256("abc") is only an
+        // arbitrary wrong value here.
+        let wrong = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        match YtDlpTool::YtDlp.pinned_sha256() {
+            Some(pin) => {
+                assert!(verify_tool_digest(YtDlpTool::YtDlp, pin).is_ok());
+                assert!(verify_tool_digest(YtDlpTool::YtDlp, wrong).is_err());
+                // A good hash for the wrong tool is still a mismatch.
+                assert!(verify_tool_digest(YtDlpTool::YtDlp, DENO_ZIP_SHA256).is_err());
+            }
+            None => {
+                // No pin recorded for this platform — every platform
+                // has one now, so reaching this arm means a pin went
+                // missing: a wrong digest must still be rejected,
+                // never silently trusted on first use.
+                assert!(verify_tool_digest(YtDlpTool::YtDlp, wrong).is_err());
+            }
+        }
+        match YtDlpTool::Deno.pinned_sha256() {
+            Some(pin) => {
+                assert!(verify_tool_digest(YtDlpTool::Deno, pin).is_ok());
+                assert!(verify_tool_digest(YtDlpTool::Deno, wrong).is_err());
+            }
+            None => {
+                // As above: a missing pin must not silently become
+                // trust on first use.
+                assert!(verify_tool_digest(YtDlpTool::Deno, wrong).is_err());
+            }
+        }
     }
 
     // Serializes every test that points THUNDERLOAD_TOOLS_DIR at a
@@ -1659,7 +2030,7 @@ mod tests {
     static TOOLS_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn write_fake_ytdlp(dir: &std::path::Path, script: &str) -> PathBuf {
-        let path = dir.join("yt-dlp.exe");
+        let path = dir.join(YtDlpTool::YtDlp.file_name());
         std::fs::write(&path, script).unwrap();
         #[cfg(unix)]
         {
@@ -1675,18 +2046,23 @@ mod tests {
     /// is not the pinned one). Used by every test that spawns the fake
     /// and by the verification tests (which never execute it). The
     /// sidecar is written to `dir` directly (same name the production
-    /// code uses: `.yt-dlp.exe.sha256`): the tests set
+    /// code uses: `.{file_name}.sha256`): the tests set
     /// THUNDERLOAD_TOOLS_DIR only after writing the fake, so resolving
     /// the path through tools_dir() here would point at the wrong
     /// (possibly nonexistent) directory.
     fn write_verified_fake_ytdlp(dir: &std::path::Path, script: &str) -> PathBuf {
         let path = write_fake_ytdlp(dir, script);
         let hash = format!("{:x}", Sha256::digest(std::fs::read(&path).unwrap()));
-        std::fs::write(dir.join(".yt-dlp.exe.sha256"), hash).unwrap();
+        std::fs::write(
+            dir.join(format!(".{}.sha256", YtDlpTool::YtDlp.file_name())),
+            hash,
+        )
+        .unwrap();
         path
     }
 
-    // NOTE (fix round): the fakes are shell scripts named yt-dlp.exe.
+    // NOTE (fix round): the fakes are shell scripts named after the
+    // platform tool file (`yt-dlp` / `yt-dlp.exe`).
     // They execute on Unix only — Windows CreateProcess cannot run a
     // text file named .exe (ERROR_BAD_EXE_FORMAT), and Windows CI runs
     // `cargo test --workspace`, so the three Slice 3 tests that spawned
@@ -1709,12 +2085,12 @@ for a in "$@"; do
 done
 stem=$(printf '%s' "$out" | sed 's/\.%(ext)s$//')
 echo "download: 10.0%|1024|10240|1.0KiB/s|00:09"
-if [ -f "$stem.part" ]; then
-  mv "$stem.part" "$stem.mp4"
+if [ -f "$stem.mp4.part" ]; then
+  mv "$stem.mp4.part" "$stem.mp4"
   echo "download: 100.0%|10240|10240|1.0MiB/s|00:00"
   exit 0
 fi
-printf 'partial content' > "$stem.part"
+printf 'partial content' > "$stem.mp4.part"
 exec sleep 30
 "#
         .to_string()
@@ -1722,16 +2098,46 @@ exec sleep 30
 
     #[test]
     fn verify_tool_digest_accepts_pinned_and_rejects_other() {
-        assert!(verify_tool_digest(YtDlpTool::YtDlp, YTDLP_EXE_SHA256).is_ok());
-        assert!(verify_tool_digest(YtDlpTool::Deno, DENO_ZIP_SHA256).is_ok());
-        let bad = verify_tool_digest(
-            YtDlpTool::YtDlp,
-            "0000000000000000000000000000000000000000000000000000000000000000",
-        );
-        assert!(bad.is_err());
-        assert!(bad.unwrap_err().to_string().contains("SHA256 mismatch"));
-        // A good hash for the wrong tool is still a mismatch.
-        assert!(verify_tool_digest(YtDlpTool::YtDlp, DENO_ZIP_SHA256).is_err());
+        // Pins are recorded in code for every platform (see
+        // pinned_sha256) — a wrong digest is rejected at download
+        // time on all of them.
+        #[cfg(target_os = "windows")]
+        {
+            assert!(verify_tool_digest(YtDlpTool::YtDlp, YTDLP_EXE_SHA256).is_ok());
+            assert!(verify_tool_digest(YtDlpTool::Deno, DENO_ZIP_SHA256).is_ok());
+            let bad = verify_tool_digest(
+                YtDlpTool::YtDlp,
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            );
+            assert!(bad.is_err());
+            assert!(bad.unwrap_err().to_string().contains("SHA256 mismatch"));
+            // A good hash for the wrong tool is still a mismatch.
+            assert!(verify_tool_digest(YtDlpTool::YtDlp, DENO_ZIP_SHA256).is_err());
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            // Pins are recorded for this platform too (see
+            // pinned_sha256): the platform pin is accepted, a wrong
+            // digest is rejected, and the other tool's pin is still
+            // a mismatch — no trust on first use.
+            let ytdlp_pin = YtDlpTool::YtDlp
+                .pinned_sha256()
+                .expect("yt-dlp pin recorded");
+            let deno_pin = YtDlpTool::Deno
+                .pinned_sha256()
+                .expect("Deno pin recorded");
+            assert!(verify_tool_digest(YtDlpTool::YtDlp, ytdlp_pin).is_ok());
+            assert!(verify_tool_digest(YtDlpTool::Deno, deno_pin).is_ok());
+            let bad = verify_tool_digest(
+                YtDlpTool::YtDlp,
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            );
+            assert!(bad.is_err());
+            assert!(bad.unwrap_err().to_string().contains("SHA256 mismatch"));
+            // A good hash for the wrong tool is still a mismatch.
+            assert!(verify_tool_digest(YtDlpTool::YtDlp, deno_pin).is_err());
+            assert!(verify_tool_digest(YtDlpTool::Deno, ytdlp_pin).is_err());
+        }
     }
 
     #[tokio::test]
@@ -1823,7 +2229,7 @@ exec sleep 30
         assert!(matches!(outcome, DownloadOutcome::Paused));
         assert!(produced.is_none());
         assert!(
-            dir.join("video.part").is_file(),
+            dir.join("video.mp4.part").is_file(),
             "pause must keep the .part file"
         );
         // Resume: the same command, same target — the fake finishes it.
@@ -1842,7 +2248,7 @@ exec sleep 30
         assert!(matches!(outcome2, DownloadOutcome::Completed));
         assert_eq!(produced2, Some(dir.join("video.mp4")));
         assert!(dir.join("video.mp4").is_file());
-        assert!(!dir.join("video.part").exists());
+        assert!(!dir.join("video.mp4.part").exists());
         std::env::remove_var("THUNDERLOAD_TOOLS_DIR");
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -1884,10 +2290,50 @@ exec sleep 30
         assert!(matches!(outcome, DownloadOutcome::Cancelled));
         assert!(produced.is_none());
         assert!(
-            !dir.join("video.part").exists(),
+            !dir.join("video.mp4.part").exists(),
             "cancel must delete the .part file"
         );
         std::env::remove_var("THUNDERLOAD_TOOLS_DIR");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_partial_removes_partials_but_keeps_unrelated_files() {
+        // P0-01: call cleanup_partial directly — a real video.mp4.part
+        // must go, while a video.pdf sharing the same stem (the decoy)
+        // and the finished video.mp4 must survive. The whitelist is
+        // "{stem}." + .part / .part-Frag / .ytdl / .temp. — a file
+        // that only shares the stem is never touched.
+        let dir = std::env::temp_dir()
+            .join(format!("thunderload-cleanup-partial-{}", uuid::Uuid::new_v4()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("video.mp4.part"), b"partial").await.unwrap();
+        tokio::fs::write(dir.join("video.mp4.part-Frag0"), b"fragment").await.unwrap();
+        tokio::fs::write(dir.join("video.mp4.ytdl"), b"info").await.unwrap();
+        tokio::fs::write(dir.join("video.pdf"), b"decoy").await.unwrap();
+        tokio::fs::write(dir.join("video.mp4"), b"finished").await.unwrap();
+        cleanup_partial(&dir.join("video")).await;
+        assert!(
+            !dir.join("video.mp4.part").exists(),
+            "the real .part file must be deleted"
+        );
+        assert!(
+            !dir.join("video.mp4.part-Frag0").exists(),
+            "a .part-Frag file must be deleted"
+        );
+        assert!(
+            !dir.join("video.mp4.ytdl").exists(),
+            "a .ytdl file must be deleted"
+        );
+        assert!(
+            dir.join("video.pdf").is_file(),
+            "the video.pdf decoy must survive"
+        );
+        assert!(
+            dir.join("video.mp4").is_file(),
+            "the finished video.mp4 must survive"
+        );
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
@@ -1936,11 +2382,12 @@ exec sleep 30
         write_verified_fake_ytdlp(&dir, "#!/bin/sh\nexit 0\n");
         assert!(verify_tool_on_disk(YtDlpTool::YtDlp).await.is_ok());
         // Swap the binary afterwards: same path, different bytes.
-        std::fs::write(dir.join("yt-dlp.exe"), b"tampered").unwrap();
+        std::fs::write(dir.join(YtDlpTool::YtDlp.file_name()), b"tampered").unwrap();
         let error = verify_tool_on_disk(YtDlpTool::YtDlp).await.unwrap_err();
         assert!(error.to_string().contains("SHA256 mismatch"));
-        // No sidecar at all: the pinned hash applies, so a fake that
-        // is not the pinned binary is refused.
+        // No sidecar at all: the pinned hash applies on every
+        // platform now, so a fake that is not the pinned binary is
+        // refused; a later swap is still caught (above).
         let _ = std::fs::remove_file(tool_hash_sidecar_path(YtDlpTool::YtDlp));
         assert!(verify_tool_on_disk(YtDlpTool::YtDlp).await.is_err());
         std::env::remove_var("THUNDERLOAD_TOOLS_DIR");
@@ -1956,7 +2403,7 @@ exec sleep 30
         std::env::set_var("THUNDERLOAD_TOOLS_DIR", &dir);
         // A manual Deno drop: no sidecar, no pinned exe hash — the
         // first use trusts it and records the hash.
-        let deno = dir.join("deno.exe");
+        let deno = dir.join(YtDlpTool::Deno.file_name());
         std::fs::write(&deno, b"fake-deno").unwrap();
         assert!(!tool_hash_sidecar_path(YtDlpTool::Deno).exists());
         assert!(verify_tool_on_disk(YtDlpTool::Deno).await.is_ok());
@@ -1976,12 +2423,15 @@ exec sleep 30
         tokio::fs::create_dir_all(&dir).await.unwrap();
         std::env::set_var("THUNDERLOAD_TOOLS_DIR", &dir);
         write_verified_fake_ytdlp(&dir, "#!/bin/sh\nexit 0\n");
-        let before = std::fs::read(dir.join("yt-dlp.exe")).unwrap();
+        let before = std::fs::read(dir.join(YtDlpTool::YtDlp.file_name())).unwrap();
         // No progress channel needed: a present, verified tool returns
         // without downloading (no network is touched).
         let path = ensure_tool(YtDlpTool::YtDlp, None).await.unwrap();
-        assert_eq!(path, dir.join("yt-dlp.exe"));
-        assert_eq!(std::fs::read(dir.join("yt-dlp.exe")).unwrap(), before);
+        assert_eq!(path, dir.join(YtDlpTool::YtDlp.file_name()));
+        assert_eq!(
+            std::fs::read(dir.join(YtDlpTool::YtDlp.file_name())).unwrap(),
+            before
+        );
         std::env::remove_var("THUNDERLOAD_TOOLS_DIR");
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -2224,5 +2674,67 @@ printf 'partial content' > "$stem.part"
         );
         std::env::remove_var("THUNDERLOAD_TOOLS_DIR");
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn audio_only_selector_recognises_audio_ids_and_combos() {
+        // Audio-only selectors (single ids, bestaudio, vcodec=none)
+        // must never get --remux-video mp4; combined selectors must.
+        assert!(is_audio_only_selector("bestaudio"));
+        assert!(is_audio_only_selector("ba"));
+        assert!(is_audio_only_selector("140"));
+        assert!(is_audio_only_selector("251"));
+        assert!(is_audio_only_selector("140[vcodec=none]"));
+        assert!(is_audio_only_selector("bestaudio/best"));
+        assert!(!is_audio_only_selector("137+140"));
+        assert!(!is_audio_only_selector("248+251"));
+        assert!(!is_audio_only_selector("137"));
+        assert!(!is_audio_only_selector("bestvideo+bestaudio"));
+        assert!(!is_audio_only_selector("best"));
+    }
+
+    #[tokio::test]
+    async fn produced_file_for_stem_ignores_non_media_siblings() {
+        let dir = std::env::temp_dir()
+            .join(format!("thunderload-produced-stem-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        // The finished file plus the siblings yt-dlp leaves next to
+        // it: subtitles, a thumbnail, a leftover .part and an info
+        // file. The old code returned None whenever more than one
+        // file shared the stem.
+        tokio::fs::write(dir.join("video.mp4"), b"media").await.unwrap();
+        tokio::fs::write(dir.join("video.en.vtt"), b"subs").await.unwrap();
+        tokio::fs::write(dir.join("video.jpg"), b"thumb").await.unwrap();
+        tokio::fs::write(dir.join("video.mp4.part"), b"partial").await.unwrap();
+        tokio::fs::write(dir.join("video.info.json"), b"{}").await.unwrap();
+        let found = produced_file_for_stem(&dir.join("video")).await;
+        assert_eq!(found, Some(dir.join("video.mp4")));
+        // No media file at all: still None, not a sibling.
+        tokio::fs::remove_file(dir.join("video.mp4")).await.unwrap();
+        assert_eq!(produced_file_for_stem(&dir.join("video")).await, None);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn temp_cookies_file_is_exact_origin_only() {
+        let session = SessionHeaders {
+            cookies: Some("session=abc; other=def".into()),
+            origin: Some("https://example.com".into()),
+            ..Default::default()
+        };
+        let file = TempCookiesFile::write(&session, "https://example.com/watch")
+            .await
+            .unwrap()
+            .expect("cookies apply to the page origin");
+        let text = tokio::fs::read_to_string(&file.path).await.unwrap();
+        // Second field is "include subdomains": FALSE keeps the
+        // cookies exact-origin instead of widening them.
+        for line in text.lines().filter(|line| !line.starts_with('#')) {
+            assert!(
+                line.starts_with("example.com\tFALSE\t"),
+                "cookie line must be exact-origin: {line}"
+            );
+        }
+        assert!(text.contains("session\tabc"));
     }
 }

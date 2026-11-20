@@ -205,10 +205,15 @@ fn find_bytes(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
 /// from.
 fn blank_non_markup(lower: &str) -> String {
     let mut bytes = lower.as_bytes().to_vec();
+    // Script/style bodies first: a `<!--` inside JavaScript used to
+    // blank the rest of the document (the comment pass ran first and
+    // treated it as a comment opener). Blanked script bodies no longer
+    // contain `<!--`, so the comment pass after them only sees real
+    // comments.
     for (start_marker, end_marker) in [
-        ("<!--", "-->"),
         ("<script", "</script>"),
         ("<style", "</style>"),
+        ("<!--", "-->"),
     ] {
         let mut from = 0;
         while let Some(start) = find_bytes(&bytes, start_marker.as_bytes(), from) {
@@ -311,7 +316,7 @@ pub fn extract_page_media(html: &str, base_url: &str) -> PageMediaList {
         }
         if items.len() >= MAX_ITEMS {
             truncated = true;
-            continue;
+            break;
         }
         let name = name_for(&url, kind);
         items.push(PageMedia {
@@ -321,6 +326,31 @@ pub fn extract_page_media(html: &str, base_url: &str) -> PageMediaList {
         });
     }
     PageMediaList { items, truncated }
+}
+
+/// One client shared by every page fetch: a fresh `Client` per call
+/// still built its own connection pool, so keep-alive connections
+/// were re-established on every grab. `Client::clone` is cheap and
+/// shares the pool. (The fallback only runs if the fixed builder
+/// somehow fails; it is deliberately degraded rather than a panic.)
+fn shared_client() -> reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .user_agent("Mozilla/5.0 ThunderLoad/0.1")
+                .redirect(crate::session::validated_redirect_policy())
+                .dns_resolver(std::sync::Arc::new(
+                    crate::session::ValidatingResolver::from_env(),
+                ))
+                // A hung server must not hang the Tauri command forever (F4):
+                // 15 s to connect, 30 s for the whole fetch including the body.
+                .connect_timeout(std::time::Duration::from_secs(15))
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        })
+        .clone()
 }
 
 /// Fetch a page and extract its media links (desktop grabber path).
@@ -342,19 +372,8 @@ pub async fn grab_page_media_with_session(
     page_url: &str,
     session: Option<&SessionHeaders>,
 ) -> Result<PageMediaList> {
-    let parsed = Url::parse(page_url).context("Invalid page URL")?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(anyhow!("Only HTTP and HTTPS page URLs can be grabbed"));
-    }
-    let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 ThunderLoad/0.1")
-        .redirect(reqwest::redirect::Policy::limited(10))
-        // A hung server must not hang the Tauri command forever (F4):
-        // 15 s to connect, 30 s for the whole fetch including the body.
-        .connect_timeout(std::time::Duration::from_secs(15))
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .context("Could not build HTTP client")?;
+    crate::session::validate_public_http_url(page_url)?;
+    let client = shared_client();
     let request = crate::session::apply_session(session, client.get(page_url), page_url);
     let response = request
         .send()
@@ -368,6 +387,7 @@ pub async fn grab_page_media_with_session(
             None => error,
         },
     )?;
+    let final_url = response.url().to_string();
     // Read the body in chunks with a size cap (R3): an unbounded
     // `response.text()` lets a huge or streaming page eat memory for
     // the full 30 s timeout. 8 MiB is far above any real link page.
@@ -381,7 +401,7 @@ pub async fn grab_page_media_with_session(
         }
     }
     let html = String::from_utf8_lossy(&body).into_owned();
-    Ok(extract_page_media(&html, page_url))
+    Ok(extract_page_media(&html, &final_url))
 }
 
 #[cfg(test)]
@@ -455,6 +475,22 @@ mod tests {
                 <a href="https://example.com/real.mp4">real</a>"##,
             ),
             "https://example.com/page",
+        );
+        assert_eq!(list.items.len(), 1);
+        assert_eq!(list.items[0].url, "https://example.com/real.mp4");
+    }
+
+    #[test]
+    fn comment_opener_inside_script_does_not_blank_the_rest() {
+        // P2: a `<!--` inside JavaScript is not a comment opener — the
+        // old order blanked from it to the end of the document, so the
+        // real link below the script was lost.
+        let list = extract_page_media(
+            &html(
+                r#"<script>var s = '<!-- not a comment';</script>
+                <a href="https://example.com/real.mp4">real</a>"#,
+            ),
+            "https://example.com/",
         );
         assert_eq!(list.items.len(), 1);
         assert_eq!(list.items[0].url, "https://example.com/real.mp4");

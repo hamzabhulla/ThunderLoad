@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use crate::session::{apply_session, SessionHeaders, AUTH_REQUIRED_MESSAGE};
+use crate::session::{apply_session, map_auth_error, SessionHeaders, AUTH_REQUIRED_MESSAGE};
 use futures_util::StreamExt;
 use reqwest::{header, Client, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -137,7 +137,12 @@ async fn probe_range_support(client: &Client, url: &str, session: Option<&Sessio
 fn client() -> Result<Client> {
     Ok(Client::builder()
         .user_agent("ThunderLoad/0.1 (download manager)")
-        .connect_timeout(std::time::Duration::from_secs(15))
+        .connect_timeout(Duration::from_secs(15))
+        .read_timeout(READ_TIMEOUT)
+        .redirect(crate::session::validated_redirect_policy())
+        .dns_resolver(std::sync::Arc::new(
+            crate::session::ValidatingResolver::from_env(),
+        ))
         .pool_max_idle_per_host(16)
         .build()?)
 }
@@ -149,7 +154,9 @@ pub async fn download_url(
     session: Option<&SessionHeaders>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
     rate_limiter: Arc<GlobalRateLimiter>,
+    control: tokio::sync::watch::Receiver<DownloadControl>,
 ) -> Result<PathBuf> {
+    crate::session::validate_public_http_url(url)?;
     let target = next_available_path(target).await?;
     let result = async {
         let connections = connections.clamp(1, 16);
@@ -211,7 +218,14 @@ pub async fn download_url(
         if supports_ranges && total.unwrap_or(0) >= 2 * 1024 * 1024 && connections > 1 {
             match download_segmented(&client, url, &target, total.unwrap(), connections.min(16), session, if_range.as_deref(), progress_tx.clone(), rate_limiter.clone()).await {
                 Ok(path) => return Ok(path),
-                Err(_) => {
+                Err(error) => {
+                    // Auth and webpage failures are terminal: re-running
+                    // them through a full sequential GET only repeats a
+                    // request the server already refused (P1-7).
+                    let message = error.to_string();
+                    if message == AUTH_REQUIRED_MESSAGE || message == WEBPAGE_NOT_MEDIA_MESSAGE {
+                        return Err(error);
+                    }
                     // Some servers advertise byte ranges but return invalid ranges.
                     // Restart sequentially rather than leave a potentially corrupt file.
                     let _ = progress_tx.send(DownloadProgress {
@@ -221,7 +235,7 @@ pub async fn download_url(
                 }
             }
         }
-        download_sequential(&client, url, &target, total, session, progress_tx, rate_limiter).await
+        download_sequential(&client, url, &target, total, session, progress_tx, rate_limiter, control).await
     }.await;
 
     if result.is_err() {
@@ -244,11 +258,36 @@ async fn download_sequential(
     session: Option<&SessionHeaders>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
     rate_limiter: Arc<GlobalRateLimiter>,
+    mut control: tokio::sync::watch::Receiver<DownloadControl>,
 ) -> Result<PathBuf> {
     prepare_parent(target).await?;
     let temp = target.with_extension(format!("{}{}.part", target.extension().and_then(|x| x.to_str()).unwrap_or("file"), Uuid::new_v4()));
     let request = apply_session(session, client.get(url), url);
-    let response = request.send().await?.error_for_status()?;
+    // P1-4: the opening request can block up to the read timeout, so
+    // the control channel is watched while it is in flight — a cancel
+    // must interrupt the send promptly, not after 30 s. The send future
+    // is re-polled across loop iterations (never re-issued). No bytes
+    // exist yet at this point, so Pause/Cancel just end the call.
+    let mut send_fut = request.send();
+    let response = loop {
+        tokio::select! {
+            result = &mut send_fut => match result {
+                Ok(response) => break response,
+                Err(error) => return Err(map_auth_error(error)),
+            },
+            changed = control.changed() => {
+                if changed.is_err() {
+                    return Err(anyhow!(CONTROL_CLOSED_ERROR));
+                }
+                match *control.borrow() {
+                    DownloadControl::Paused => return Err(anyhow!("Download paused")),
+                    DownloadControl::Cancelled => return Err(anyhow!("Download cancelled")),
+                    DownloadControl::Running => {}
+                }
+            }
+        }
+    };
+    let response = response.error_for_status().map_err(map_auth_error)?;
     if response_is_webpage(response.headers()) {
         return Err(anyhow!(WEBPAGE_NOT_MEDIA_MESSAGE));
     }
@@ -286,6 +325,12 @@ async fn download_sequential(
             return Err(error).context("Sequential download failed; incomplete temporary file removed");
         }
     };
+    if let Some(expected) = actual_total {
+        if downloaded != expected {
+            let _ = fs::remove_file(&temp).await;
+            return Err(anyhow!("Download ended early ({downloaded} of {expected} bytes)"));
+        }
+    }
     if let Err(error) = replace_file(&temp, target).await {
         let _ = fs::remove_file(&temp).await;
         return Err(error).context("Could not commit completed download; temporary file removed");
@@ -452,6 +497,14 @@ async fn download_segmented(
 }
 
 async fn replace_file(temp: &Path, target: &Path) -> Result<()> {
+    // P0-4: rename(2) replaces the destination atomically on Unix, so
+    // the target is never deleted first — a crash mid-commit leaves
+    // either the old or the new file, never none. Windows keeps the
+    // pre-delete for now: a true atomic replace there needs
+    // ReplaceFileW via the `windows-sys` crate, which is not a
+    // dependency (adding it would touch Cargo.lock); the gap is
+    // recorded, not silently claimed fixed.
+    #[cfg(not(unix))]
     if fs::try_exists(target).await.unwrap_or(false) {
         fs::remove_file(target).await?;
     }
@@ -468,11 +521,89 @@ pub fn default_download_dir() -> PathBuf {
 }
 
 pub fn safe_filename(input: &str, fallback: &str) -> String {
-    let cleaned: String = input.chars()
+    const MAX_FILENAME_BYTES: usize = 200;
+    let cleaned: String = input
+        .chars()
+        .filter(|&c| !matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'))
         .map(|c| if c.is_control() || "<>:\"/\\|?*".contains(c) { '_' } else { c })
         .collect();
-    let cleaned = cleaned.trim().trim_matches('.');
-    if cleaned.is_empty() { fallback.to_string() } else { cleaned.to_string() }
+    let cleaned = cleaned.trim_matches(|c: char| c.is_whitespace() || c == '.');
+    if cleaned.is_empty() {
+        return fallback.to_string();
+    }
+    let mut name = guard_windows_reserved_name(cleaned.to_string());
+    if name.len() > MAX_FILENAME_BYTES {
+        let split_ext = name.rfind('.').and_then(|dot| {
+            let ext = &name[dot..];
+            if dot > 0 && ext.len() > 1 && ext.len() <= MAX_FILENAME_BYTES - 5 {
+                Some((&name[..dot], ext))
+            } else {
+                None
+            }
+        });
+        name = match split_ext {
+            Some((base, ext)) => {
+                let max_base = MAX_FILENAME_BYTES - ext.len();
+                let mut end = max_base.min(base.len());
+                while end > 0 && !base.is_char_boundary(end) {
+                    end -= 1;
+                }
+                let truncated_base = base[..end].trim_end_matches(|c: char| c.is_whitespace() || c == '.');
+                if truncated_base.is_empty() {
+                    format!("file{ext}")
+                } else {
+                    format!("{truncated_base}{ext}")
+                }
+            }
+            None => {
+                let mut end = MAX_FILENAME_BYTES.min(name.len());
+                while end > 0 && !name.is_char_boundary(end) {
+                    end -= 1;
+                }
+                let truncated = name[..end].trim_end_matches(|c: char| c.is_whitespace() || c == '.');
+                if truncated.is_empty() {
+                    fallback.to_string()
+                } else {
+                    truncated.to_string()
+                }
+            }
+        };
+    }
+    guard_windows_reserved_name(name)
+}
+
+fn guard_windows_reserved_name(name: String) -> String {
+    let stem = name.split('.').next().unwrap_or("").trim_end();
+    let is_reserved = matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    );
+    if is_reserved {
+        format!("_{name}")
+    } else {
+        name
+    }
 }
 
 /// Extensions that count as a real file extension for naming purposes
@@ -558,29 +689,19 @@ mod tests {
 
     #[test]
     fn segmented_chunk_boundaries_cover_the_file_without_overflow() {
-        fn ranges(total: u64, connections: u64) -> Vec<(u64, u64)> {
-            let count = connections.clamp(1, 16);
-            let chunk = total / count + u64::from(total % count != 0);
-            (0..count).filter_map(|index| {
-                let start = index * chunk;
-                if start >= total { return None; }
-                Some((start, start.saturating_add(chunk - 1).min(total - 1)))
-            }).collect()
-        }
-        assert_eq!(ranges(10, 3), vec![(0, 3), (4, 7), (8, 9)]);
-        assert_eq!(ranges(2, 16), vec![(0, 0), (1, 1)]);
-        assert_eq!(ranges(u64::MAX, 2), vec![(0, u64::MAX / 2), (u64::MAX / 2 + 1, u64::MAX - 1)]);
+        // Calls the production layout, not a local copy of it.
+        assert_eq!(super::segment_ranges(10, 3), vec![(0, 3), (4, 7), (8, 9)]);
+        assert_eq!(super::segment_ranges(2, 16), vec![(0, 0), (1, 1)]);
+        assert_eq!(super::segment_ranges(u64::MAX, 2), vec![(0, u64::MAX / 2), (u64::MAX / 2 + 1, u64::MAX - 1)]);
     }
 
     #[test]
     fn one_byte_probe_requires_a_concrete_resource_length() {
-        fn parse_probe(value: &str) -> Option<u64> {
-            value.strip_prefix("bytes 0-0/")?.parse::<u64>().ok().filter(|total| *total >= 1)
-        }
-        assert_eq!(parse_probe("bytes 0-0/4096"), Some(4096));
-        assert_eq!(parse_probe("bytes 0-0/*"), None);
-        assert_eq!(parse_probe("bytes 1-1/4096"), None);
-        assert_eq!(parse_probe("bytes 0-0/0"), None);
+        // Calls the production parser, not a local copy of it.
+        assert_eq!(super::parse_probe_content_range("bytes 0-0/4096"), Some(4096));
+        assert_eq!(super::parse_probe_content_range("bytes 0-0/*"), None);
+        assert_eq!(super::parse_probe_content_range("bytes 1-1/4096"), None);
+        assert_eq!(super::parse_probe_content_range("bytes 0-0/0"), None);
     }
 
     #[tokio::test]
@@ -602,6 +723,87 @@ mod tests {
         let target = std::path::Path::new("archive.zip");
         assert_eq!(super::partial_download_metadata_path(target), std::path::PathBuf::from("archive.zip.thunderload.part.meta.json"));
         assert_ne!(super::partial_download_metadata_path(target), super::partial_download_path(target));
+    }
+
+    #[tokio::test]
+    async fn over_delivering_chunked_206_is_rejected_before_overwrite() {
+        // P0-3: a chunked 206 with no Content-Length that sends more
+        // than the requested range must fail before the excess bytes
+        // reach the shared .part file — the bytes past the segment end
+        // are sentinel and must survive untouched.
+        use std::sync::{atomic::AtomicU64, Arc};
+        use tokio::sync::{mpsc, watch};
+        let directory = std::env::temp_dir()
+            .join(format!("thunderload-overdeliver-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let part = directory.join("file.thunderload.part");
+        tokio::fs::write(&part, vec![0xAA_u8; 1024]).await.unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serve = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) | Err(_) => return,
+                    Ok(count) => {
+                        request.extend_from_slice(&buffer[..count]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                }
+            }
+            let mut response = b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-99/1024\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();
+            for _ in 0..4 {
+                response.extend_from_slice(b"32\r\n");
+                response.extend_from_slice(&[0xBB_u8; 50]);
+                response.extend_from_slice(b"\r\n");
+            }
+            response.extend_from_slice(b"0\r\n\r\n");
+            let _ = stream.write_all(&response);
+        });
+        let client = super::client().unwrap();
+        let (control_tx, control_rx) = watch::channel(super::DownloadControl::Running);
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        let result = super::download_segment_range(
+            &client,
+            &format!("http://{addr}/file.bin"),
+            &part,
+            0,
+            99,
+            1024,
+            None,
+            None,
+            control_rx,
+            Arc::new(super::GlobalRateLimiter::new()),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+            progress_tx,
+            Arc::new(AtomicU64::new(0)),
+            1,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await;
+        drop(control_tx);
+        serve.join().unwrap();
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("more bytes"),
+            "over-delivery must fail with the range error, got: {error}"
+        );
+        let bytes = tokio::fs::read(&part).await.unwrap();
+        assert_eq!(bytes.len(), 1024);
+        assert!(bytes[..100].iter().all(|byte| *byte == 0xBB));
+        assert!(
+            bytes[100..].iter().all(|byte| *byte == 0xAA),
+            "over-delivered bytes overwrote the adjacent range"
+        );
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
     }
 
     #[test]
@@ -657,7 +859,8 @@ impl GlobalRateLimiter {
         let now = Instant::now();
         let spent_until = state.epoch + std::time::Duration::from_secs_f64(state.reserved as f64 / limit as f64);
         if spent_until < now {
-            state.epoch = now - std::time::Duration::from_secs_f64(state.reserved as f64 / limit as f64);
+            state.epoch = now;
+            state.reserved = 0;
         }
         state.reserved = state.reserved.saturating_add(bytes);
         let target = state.epoch + std::time::Duration::from_secs_f64(state.reserved as f64 / limit as f64);
@@ -690,14 +893,19 @@ pub async fn reserve_download_path(path: &Path) -> Result<PathBuf> {
 }
 
 /// Stable sidecar used by the desktop queue across process restarts.
+/// The suffix is appended to the target's full name (`OsString` push),
+/// never built with `with_extension`: the old `"file"` fallback made
+/// `README` and `README.file` share one part path (P1-6).
 pub fn partial_download_path(target: &Path) -> PathBuf {
-    let extension = target.extension().and_then(|value| value.to_str()).unwrap_or("file");
-    target.with_extension(format!("{extension}.thunderload.part"))
+    let mut path = target.as_os_str().to_owned();
+    path.push(".thunderload.part");
+    PathBuf::from(path)
 }
 
 pub fn partial_download_metadata_path(target: &Path) -> PathBuf {
-    let extension = target.extension().and_then(|value| value.to_str()).unwrap_or("file");
-    target.with_extension(format!("{extension}.thunderload.part.meta.json"))
+    let mut path = target.as_os_str().to_owned();
+    path.push(".thunderload.part.meta.json");
+    PathBuf::from(path)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -791,7 +999,21 @@ const MAX_CHUNKS: usize = 1024;
 /// How long a worker may go without receiving a byte before the
 /// coordinator treats its current chunk as stalled and re-assigns it
 /// (see `run_segmented_download_with_stats`).
-const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// INVARIANT (MC4): the stall watchdog MUST stay clearly above the
+/// client's read timeout (`READ_TIMEOUT`, 30 s) — 90 s here, 3x.
+/// The two must never fire together: on a dead connection the read
+/// timeout fires first and surfaces as a retryable timeout error,
+/// which the chunk worker re-queues as a fresh attempt (see
+/// `is_transient_segment_error`); the watchdog is only the backstop
+/// for a connection that keeps trickling bytes — trickle resets the
+/// read timeout, so only the watchdog can catch it. If the watchdog
+/// were equal to (or below) the read timeout, a dead connection
+/// would race between a timeout error and a watchdog abort, and the
+/// abort path could discard a chunk the timeout path was already
+/// re-queueing. Keep this gap when either value changes.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(90);
 /// A chunk that stalls this many times in one run is a real failure, not
 /// a race to chase: the run errors out (checkpoint preserved for Resume)
 /// instead of aborting and re-queueing forever.
@@ -985,9 +1207,23 @@ pub(crate) fn direct_checkpoint_info(path: &Path) -> Option<(String, Option<u64>
 }
 
 async fn write_resume_metadata(path: &Path, metadata: &ResumeMetadata) -> Result<()> {
-    let temporary = path.with_extension("meta.tmp");
+    // Unique tmp name (pid + uuid, as the job store does): two writers
+    // to the same checkpoint must never share one `meta.tmp`.
+    let mut tmp_name = path.as_os_str().to_owned();
+    tmp_name.push(format!(".{}.{}.tmp", std::process::id(), Uuid::new_v4()));
+    let temporary = PathBuf::from(tmp_name);
     let bytes = serde_json::to_vec(metadata)?;
-    fs::write(&temporary, bytes).await?;
+    let mut options = fs::OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut tmp_file = options.open(&temporary).await?;
+    tmp_file.write_all(&bytes).await?;
+    tmp_file.flush().await?;
+    // P0-4: the checkpoint must be durable before the rename — a power
+    // loss after the rename must never expose a torn checkpoint.
+    tmp_file.sync_all().await?;
+    drop(tmp_file);
     // Unix rename(2) replaces the destination atomically, so the
     // metadata file is never absent: a crash mid-write leaves either
     // the old or the new checkpoint, never none. Windows rename fails
@@ -1106,6 +1342,121 @@ enum SegmentOutcome {
     Paused,
     Cancelled,
     ValidatorChanged,
+    /// The control channel closed (host disconnected) while this
+    /// segment was in flight. This is NOT a user Cancel: the
+    /// coordinator turns it into an error with the checkpoint kept,
+    /// so the host's disconnect path can mark the job Interrupted
+    /// ("partial checkpoint kept") instead of deleting the resume
+    /// state (N1). An explicit Cancel still wins over it.
+    Interrupted,
+}
+
+/// Attempts for one chunk, initial try included: a chunk that hits a
+/// transient failure is retried this many times in total before the
+/// run fails with the checkpoint preserved.
+const MAX_SEGMENT_ATTEMPTS: u32 = 4;
+
+/// Whether an HTTP status is worth retrying with backoff: 429 (rate
+/// limited) and 5xx (server fault). Everything else fails fast —
+/// notably 401/403 (login wall) and 404/416, which a retry cannot fix.
+fn is_transient_http_status(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+/// Whether a failed chunk attempt is worth retrying (MC3): a 429/5xx
+/// status carried on a reqwest error, or a transport failure
+/// (connect / timeout — including the client's read timeout firing on
+/// a dead connection, MC4: a read timeout re-queues the chunk, it
+/// never fails the run outright). Anything else — auth, a bad range,
+/// a webpage, a validator change — is terminal.
+fn is_transient_segment_error(error: &anyhow::Error) -> bool {
+    for cause in error.chain() {
+        if let Some(request_error) = cause.downcast_ref::<reqwest::Error>() {
+            if let Some(status) = request_error.status() {
+                if is_transient_http_status(status) {
+                    return true;
+                }
+                // A status is present but not transient: fail fast.
+                return false;
+            }
+            if request_error.is_connect() || request_error.is_timeout() || request_error.is_body() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Backoff between chunk attempts: 1 s, 2 s, 4 s. Bounded by
+/// `MAX_SEGMENT_ATTEMPTS`, so the worst case is ~7 s of waiting
+/// before the run fails with the checkpoint preserved.
+fn transient_backoff(attempt: u32) -> Duration {
+    Duration::from_secs(1 << attempt.min(2))
+}
+
+/// Error text when the control channel closes mid-transfer (N1):
+/// the host disconnected, which is NOT a user Cancel — the partial
+/// file and checkpoint stay on disk for Resume, and the host marks
+/// the job Interrupted from this error.
+const CONTROL_CLOSED_ERROR: &str =
+    "Download control channel closed; partial checkpoint kept for Resume";
+
+/// Backoff interruption in the sequential path: translate the
+/// control outcome from `sleep_or_control` into the return value of
+/// `download_sequential_resumable`. Returns `None` to keep retrying.
+/// Paused keeps the checkpoint, Cancelled deletes it (explicit user
+/// action), Interrupted errors with the checkpoint kept (N1).
+async fn sequential_backoff(
+    control: &mut tokio::sync::watch::Receiver<DownloadControl>,
+    delay: Duration,
+    part: &Path,
+    metadata_path: &Path,
+    target: &Path,
+) -> Option<Result<DownloadOutcome>> {
+    match sleep_or_control(control, delay).await {
+        None => None,
+        Some(SegmentOutcome::Paused) => Some(Ok(DownloadOutcome::Paused)),
+        Some(SegmentOutcome::Cancelled) => {
+            remove_resume_files(part, metadata_path, target).await;
+            Some(Ok(DownloadOutcome::Cancelled))
+        }
+        Some(_) => Some(Err(anyhow!(CONTROL_CLOSED_ERROR))),
+    }
+}
+/// Sleep `delay` unless the control channel changes state first.
+/// Returns the outcome the caller must return when control spoke:
+/// Paused / Cancelled on an explicit state change, Interrupted when
+/// the channel closed (host disconnected — checkpoint kept, N1).
+/// Returns `None` when the full delay elapsed with control still
+/// Running. A re-sent Running mark just restarts the wait.
+async fn sleep_or_control(
+    control: &mut tokio::sync::watch::Receiver<DownloadControl>,
+    delay: Duration,
+) -> Option<SegmentOutcome> {
+    if delay.is_zero() {
+        return None;
+    }
+    let deadline = Instant::now() + delay;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(remaining) => return None,
+            changed = control.changed() => {
+                if changed.is_err() {
+                    return Some(SegmentOutcome::Interrupted);
+                }
+                match *control.borrow() {
+                    DownloadControl::Paused => return Some(SegmentOutcome::Paused),
+                    DownloadControl::Cancelled => return Some(SegmentOutcome::Cancelled),
+                    // A re-sent Running mark: keep waiting out the remainder.
+                    DownloadControl::Running => {}
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1158,12 +1509,51 @@ async fn download_segment_range(
     if let Some(validator_value) = validator {
         request = request.header(header::IF_RANGE, validator_value);
     }
-    let response = request.send().await?;
-    if response.status() != StatusCode::PARTIAL_CONTENT {
+    // N1: the opening request can block up to the read timeout, so
+    // the control channel is watched while it is in flight — a
+    // disconnect must interrupt the segment promptly, not after 30 s.
+    // The send future is re-polled across loop iterations (never
+    // re-issued), so a re-sent Running mark just keeps waiting.
+    let mut send_fut = request.send();
+    let response = loop {
+        tokio::select! {
+            result = &mut send_fut => break result?,
+            changed = control.changed() => {
+                if changed.is_err() {
+                    return Ok(SegmentOutcome::Interrupted);
+                }
+                // Copy the value out first: watch::Ref is !Send.
+                let state = *control.borrow();
+                match state {
+                    DownloadControl::Paused => return Ok(SegmentOutcome::Paused),
+                    DownloadControl::Cancelled => return Ok(SegmentOutcome::Cancelled),
+                    DownloadControl::Running => {}
+                }
+            }
+        }
+    };
+    if response.status() == StatusCode::UNAUTHORIZED || response.status() == StatusCode::FORBIDDEN {
+        return Err(anyhow!(AUTH_REQUIRED_MESSAGE));
+    }
+    if response.status() == StatusCode::OK {
         // A 200 here means If-Range failed: the object changed mid-flight.
         // The coordinator discards the checkpoint and restarts cleanly
         // instead of joining two versions of the file.
         return Ok(SegmentOutcome::ValidatorChanged);
+    }
+    if response.status() != StatusCode::PARTIAL_CONTENT {
+        // Carry the status on the reqwest error (instead of a bare
+        // "HTTP 503" string) so the chunk worker can classify it:
+        // 429/5xx is transient and retried with backoff, anything
+        // else fails fast (MC3). 3xx cannot carry a reqwest status
+        // error — error_for_status only fires on 4xx/5xx — so those
+        // keep the plain message.
+        if response.status().is_client_error() || response.status().is_server_error() {
+            return Err(anyhow::Error::new(
+                response.error_for_status().unwrap_err(),
+            ));
+        }
+        return Err(anyhow!("Segment request returned HTTP {}", response.status()));
     }
     if validator.is_some_and(|expected| !response_matches_validator(response.headers(), expected)) {
         return Ok(SegmentOutcome::ValidatorChanged);
@@ -1200,7 +1590,11 @@ async fn download_segment_range(
             value = stream.next() => value,
             changed = control.changed() => {
                 if changed.is_ok() { continue; }
-                None
+                // Control channel closed (host disconnected): NOT a
+                // user Cancel — flush and report Interrupted so the
+                // coordinator keeps the checkpoint (N1).
+                let _ = file.flush().await;
+                return Ok(SegmentOutcome::Interrupted);
             }
         };
         let Some(chunk_result) = next else { break };
@@ -1212,6 +1606,12 @@ async fn download_segment_range(
                     .context("Network interrupted; segment checkpoint has been preserved for Resume");
             }
         };
+        // P0-3: a chunked 206 with no Content-Length can over-deliver
+        // past this segment's end and overwrite the adjacent segment
+        // in the shared .part file. Abort before writing, not after.
+        if chunk.len() as u64 > segment_len.saturating_sub(local_bytes) {
+            return Err(anyhow!("Server sent more bytes than the requested range"));
+        }
         file.write_all(&chunk).await?;
         local_bytes += chunk.len() as u64;
         // R1: both counters are incremented together, before any await.
@@ -1226,10 +1626,35 @@ async fn download_segment_range(
             *last = Instant::now();
         }
         let wait = rate_limiter.reserve(chunk.len() as u64).await;
-        if !wait.is_zero() {
+        let mut remaining = wait;
+        while remaining > Duration::ZERO {
+            let step = remaining.min(Duration::from_secs(5));
             tokio::select! {
-                _ = tokio::time::sleep(wait) => {},
-                changed = control.changed() => { if changed.is_err() { /* host is shutting down */ } }
+                _ = tokio::time::sleep(step) => {
+                    remaining = remaining.saturating_sub(step);
+                    if let Ok(mut last) = activity.lock() {
+                        *last = Instant::now();
+                    }
+                }
+                changed = control.changed() => {
+                    if changed.is_err() {
+                        // Control channel closed (host disconnected):
+                        // NOT a user Cancel — keep the checkpoint (N1).
+                        let _ = file.flush().await;
+                        return Ok(SegmentOutcome::Interrupted);
+                    }
+                    let state = *control.borrow();
+                    match state {
+                        DownloadControl::Paused => {
+                            file.flush().await?;
+                            return Ok(SegmentOutcome::Paused);
+                        }
+                        DownloadControl::Cancelled => {
+                            return Ok(SegmentOutcome::Cancelled);
+                        }
+                        DownloadControl::Running => {}
+                    }
+                }
             }
         }
         if let Ok(mut last) = last_report.lock() {
@@ -1254,6 +1679,10 @@ async fn download_segment_range(
     if local_bytes != segment_len {
         return Err(anyhow!("A range returned an incomplete segment"));
     }
+    // P0-4: the segment bytes must be durable before the checkpoint can
+    // mark this chunk done — otherwise a power loss leaves the metadata
+    // claiming bytes that never reached disk.
+    file.sync_data().await?;
     Ok(SegmentOutcome::Completed)
 }
 
@@ -1278,6 +1707,15 @@ struct WorkerStats {
 struct SegmentRunStats {
     workers: Vec<WorkerStats>,
     stall_requeues: u32,
+    /// The shared received-bytes counter at the end of the run:
+    /// unique bytes actually streamed. A retried or re-queued
+    /// chunk's partial bytes are subtracted back out, so this stays
+    /// the true byte count rather than the sum of every attempt's
+    /// bytes — tests assert it against the real total instead of
+    /// re-deriving bytes from the chunk plan (per-worker
+    /// `bytes_downloaded` only counts completed chunks, so it cannot
+    /// prove the rollback).
+    received: u64,
 }
 
 /// Shared work-stealing state for one segmented run. `pending` holds the
@@ -1351,32 +1789,73 @@ async fn download_chunk_worker(
         let Some(index) = claimed else {
             return WorkerResult { terminal: None, error: None, stats };
         };
-        if let Ok(mut last) = shared.activities[slot].lock() {
-            *last = Instant::now();
-        }
+        // Transient retry (MC3): a chunk that fails on a 429/5xx
+        // status or a transport failure (including the read timeout
+        // firing on a dead connection, MC4) is re-downloaded whole
+        // on a fresh connection with backoff, instead of failing the
+        // run outright. The attempt's counted bytes are rolled back
+        // first — the same swap/subtract pairing the stall re-queue
+        // uses — so progress never over-counts across attempts.
+        // Non-transient failures (auth, bad range, webpage) and
+        // ValidatorChanged still end the chunk immediately.
         let (start, end) = shared.ranges[index];
-        let started = Instant::now();
-        let outcome = download_segment_range(
-            &shared.client,
-            &shared.url,
-            &shared.part,
-            start,
-            end,
-            shared.total,
-            shared.validator.as_deref(),
-            shared.session.as_ref(),
-            control.clone(),
-            shared.rate_limiter.clone(),
-            shared.received.clone(),
-            shared.last_report.clone(),
-            shared.progress_tx.clone(),
-            shared.segments_done.clone(),
-            shared.segments_total,
-            shared.chunk_received[index].clone(),
-            shared.activities[slot].clone(),
-            shared.reported.clone(),
-        )
-        .await;
+        // Set at the top of every attempt below, before any break
+        // out of the retry loop — always the successful attempt's
+        // start by the time the Completed arm reads it.
+        let mut started: Instant;
+        let outcome: Result<SegmentOutcome> = {
+            let mut attempt: u32 = 0;
+            loop {
+                attempt += 1;
+                started = Instant::now();
+                if let Ok(mut last) = shared.activities[slot].lock() {
+                    *last = Instant::now();
+                }
+                match download_segment_range(
+                    &shared.client,
+                    &shared.url,
+                    &shared.part,
+                    start,
+                    end,
+                    shared.total,
+                    shared.validator.as_deref(),
+                    shared.session.as_ref(),
+                    control.clone(),
+                    shared.rate_limiter.clone(),
+                    shared.received.clone(),
+                    shared.last_report.clone(),
+                    shared.progress_tx.clone(),
+                    shared.segments_done.clone(),
+                    shared.segments_total,
+                    shared.chunk_received[index].clone(),
+                    shared.activities[slot].clone(),
+                    shared.reported.clone(),
+                )
+                .await
+                {
+                    Ok(outcome) => break Ok(outcome),
+                    Err(error) if is_transient_segment_error(&error)
+                        && attempt < MAX_SEGMENT_ATTEMPTS =>
+                    {
+                        let partial =
+                            shared.chunk_received[index].swap(0, Ordering::Relaxed);
+                        debug_assert!(partial <= shared.received.load(Ordering::Relaxed));
+                        shared.received.fetch_sub(partial, Ordering::Relaxed);
+                        let mut backoff_control = control.clone();
+                        match sleep_or_control(
+                            &mut backoff_control,
+                            transient_backoff(attempt - 1),
+                        )
+                        .await
+                        {
+                            Some(outcome) => break Ok(outcome),
+                            None => continue,
+                        }
+                    }
+                    Err(error) => break Err(error),
+                }
+            }
+        };
         {
             let mut guard = shared.queue.lock().unwrap();
             guard.current[slot] = None;
@@ -1548,6 +2027,7 @@ async fn run_segmented_download_with_stats(
     let mut saw_paused = false;
     let mut saw_cancelled = false;
     let mut saw_validator_changed = false;
+    let mut saw_interrupted = false;
     let mut first_error: Option<anyhow::Error> = None;
     loop {
         // Reap finished slots.
@@ -1574,6 +2054,7 @@ async fn run_segmented_download_with_stats(
                         Some(SegmentOutcome::Paused) => saw_paused = true,
                         Some(SegmentOutcome::Cancelled) => saw_cancelled = true,
                         Some(SegmentOutcome::ValidatorChanged) => saw_validator_changed = true,
+                        Some(SegmentOutcome::Interrupted) => saw_interrupted = true,
                         Some(SegmentOutcome::Completed) | None => {}
                     }
                 }
@@ -1626,7 +2107,9 @@ async fn run_segmented_download_with_stats(
             }
         }
 
-        let terminating = saw_validator_changed || saw_cancelled || first_error.is_some();
+        let terminating =
+            saw_validator_changed || saw_cancelled || saw_interrupted || first_error.is_some()
+                || *control.borrow() == DownloadControl::Cancelled;
         // F4: once the user asked for Pause, the watchdog stands down —
         // no aborts, no stall-limit errors, no replacement workers
         // issuing fresh Range requests while the run is draining. The
@@ -1646,8 +2129,8 @@ async fn run_segmented_download_with_stats(
         } else if !paused {
             // Stall watchdog: a slot whose current chunk received
             // nothing for `stall_timeout` is stuck on a dead connection
-            // (the client sets no read timeout, so a hung chunk would
-            // otherwise block the tail forever). Abort that one worker,
+            // (in addition to the client's 30s read timeout, this catches
+            // stalled or trickling slots at `stall_timeout`). Abort that one worker,
             // re-queue its chunk for a fresh connection, and spawn a
             // replacement. A chunk that stalls too often is a real
             // failure: error out with the checkpoint preserved.
@@ -1735,16 +2218,31 @@ async fn run_segmented_download_with_stats(
         };
         // A terminating run ends once every slot is idle even if chunks
         // are still pending (they stay in the checkpoint for Resume).
-        if all_idle && (queue_empty || saw_paused || terminating) {
+        // P0-2: the break must use the live `paused` state, not only
+        // `saw_paused` — when the watchdog aborts the last worker and
+        // Pause arrives before the reap, no worker ever reports Paused
+        // and the old condition looped forever.
+        if all_idle && (queue_empty || paused || terminating) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
+    // Snapshot the shared received counter once, for every outcome,
+    // so tests can assert it against the true total.
+    run_stats.received = received.load(Ordering::Relaxed);
+
+    // P0-2: the outcome reads the live control state, not only what a
+    // worker happened to report — a watchdog-aborted worker never
+    // reports Paused/Cancelled, so the reaped flags alone would fall
+    // through to the size check and fail a run the user paused.
+    let paused = saw_paused || *control.borrow() == DownloadControl::Paused;
+    let cancelled = saw_cancelled || *control.borrow() == DownloadControl::Cancelled;
+
     if saw_validator_changed {
         return Ok((SegmentedRun::ValidatorChanged, run_stats));
     }
-    if saw_cancelled {
+    if cancelled {
         remove_resume_files(
             part,
             &checkpoint.lock().await.metadata_path,
@@ -1753,10 +2251,24 @@ async fn run_segmented_download_with_stats(
         .await;
         return Ok((SegmentedRun::Finished(DownloadOutcome::Cancelled), run_stats));
     }
+    if saw_interrupted {
+        // N1: the control channel closed (host disconnected) — this is
+        // NOT a user Cancel, so nothing is deleted. The error keeps
+        // the part file and checkpoint on disk, and the host's own
+        // disconnect path turns the failed run into Interrupted
+        // ("partial checkpoint kept") instead of Cancelled. An
+        // explicit Cancel above still wins over a racing disconnect.
+        // Persist the final completion state first, as the Paused
+        // tail does, so a chunk that finished while siblings were
+        // being aborted is not lost.
+        let guard = checkpoint.lock().await;
+        let _ = write_resume_metadata(&guard.metadata_path, &guard.metadata).await;
+        return Err(anyhow!(CONTROL_CLOSED_ERROR));
+    }
     if let Some(error) = first_error {
         return Err(error);
     }
-    if saw_paused {
+    if paused {
         // Persist the final completion state (completions are already
         // written as chunks finish; this covers a worker that finished
         // between its last mark and the abort of its siblings).
@@ -1856,13 +2368,13 @@ async fn run_segmented_with_restart(
     part: &Path,
     metadata_path: &Path,
     mut metadata: ResumeMetadata,
-    server: &ServerInfo,
+    _server: &ServerInfo,
     session: Option<&SessionHeaders>,
     control: tokio::sync::watch::Receiver<DownloadControl>,
     rate_limiter: Arc<GlobalRateLimiter>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
 ) -> Result<DownloadOutcome> {
-    let total = metadata.total.unwrap_or(0);
+    let mut total = metadata.total.unwrap_or(0);
     let connections = metadata
         .connections
         .unwrap_or(DEFAULT_RESUMABLE_CONNECTIONS);
@@ -1893,8 +2405,33 @@ async fn run_segmented_with_restart(
         {
             SegmentedRun::Finished(outcome) => return Ok(outcome),
             SegmentedRun::ValidatorChanged if attempt == 0 => {
-                remove_resume_files(part, metadata_path, target).await;
-                metadata = fresh_segmented_metadata(url, total, connections, server, session);
+                // M1: probe FIRST, delete only after the probe proves
+                // the new object is usable (fresh total + range
+                // support). The old code deleted the checkpoint before
+                // re-probing, so a silent probe hard-errored with the
+                // completed segments already gone. Now a silent probe
+                // errors with the old checkpoint still on disk, and
+                // Resume can retry later. The P0-03 restart itself is
+                // unchanged: it still re-calls fetch_server_info and
+                // still requires a fresh total and range support.
+                let fresh_server = fetch_server_info(client, url, session, true).await;
+                if fresh_server.is_webpage {
+                    return Err(anyhow!(WEBPAGE_NOT_MEDIA_MESSAGE));
+                }
+                let Some(fresh_total) = fresh_server.total else {
+                    return Err(anyhow!(
+                        "The download changed on the server and its new size is unknown; restart it to try again"
+                    ));
+                };
+                if !fresh_server.supports_ranges {
+                    return Err(anyhow!(
+                        "The download changed on the server and no longer supports segmented resume; restart it to try again"
+                    ));
+                }
+                let _ = fs::remove_file(part).await;
+                let _ = fs::remove_file(metadata_path).await;
+                total = fresh_total;
+                metadata = fresh_segmented_metadata(url, total, connections, &fresh_server, session);
                 ensure_segmented_part(part, total).await?;
                 write_resume_metadata(metadata_path, &metadata).await?;
             }
@@ -1920,7 +2457,7 @@ async fn download_segmented_resumable(
     target: &Path,
     part: &Path,
     metadata_path: &Path,
-    saved: ResumeMetadata,
+    mut saved: ResumeMetadata,
     server: &ServerInfo,
     session: Option<&SessionHeaders>,
     control: tokio::sync::watch::Receiver<DownloadControl>,
@@ -1932,6 +2469,21 @@ async fn download_segmented_resumable(
             "Segmented checkpoint is missing the total size; restart the download"
         ));
     };
+    let existing_len = tokio::fs::metadata(part).await.map(|m| m.len()).unwrap_or(0);
+    if existing_len < total {
+        let mut invalidated = false;
+        if let Some(segments) = saved.segments.as_mut() {
+            for seg in segments.iter_mut() {
+                if seg.end >= existing_len && seg.done {
+                    seg.done = false;
+                    invalidated = true;
+                }
+            }
+        }
+        if invalidated {
+            write_resume_metadata(metadata_path, &saved).await?;
+        }
+    }
     ensure_segmented_part(part, total).await?;
     run_segmented_with_restart(
         client,
@@ -2042,9 +2594,7 @@ pub async fn download_url_resumable_with_connections(
     rate_limiter: Arc<GlobalRateLimiter>,
     progress_tx: mpsc::UnboundedSender<DownloadProgress>,
 ) -> Result<DownloadOutcome> {
-    if !matches!(url::Url::parse(url)?.scheme(), "http" | "https") {
-        return Err(anyhow!("Only HTTP and HTTPS download URLs are supported"));
-    }
+    crate::session::validate_public_http_url(url)?;
     prepare_parent(target).await?;
     let part = partial_download_path(target);
     let metadata_path = partial_download_metadata_path(target);
@@ -2209,20 +2759,146 @@ async fn download_sequential_resumable(
     let head_etag = server.etag.clone();
     let head_modified = server.last_modified.clone();
 
-    let mut request = client.get(url);
-    if offset > 0 {
-        request = request.header(header::RANGE, format!("bytes={offset}-"));
-        if let Some(saved) = &saved_metadata {
-            if let Some(etag) = saved.etag.as_deref() {
-                request = request.header(header::IF_RANGE, etag);
-            } else if let Some(last_modified) = saved.last_modified.as_deref() {
-                request = request.header(header::IF_RANGE, last_modified);
+    // Transient retry (MC3) for the opening request: a 429/5xx
+    // answer — or a transport failure sending the request — is
+    // retried with backoff instead of failing the run outright.
+    // 401/403 fail fast in the status gate below (login wall), as
+    // does any other non-transient status. The request is rebuilt
+    // per attempt: a sent RequestBuilder cannot be reused.
+    let mut response = {
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            let mut request = client.get(url);
+            if offset > 0 {
+                request = request.header(header::RANGE, format!("bytes={offset}-"));
+                if let Some(saved) = &saved_metadata {
+                    if let Some(etag) = saved.etag.as_deref() {
+                        request = request.header(header::IF_RANGE, etag);
+                    } else if let Some(last_modified) = saved.last_modified.as_deref() {
+                        request = request.header(header::IF_RANGE, last_modified);
+                    }
+                }
+            }
+            let request = apply_session(session, request, url);
+            // N1: the opening request can block up to the read
+            // timeout, so the control channel is watched while it is
+            // in flight — a disconnect must interrupt the run
+            // promptly, not after 30 s. The send future is re-polled
+            // across loop iterations (never re-issued).
+            let mut send_fut = request.send();
+            let send_result = loop {
+                tokio::select! {
+                    result = &mut send_fut => break result,
+                    changed = control.changed() => {
+                        if changed.is_err() {
+                            return Err(anyhow!(CONTROL_CLOSED_ERROR));
+                        }
+                        // Copy the value out first: watch::Ref is
+                        // !Send and must not live across the await
+                        // in the Cancelled arm below.
+                        let state = *control.borrow();
+                        match state {
+                            DownloadControl::Paused => {
+                                return Ok(DownloadOutcome::Paused);
+                            }
+                            DownloadControl::Cancelled => {
+                                remove_resume_files(&part, &metadata_path, target).await;
+                                return Ok(DownloadOutcome::Cancelled);
+                            }
+                            DownloadControl::Running => {}
+                        }
+                    }
+                }
+            };
+            match send_result {
+                Ok(response)
+                    if is_transient_http_status(response.status())
+                        && attempt < MAX_SEGMENT_ATTEMPTS =>
+                {
+                    if let Some(outcome) = sequential_backoff(
+                        &mut control,
+                        transient_backoff(attempt - 1),
+                        &part,
+                        &metadata_path,
+                        target,
+                    )
+                    .await
+                    {
+                        return outcome;
+                    }
+                    continue;
+                }
+                Ok(response) => break response,
+                Err(error) => {
+                    let wrapped = anyhow::Error::new(error);
+                    if is_transient_segment_error(&wrapped)
+                        && attempt < MAX_SEGMENT_ATTEMPTS
+                    {
+                        if let Some(outcome) = sequential_backoff(
+                            &mut control,
+                            transient_backoff(attempt - 1),
+                            &part,
+                            &metadata_path,
+                            target,
+                        )
+                        .await
+                        {
+                            return outcome;
+                        }
+                        continue;
+                    }
+                    return Err(wrapped)
+                        .context("Could not connect to the download server");
+                }
             }
         }
-    }
-    request = apply_session(session, request, url);
-    let mut response = request.send().await.context("Could not connect to the download server")?;
+    };
     if !response.status().is_success() && response.status() != StatusCode::PARTIAL_CONTENT {
+        if offset > 0 && response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
+            let server_416_total = response
+                .headers()
+                .get(header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().strip_prefix("bytes */"))
+                .and_then(|n| n.trim().parse::<u64>().ok());
+            // P1-1: a 416 commits the part file only when the server's
+            // total is explicitly the resume offset AND the 416
+            // response still identifies the same resource — a missing
+            // Content-Range, or a changed ETag/Last-Modified, must
+            // never mark stale bytes Completed.
+            let total_matches = server_416_total == Some(offset);
+            let response_etag = response
+                .headers()
+                .get(header::ETAG)
+                .and_then(|value| value.to_str().ok())
+                .filter(|value| !value.trim_start().starts_with("W/"));
+            let response_modified = response
+                .headers()
+                .get(header::LAST_MODIFIED)
+                .and_then(|value| value.to_str().ok());
+            let identity_matches = saved_metadata.as_ref().is_some_and(|saved| {
+                resume_identity_matches(saved, url, response_etag, response_modified, Some(offset))
+            });
+            if total_matches && identity_matches {
+                replace_file(&part, target).await?;
+                let _ = fs::remove_file(&metadata_path).await;
+                let _ = progress_tx.send(DownloadProgress {
+                    downloaded: offset,
+                    total: Some(offset),
+                    percent: Some(100.0),
+                    phase: "complete".into(),
+                    segments_done: None,
+                    segments_total: None,
+                });
+                return Ok(DownloadOutcome::Completed);
+            }
+            let _ = fs::remove_file(&part).await;
+            let _ = fs::remove_file(&metadata_path).await;
+            return Err(anyhow!(
+                "Resume offset ({offset} bytes) was rejected by the server (HTTP 416); cleared stale partial data so the next attempt starts fresh."
+            ));
+        }
         // A 401/403 is the login wall, not a generic server error —
         // say so instead of the bare status (Slice 5).
         if response.status() == StatusCode::UNAUTHORIZED || response.status() == StatusCode::FORBIDDEN {
@@ -2252,7 +2928,7 @@ async fn download_sequential_resumable(
             // if a server nevertheless returns a mismatched 206, discard the
             // old prefix and issue a fresh full GET instead of joining versions.
             let restart = apply_session(session, client.get(url), url);
-            response = restart.send().await.context("Could not restart a changed download")?.error_for_status()?;
+            response = restart.send().await.context("Could not restart a changed download")?.error_for_status().map_err(map_auth_error)?;
             append = false;
             let _ = fs::remove_file(&part).await;
         }
@@ -2276,10 +2952,13 @@ async fn download_sequential_resumable(
 
     let start_offset = if append { offset } else { 0 };
     let response_etag = response.headers().get(header::ETAG)
-        .and_then(|value| value.to_str().ok()).map(str::to_owned).or(head_etag);
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim_start().starts_with("W/"))
+        .map(str::to_owned)
+        .or(head_etag);
     let response_modified = response.headers().get(header::LAST_MODIFIED)
         .and_then(|value| value.to_str().ok()).map(str::to_owned).or(head_modified);
-    let total = if append {
+    let mut total = if append {
         response.headers().get(header::CONTENT_RANGE)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| parse_resume_content_range(value, offset).ok().flatten())
@@ -2311,6 +2990,11 @@ async fn download_sequential_resumable(
     let mut file = options.open(&part).await?;
     let mut stream = response.bytes_stream();
     let mut downloaded = start_offset;
+    // Mid-stream retry budget: the opening request above retries on
+    // its own counter; this counts stream attempts (initial stream
+    // included) so a transient failure mid-body gets the same
+    // MAX_SEGMENT_ATTEMPTS total as one segmented chunk.
+    let mut stream_attempt: u32 = 1;
     let mut last_report = Instant::now();
 
     loop {
@@ -2333,15 +3017,210 @@ async fn download_sequential_resumable(
             value = stream.next() => value,
             changed = control.changed() => {
                 if changed.is_ok() { continue; }
-                None
+                // Control channel closed (host disconnected): NOT a
+                // user Cancel — flush and error with the checkpoint
+                // kept (N1).
+                let _ = file.flush().await;
+                drop(file);
+                return Err(anyhow!(CONTROL_CLOSED_ERROR));
             }
         };
         let Some(chunk_result) = next else { break; };
         let chunk = match chunk_result {
             Ok(chunk) => chunk,
             Err(error) => {
+                // Mid-stream transient retry (MC3, sequential path):
+                // the opening request above retries, but until now a
+                // failure after the first byte was terminal. A
+                // transient stream error — a 429/5xx carried on the
+                // error, or a transport failure such as a read timeout
+                // — is retried with the same is_transient_segment_error
+                // check and backoff as the segmented path, re-issuing
+                // the GET from the preserved offset so bytes already
+                // written are neither re-downloaded nor truncated: the
+                // file stays open in append mode across the retry and
+                // only `downloaded` moves. Non-transient errors still
+                // fail fast with the checkpoint kept.
                 let _ = file.flush().await;
-                return Err(error).context("Network interrupted; partial file has been preserved for Resume");
+                let wrapped = anyhow::Error::new(error);
+                if !is_transient_segment_error(&wrapped)
+                    || stream_attempt >= MAX_SEGMENT_ATTEMPTS
+                {
+                    return Err(wrapped)
+                        .context("Network interrupted; partial file has been preserved for Resume");
+                }
+                if let Some(outcome) = sequential_backoff(
+                    &mut control,
+                    transient_backoff(stream_attempt - 1),
+                    &part,
+                    &metadata_path,
+                    target,
+                )
+                .await
+                {
+                    return outcome;
+                }
+                stream_attempt += 1;
+                // Re-issue the GET from the preserved offset. A
+                // transient answer to the re-issue itself (a 429/5xx
+                // status, or a transport failure sending it) consumes
+                // another attempt and backs off again instead of
+                // failing the run.
+                loop {
+                    let mut request = client.get(url);
+                    request =
+                        request.header(header::RANGE, format!("bytes={downloaded}-"));
+                    if let Some(saved) = &saved_metadata {
+                        if let Some(etag) = saved.etag.as_deref() {
+                            request = request.header(header::IF_RANGE, etag);
+                        } else if let Some(last_modified) = saved.last_modified.as_deref() {
+                            request = request.header(header::IF_RANGE, last_modified);
+                        }
+                    }
+                    let request = apply_session(session, request, url);
+                    match request.send().await {
+                        Ok(retry_response)
+                            if is_transient_http_status(retry_response.status()) =>
+                        {
+                            if stream_attempt >= MAX_SEGMENT_ATTEMPTS {
+                                return Err(anyhow!(
+                                    "Download server returned HTTP {}",
+                                    retry_response.status()
+                                ));
+                            }
+                            if let Some(outcome) = sequential_backoff(
+                                &mut control,
+                                transient_backoff(stream_attempt - 1),
+                                &part,
+                                &metadata_path,
+                                target,
+                            )
+                            .await
+                            {
+                                return outcome;
+                            }
+                            stream_attempt += 1;
+                            continue;
+                        }
+                        Ok(retry_response) => {
+                            match retry_response.status() {
+                                StatusCode::PARTIAL_CONTENT => {
+                                    let range = retry_response
+                                        .headers()
+                                        .get(header::CONTENT_RANGE)
+                                        .and_then(|value| value.to_str().ok())
+                                        .ok_or_else(|| {
+                                            anyhow!("Server omitted Content-Range while resuming")
+                                        })?;
+                                    // The server may report a new total in
+                                    // Content-Range: refresh it (and the
+                                    // saved metadata) so the completion
+                                    // check below compares against the
+                                    // live version, not the opening one.
+                                    if let Some(new_total) =
+                                        parse_resume_content_range(range, downloaded)?
+                                    {
+                                        total = Some(new_total);
+                                        if let Some(saved) = saved_metadata.as_mut() {
+                                            saved.total = total;
+                                            write_resume_metadata(&metadata_path, saved)
+                                                .await?;
+                                        }
+                                    }
+                                    stream = retry_response.bytes_stream();
+                                }
+                                StatusCode::OK => {
+                                    // Server ignored Range (or If-Range
+                                    // failed because the object changed):
+                                    // restart from byte zero on this full
+                                    // response instead of joining a new
+                                    // version onto the old prefix. This is
+                                    // a NEW version: refresh the total
+                                    // from its Content-Length and the
+                                    // saved identity/total metadata (plus
+                                    // the metadata file) so the completion
+                                    // check below compares against the new
+                                    // version instead of the stale opening
+                                    // total.
+                                    total = retry_response
+                                        .content_length()
+                                        .filter(|length| *length != 0);
+                                    let retry_etag = retry_response
+                                        .headers()
+                                        .get(header::ETAG)
+                                        .and_then(|value| value.to_str().ok())
+                                        .filter(|value| {
+                                            !value.trim_start().starts_with("W/")
+                                        })
+                                        .map(str::to_owned);
+                                    let retry_modified = retry_response
+                                        .headers()
+                                        .get(header::LAST_MODIFIED)
+                                        .and_then(|value| value.to_str().ok())
+                                        .map(str::to_owned);
+                                    if let Some(saved) = saved_metadata.as_mut() {
+                                        saved.etag = retry_etag;
+                                        saved.last_modified = retry_modified;
+                                        saved.total = total;
+                                        write_resume_metadata(&metadata_path, saved).await?;
+                                    }
+                                    // `set_len(0)` truncates the file but
+                                    // does NOT move the write offset: without
+                                    // the seek below, the new version would
+                                    // be written after a zero-filled hole
+                                    // the size of the old prefix.
+                                    file.set_len(0).await?;
+                                    file.seek(SeekFrom::Start(0)).await?;
+                                    downloaded = 0;
+                                    stream = retry_response.bytes_stream();
+                                }
+                                StatusCode::RANGE_NOT_SATISFIABLE
+                                    if total == Some(downloaded) =>
+                                {
+                                    // Nothing left to fetch: the part
+                                    // file is already complete; the empty
+                                    // body ends the stream and the
+                                    // completion check below passes.
+                                    stream = retry_response.bytes_stream();
+                                }
+                                status => {
+                                    if status == StatusCode::UNAUTHORIZED
+                                        || status == StatusCode::FORBIDDEN
+                                    {
+                                        return Err(anyhow!(AUTH_REQUIRED_MESSAGE));
+                                    }
+                                    return Err(anyhow!(
+                                        "Download server returned HTTP {status}"
+                                    ));
+                                }
+                            }
+                            break;
+                        }
+                        Err(error) => {
+                            let wrapped = anyhow::Error::new(error);
+                            if !is_transient_segment_error(&wrapped)
+                                || stream_attempt >= MAX_SEGMENT_ATTEMPTS
+                            {
+                                return Err(wrapped)
+                                    .context("Could not connect to the download server");
+                            }
+                            if let Some(outcome) = sequential_backoff(
+                                &mut control,
+                                transient_backoff(stream_attempt - 1),
+                                &part,
+                                &metadata_path,
+                                target,
+                            )
+                            .await
+                            {
+                                return outcome;
+                            }
+                            stream_attempt += 1;
+                            continue;
+                        }
+                    }
+                }
+                continue;
             }
         };
         file.write_all(&chunk).await?;
@@ -2351,7 +3230,15 @@ async fn download_sequential_resumable(
         if !wait.is_zero() {
             tokio::select! {
                 _ = tokio::time::sleep(wait) => {},
-                changed = control.changed() => { if changed.is_err() { /* host is shutting down */ } }
+                changed = control.changed() => {
+                    if changed.is_err() {
+                        // Host disconnected mid-wait: NOT a Cancel —
+                        // keep the checkpoint (N1).
+                        let _ = file.flush().await;
+                        drop(file);
+                        return Err(anyhow!(CONTROL_CLOSED_ERROR));
+                    }
+                }
             }
         }
 
@@ -2410,8 +3297,8 @@ mod resumable_tests {
 mod resumable_http_tests {
     use super::{
         download_segmented, download_url_resumable, partial_download_metadata_path, partial_download_path,
-        reserve_download_path, DownloadControl, DownloadOutcome, GlobalRateLimiter,
-        SessionHeaders, WEBPAGE_NOT_MEDIA_MESSAGE,
+        reserve_download_path, ResumeMetadata, write_resume_metadata, DownloadControl, DownloadOutcome,
+        GlobalRateLimiter, SessionHeaders, WEBPAGE_NOT_MEDIA_MESSAGE,
     };
     use crate::AUTH_REQUIRED_MESSAGE;
     use std::{
@@ -2537,6 +3424,62 @@ mod resumable_http_tests {
     }
 
     #[tokio::test]
+    async fn control_channel_close_keeps_checkpoint_instead_of_cancelling() {
+        // N1: dropping the control sender mid-download (host
+        // disconnected) is NOT a user Cancel — the run must error
+        // with the checkpoint kept, and a later resume must still
+        // complete with exact bytes.
+        let (url, _version, shutdown, server) = spawn_range_server();
+        let directory = std::env::temp_dir().join(format!("thunderload-control-close-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("file.bin")).await.unwrap();
+        let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        let url_for_run = url.clone();
+        let target_for_run = target.clone();
+        let task = tokio::spawn(async move {
+            download_url_resumable(&url_for_run, &target_for_run, None, control_rx, Arc::new(GlobalRateLimiter::new()), progress_tx).await
+        });
+        let part = partial_download_path(&target);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let written = tokio::fs::metadata(&part).await.map(|metadata| metadata.len()).unwrap_or(0);
+            if written > 0 { break; }
+            assert!(tokio::time::Instant::now() < deadline, "download never wrote its first checkpoint bytes");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        drop(control_tx);
+        let result = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("run hung after the control channel closed")
+            .unwrap();
+        assert!(result.is_err(), "a dropped control channel must error, not cancel");
+        assert!(
+            result.unwrap_err().to_string().contains("partial checkpoint kept"),
+            "the error must say the checkpoint was kept"
+        );
+        assert!(tokio::fs::try_exists(&part).await.unwrap(), "part file must be kept");
+        assert!(
+            tokio::fs::try_exists(partial_download_metadata_path(&target)).await.unwrap(),
+            "checkpoint metadata must be kept"
+        );
+        // Resume after the disconnect completes with exact bytes.
+        let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        let outcome = download_url_resumable(
+            &url, &target, None, control_rx, Arc::new(GlobalRateLimiter::new()), progress_tx
+        ).await.unwrap();
+        assert_eq!(outcome, DownloadOutcome::Completed);
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(bytes, vec![b'A'; BODY_SIZE]);
+        drop(control_tx);
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn pause_resume_uses_byte_range_and_preserves_original_file_bytes() {
         let (url, _version, shutdown, server) = spawn_range_server();
         let directory = std::env::temp_dir().join(format!("thunderload-resume-{}", uuid::Uuid::new_v4()));
@@ -2583,6 +3526,143 @@ mod resumable_http_tests {
         assert_eq!(outcome, DownloadOutcome::Completed);
         let bytes = tokio::fs::read(&target).await.unwrap();
         assert_eq!(bytes, vec![b'B'; BODY_SIZE]);
+        drop(control_tx);
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    /// A server whose object changes mid-download: the opening HEAD
+    /// probe and the first GET see v1 (256 KiB, ETag "v1"), but the
+    /// first GET is cut off halfway through the body — a mid-stream
+    /// transport failure. Every later GET serves the whole of v2
+    /// (384 KiB, ETag "v2") as a 200, because the retry's If-Range
+    /// ("v1") no longer matches. Models a mid-stream transient
+    /// failure followed by an object change.
+    fn spawn_changing_midstream_server() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        const V1_SIZE: usize = 256 * 1024;
+        const V2_SIZE: usize = 384 * 1024;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = shutdown.clone();
+        let gets = Arc::new(AtomicUsize::new(0));
+        let thread_gets = gets.clone();
+        let handle = thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => {
+                        let _ = connection.0.set_nonblocking(false);
+                        connection
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(3));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => {
+                            request.extend_from_slice(&buffer[..count]);
+                            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let is_head = request
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .starts_with("HEAD ");
+                if is_head {
+                    // The opening probe always sees v1.
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {V1_SIZE}\r\nETag: \"v1\"\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(headers.as_bytes());
+                    continue;
+                }
+                let get_no = thread_gets.fetch_add(1, Ordering::Relaxed);
+                if get_no == 0 {
+                    // First GET: v1 headers, half the body, then drop
+                    // the socket — a mid-stream transport failure.
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {V1_SIZE}\r\nETag: \"v1\"\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+                    );
+                    if stream.write_all(headers.as_bytes()).is_err() {
+                        continue;
+                    }
+                    let _ = stream.write_all(&vec![b'A'; V1_SIZE / 2]);
+                    drop(stream);
+                    continue;
+                }
+                // Every later GET: the object changed, so the retry's
+                // If-Range ("v1") no longer matches and the whole new
+                // version is served as a 200 with a different total.
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {V2_SIZE}\r\nETag: \"v2\"\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+                );
+                if stream.write_all(headers.as_bytes()).is_err() {
+                    continue;
+                }
+                let _ = stream.write_all(&vec![b'B'; V2_SIZE]);
+            }
+        });
+        (format!("http://{address}/download.bin"), shutdown, handle)
+    }
+
+    #[tokio::test]
+    async fn sequential_midstream_retry_restarting_on_changed_object_completes_with_new_total() {
+        // MUST-FIX regression test: a mid-stream transient failure
+        // whose retry GET returns 200 with a DIFFERENT total (the
+        // object changed, so If-Range failed) must complete against
+        // the NEW total. Before the fix the run downloaded the new
+        // version byte-exact, then failed the end-of-function check
+        // against the stale opening total — and Resume would have
+        // re-downloaded everything from scratch.
+        let (url, shutdown, server) = spawn_changing_midstream_server();
+        let directory = std::env::temp_dir().join(format!(
+            "thunderload-midstream-200-{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("changed.bin"))
+            .await
+            .unwrap();
+        let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            download_url_resumable(
+                &url,
+                &target,
+                None,
+                control_rx,
+                Arc::new(GlobalRateLimiter::new()),
+                progress_tx,
+            ),
+        )
+        .await
+        .expect("run hung after the mid-stream failure")
+        .unwrap();
+        assert_eq!(outcome, DownloadOutcome::Completed);
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(
+            bytes.len(),
+            384 * 1024,
+            "final file length must equal the new version's total"
+        );
+        assert!(
+            bytes.iter().all(|byte| *byte == b'B'),
+            "final file must be entirely the new version's bytes"
+        );
         drop(control_tx);
         shutdown.store(true, Ordering::Relaxed);
         server.join().unwrap();
@@ -2678,9 +3758,14 @@ mod resumable_http_tests {
     }
 
     fn gated_session_for(url: &str) -> SessionHeaders {
+        // The referer must be genuinely same-origin with the download
+        // URL (same scheme/host/port): a bare "http://127.0.0.1/page"
+        // is cross-origin with the server's ephemeral port, so the
+        // same-origin Referer rule correctly withholds it.
+        let referer = SessionHeaders::origin_of(url).map(|origin| format!("{origin}/page"));
         let session = SessionHeaders {
             cookies: Some("sessionid=abc123".to_string()),
-            referer: Some("http://127.0.0.1/page".to_string()),
+            referer,
             user_agent: Some("ThunderLoad-Test/1.0".to_string()),
             origin: SessionHeaders::origin_of(url),
         };
@@ -2709,7 +3794,49 @@ mod resumable_http_tests {
         assert!(!seen.is_empty(), "server must have seen at least one request");
         for entry in seen.iter() {
             assert!(entry.contains("cookie=sessionid=abc123"), "request without the session cookie: {entry}");
-            assert!(entry.contains("referer=http://127.0.0.1/page"), "request without the referer: {entry}");
+            let expected_referer = format!("referer={}/page", SessionHeaders::origin_of(&url).unwrap());
+            assert!(entry.contains(&expected_referer), "request without the referer: {entry}");
+            assert!(entry.contains("user-agent=ThunderLoad-Test/1.0"), "request without the browser UA: {entry}");
+        }
+        drop(control_tx);
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    /// P1-2 (Referer): a cross-origin referer must be withheld even
+    /// when the rest of the session applies — the cookie is still sent
+    /// (same-origin) and the browser UA is still sent, but no request
+    /// may carry the referer at all.
+    #[tokio::test]
+    async fn cross_origin_referer_is_withheld_for_a_gated_download() {
+        let (url, seen, shutdown, server) = spawn_cookie_gated_server();
+        let directory = std::env::temp_dir().join(format!("thunderload-session-xorigin-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("file.bin")).await.unwrap();
+        let session = SessionHeaders {
+            cookies: Some("sessionid=abc123".to_string()),
+            referer: Some("http://example.com/page".to_string()),
+            user_agent: Some("ThunderLoad-Test/1.0".to_string()),
+            origin: SessionHeaders::origin_of(&url),
+        };
+        assert!(session.validate(&url).is_ok(), "test session must validate for {url}");
+        let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        let outcome = download_url_resumable(
+            &url, &target, Some(&session), control_rx, Arc::new(GlobalRateLimiter::new()), progress_tx,
+        ).await.unwrap();
+        assert_eq!(outcome, DownloadOutcome::Completed);
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(bytes, vec![b'C'; BODY_SIZE]);
+        // The cookie and UA still went out (same-origin / unconditional),
+        // but no request carried the cross-origin referer.
+        let seen = seen.lock().unwrap();
+        assert!(!seen.is_empty(), "server must have seen at least one request");
+        for entry in seen.iter() {
+            assert!(entry.contains("cookie=sessionid=abc123"), "request without the session cookie: {entry}");
+            assert!(entry.contains("referer=|"), "cross-origin referer leaked: {entry}");
+            assert!(!entry.contains("example.com"), "cross-origin referer leaked: {entry}");
             assert!(entry.contains("user-agent=ThunderLoad-Test/1.0"), "request without the browser UA: {entry}");
         }
         drop(control_tx);
@@ -2852,6 +3979,134 @@ mod resumable_http_tests {
         for entry in seen.iter().skip(requests_before_resume) {
             assert!(entry.contains("cookie=sessionid=abc123"), "resume request without the session cookie: {entry}");
         }
+        drop(control_tx);
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    /// Serves a complete object on HEAD, then answers every Range GET
+    /// with 416. `include_content_range` controls whether the 416
+    /// carries `Content-Range: bytes */{BODY_SIZE}` — the P1-1 commit
+    /// gate needs the total stated explicitly.
+    fn spawn_416_server(include_content_range: bool) -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = shutdown.clone();
+        let handle = thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => {
+                        let _ = connection.0.set_nonblocking(false);
+                        connection
+                    },
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(3));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => {
+                            request.extend_from_slice(&buffer[..count]);
+                            if request.windows(4).any(|window| window == b"\r\n\r\n") { break; }
+                        }
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let first = request.lines().next().unwrap_or_default().to_string();
+                if first.starts_with("HEAD ") {
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {BODY_SIZE}\r\nContent-Type: application/octet-stream\r\nETag: \"v1\"\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(headers.as_bytes());
+                    continue;
+                }
+                let content_range = if include_content_range {
+                    format!("Content-Range: bytes */{BODY_SIZE}\r\n")
+                } else {
+                    String::new()
+                };
+                let headers = format!(
+                    "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nContent-Type: application/octet-stream\r\nETag: \"v1\"\r\n{content_range}Connection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(headers.as_bytes());
+            }
+        });
+        (format!("http://{address}/file.bin"), shutdown, handle)
+    }
+
+    /// Seeds a complete sequential checkpoint: a part file holding all
+    /// BODY_SIZE bytes plus metadata naming the same object (ETag "v1",
+    /// total BODY_SIZE). A resume of this checkpoint sends
+    /// `Range: bytes={BODY_SIZE}-`, which a correct server answers 416.
+    async fn seed_complete_checkpoint(target: &std::path::Path, url: &str) {
+        let part = partial_download_path(target);
+        let metadata_path = partial_download_metadata_path(target);
+        tokio::fs::write(&part, vec![b'C'; BODY_SIZE]).await.unwrap();
+        let metadata = ResumeMetadata {
+            url: url.to_string(),
+            etag: Some("\"v1\"".to_string()),
+            last_modified: None,
+            total: Some(BODY_SIZE as u64),
+            connections: None,
+            segments: None,
+            dynamic: None,
+            session: None,
+        };
+        write_resume_metadata(&metadata_path, &metadata).await.unwrap();
+    }
+
+    /// P1-1: a 416 with no Content-Range must NOT commit the part —
+    /// the server never stated its total, so the bytes may be stale.
+    #[tokio::test]
+    async fn resume_416_without_content_range_does_not_commit() {
+        let (url, shutdown, server) = spawn_416_server(false);
+        let directory = std::env::temp_dir().join(format!("thunderload-416-norange-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = directory.join("file.bin");
+        seed_complete_checkpoint(&target, &url).await;
+        let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        let result = download_url_resumable(
+            &url, &target, None, control_rx, Arc::new(GlobalRateLimiter::new()), progress_tx,
+        ).await;
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("416"), "expected a 416 rejection, got {error}");
+        assert!(!tokio::fs::try_exists(&target).await.unwrap(), "target must not be committed");
+        assert!(!tokio::fs::try_exists(partial_download_path(&target)).await.unwrap(), "stale part must be cleared");
+        assert!(!tokio::fs::try_exists(partial_download_metadata_path(&target)).await.unwrap(), "stale metadata must be cleared");
+        drop(control_tx);
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    /// P1-1: a 416 that states `bytes */{BODY_SIZE}` with the same
+    /// ETag commits the already-complete part file.
+    #[tokio::test]
+    async fn resume_416_with_matching_total_and_identity_commits() {
+        let (url, shutdown, server) = spawn_416_server(true);
+        let directory = std::env::temp_dir().join(format!("thunderload-416-commit-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = directory.join("file.bin");
+        seed_complete_checkpoint(&target, &url).await;
+        let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        let outcome = download_url_resumable(
+            &url, &target, None, control_rx, Arc::new(GlobalRateLimiter::new()), progress_tx,
+        ).await.unwrap();
+        assert_eq!(outcome, DownloadOutcome::Completed);
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(bytes, vec![b'C'; BODY_SIZE]);
+        assert!(!tokio::fs::try_exists(partial_download_path(&target)).await.unwrap(), "part must be consumed by the commit");
+        assert!(!tokio::fs::try_exists(partial_download_metadata_path(&target)).await.unwrap(), "metadata must be consumed by the commit");
         drop(control_tx);
         shutdown.store(true, Ordering::Relaxed);
         server.join().unwrap();
@@ -3335,9 +4590,10 @@ mod resume_metadata_tests {
 #[cfg(test)]
 mod segmented_http_tests {
     use super::{
-        client, download_segmented, download_url, probe_range_support, DownloadProgress,
-        GlobalRateLimiter, WEBPAGE_NOT_MEDIA_MESSAGE,
+        client, download_segmented, download_url, probe_range_support, DownloadControl,
+        DownloadProgress, GlobalRateLimiter, WEBPAGE_NOT_MEDIA_MESSAGE,
     };
+    use crate::AUTH_REQUIRED_MESSAGE;
     use reqwest::Client;
     use std::{
         io::{Read, Write},
@@ -3346,7 +4602,7 @@ mod segmented_http_tests {
         thread,
         time::Duration,
     };
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, watch};
 
     const BODY_SIZE: usize = 2 * 1024 * 1024 + 37;
 
@@ -3600,6 +4856,7 @@ mod segmented_http_tests {
         let (progress_tx, _progress_rx) = mpsc::unbounded_channel::<DownloadProgress>();
         let error = download_url(
             &url, &target, 4, None, progress_tx, Arc::new(GlobalRateLimiter::new()),
+            watch::channel(DownloadControl::Running).1,
         ).await.unwrap_err();
         assert_eq!(error.to_string(), WEBPAGE_NOT_MEDIA_MESSAGE);
         assert!(!tokio::fs::try_exists(&target).await.unwrap());
@@ -3627,6 +4884,7 @@ mod segmented_http_tests {
             None,
             progress_tx,
             Arc::new(GlobalRateLimiter::new()),
+            watch::channel(DownloadControl::Running).1,
         )
         .await;
         shutdown.store(true, Ordering::Relaxed);
@@ -3689,7 +4947,7 @@ mod segmented_http_tests {
             events
         });
         let path = directory.join("payload.bin");
-        let result = download_url(&url, &path, 2, None, progress_tx, Arc::new(GlobalRateLimiter::new())).await;
+        let result = download_url(&url, &path, 2, None, progress_tx, Arc::new(GlobalRateLimiter::new()), watch::channel(DownloadControl::Running).1).await;
         shutdown.store(true, Ordering::Relaxed);
         server.join().unwrap();
         result.unwrap();
@@ -3725,7 +4983,7 @@ mod segmented_http_tests {
             events
         });
         let path = directory.join("payload.bin");
-        let result = download_url(&url, &path, 1, None, progress_tx, Arc::new(GlobalRateLimiter::new())).await;
+        let result = download_url(&url, &path, 1, None, progress_tx, Arc::new(GlobalRateLimiter::new()), watch::channel(DownloadControl::Running).1).await;
         shutdown.store(true, Ordering::Relaxed);
         server.join().unwrap();
         result.unwrap();
@@ -3736,6 +4994,95 @@ mod segmented_http_tests {
             events.iter().all(|event| event.segments_done.is_none() && event.segments_total.is_none()),
             "a sequential download must not claim segment progress; events: {events:?}"
         );
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    /// Serves HEAD as a large ranged object, 403s every Range GET, but
+    /// answers a plain GET with the full body — the P1-7 guard must
+    /// surface the login label instead of falling back to that plain
+    /// GET, so the test also counts plain GETs and requires zero.
+    fn spawn_range_forbidden_server() -> (String, Arc<AtomicUsize>, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let plain_gets = Arc::new(AtomicUsize::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_plain_gets = plain_gets.clone();
+        let thread_shutdown = shutdown.clone();
+        let handle = thread::spawn(move || {
+            let body: Vec<u8> = (0..BODY_SIZE).map(|index| (index % 251) as u8).collect();
+            while !thread_shutdown.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => {
+                        let _ = connection.0.set_nonblocking(false);
+                        connection
+                    },
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => {
+                            request.extend_from_slice(&buffer[..count]);
+                            if request.windows(4).any(|window| window == b"\r\n\r\n") { break; }
+                        }
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let header = |name: &str| request.lines().find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case(name).then(|| value.trim().to_string())
+                }).unwrap_or_default();
+                let first = request.lines().next().unwrap_or_default().to_string();
+                if first.starts_with("HEAD ") {
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {BODY_SIZE}\r\nContent-Type: application/octet-stream\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(headers.as_bytes());
+                    continue;
+                }
+                if !header("range").is_empty() {
+                    let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    continue;
+                }
+                thread_plain_gets.fetch_add(1, Ordering::Relaxed);
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {BODY_SIZE}\r\nContent-Type: application/octet-stream\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+                );
+                if stream.write_all(headers.as_bytes()).is_err() { continue; }
+                for chunk in body.chunks(8192) {
+                    if stream.write_all(chunk).is_err() { break; }
+                }
+            }
+        });
+        (format!("http://{address}/file.bin"), plain_gets, shutdown, handle)
+    }
+
+    /// P1-7: when the segmented path 403s but a plain GET would 200,
+    /// `download_url` must surface the login label — not silently fall
+    /// back to the plain GET, and not report a bare HTTP 403.
+    #[tokio::test]
+    async fn download_url_propagates_login_label_when_ranges_403() {
+        let (url, plain_gets, shutdown, server) = spawn_range_forbidden_server();
+        let directory = std::env::temp_dir().join(format!("thunderload-url-403-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let path = directory.join("file.bin");
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel::<DownloadProgress>();
+        let error = download_url(
+            &url, &path, 2, None, progress_tx, Arc::new(GlobalRateLimiter::new()),
+            watch::channel(DownloadControl::Running).1,
+        ).await.unwrap_err();
+        assert_eq!(error.to_string(), AUTH_REQUIRED_MESSAGE);
+        assert_eq!(plain_gets.load(Ordering::Relaxed), 0, "the sequential fallback must never issue a plain GET after a segmented auth failure");
+        assert!(!tokio::fs::try_exists(&path).await.unwrap(), "no file must be left behind on a terminal auth failure");
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap();
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 }
@@ -4463,6 +5810,9 @@ mod dynamic_segmentation_tests {
     enum UnevenMode {
         SlowFirstConnection,
         StallOnce { start: usize },
+        /// Answer the first N ranged GETs with 503, then serve
+        /// normally — the transient-retry path must recover.
+        FailFirstRangeGets { remaining: Arc<AtomicUsize> },
     }
 
     struct RangedFixture {
@@ -4487,6 +5837,15 @@ mod dynamic_segmentation_tests {
         spawn_ranged_server(BODY_SIZE, UnevenMode::StallOnce { start: stall_start })
     }
 
+    fn spawn_flaky_server(failures: usize) -> RangedFixture {
+        spawn_ranged_server(
+            BODY_SIZE,
+            UnevenMode::FailFirstRangeGets {
+                remaining: Arc::new(AtomicUsize::new(failures)),
+            },
+        )
+    }
+
     fn spawn_ranged_server(body_size: usize, mode: UnevenMode) -> RangedFixture {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -4498,6 +5857,10 @@ mod dynamic_segmentation_tests {
         let body = Arc::new(body_sized(body_size));
         let thread_shutdown = shutdown.clone();
         let thread_requests = range_requests.clone();
+        let fail_remaining = match &mode {
+            UnevenMode::FailFirstRangeGets { remaining } => Some(remaining.clone()),
+            _ => None,
+        };
         let handle = thread::spawn(move || {
             while !thread_shutdown.load(Ordering::Relaxed) {
                 let (mut stream, _) = match listener.accept() {
@@ -4516,10 +5879,11 @@ mod dynamic_segmentation_tests {
                 let stalled_once = stalled_once.clone();
                 let shutdown = thread_shutdown.clone();
                 let requests = thread_requests.clone();
+                let fail_remaining = fail_remaining.clone();
                 let mode_slow = matches!(mode, UnevenMode::SlowFirstConnection);
                 let stall_start = match mode {
                     UnevenMode::StallOnce { start } => Some(start),
-                    UnevenMode::SlowFirstConnection => None,
+                    _ => None,
                 };
                 thread::spawn(move || {
                     // This connection is slow iff it is the first one to
@@ -4597,6 +5961,30 @@ mod dynamic_segmentation_tests {
                                     thread::sleep(Duration::from_millis(100));
                                 }
                                 return;
+                            }
+                        }
+                        // FailFirstRangeGets mode: the first N ranged
+                        // GETs answer 503, then the server recovers.
+                        // HEADs (no Range) are never failed.
+                        if range.is_some() {
+                            if let Some(remaining) = &fail_remaining {
+                                let mut current = remaining.load(Ordering::Relaxed);
+                                while current > 0 {
+                                    match remaining.compare_exchange_weak(
+                                        current,
+                                        current - 1,
+                                        Ordering::Relaxed,
+                                        Ordering::Relaxed,
+                                    ) {
+                                        Ok(_) => {
+                                            let _ = stream.write_all(
+                                                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                            );
+                                            return;
+                                        }
+                                        Err(next) => current = next,
+                                    }
+                                }
                             }
                         }
                         let payload_len = end - start + 1;
@@ -4768,6 +6156,190 @@ mod dynamic_segmentation_tests {
             previous = event.downloaded;
         }
         assert_eq!(previous, BODY_SIZE as u64, "final progress must reach the total");
+        fixture.stop();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pause_racing_watchdog_abort_returns_paused_not_a_hang() {
+        // P0-2: one worker, one chunk stalled forever (until shutdown).
+        // The watchdog aborts the worker at the 1 s stall timeout and
+        // Pause arrives just after — before the reap, or just after it.
+        // Either ordering must end Paused: on the old coordinator the
+        // break condition only saw `saw_paused`, which a
+        // watchdog-aborted worker never sets, so the loop ran forever.
+        // The timeout turns a regression into a test failure instead of
+        // hanging the suite.
+        let stall_start = chunk_ranges(BODY_SIZE as u64)[0].0 as usize;
+        let fixture = spawn_stall_once_server(stall_start);
+        let directory = temp_dir("pause-watchdog-race");
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("file.bin")).await.unwrap();
+        let server = ServerInfo {
+            total: Some(BODY_SIZE as u64),
+            supports_ranges: true,
+            etag: Some("\"v1\"".into()),
+            last_modified: None,
+            is_webpage: false,
+        };
+        let part = partial_download_path(&target);
+        let metadata_path = partial_download_metadata_path(&target);
+        let metadata =
+            fresh_segmented_metadata(&fixture.url, BODY_SIZE as u64, 1, &server, None);
+        ensure_segmented_part(&part, BODY_SIZE as u64).await.unwrap();
+        write_resume_metadata(&metadata_path, &metadata).await.unwrap();
+        let checkpoint = Arc::new(tokio::sync::Mutex::new(SegmentCheckpoint {
+            metadata_path: metadata_path.clone(),
+            metadata,
+            last_write: Instant::now(),
+        }));
+        let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        let client = super::client().unwrap();
+        let pauser = {
+            let control_tx = control_tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(1100)).await;
+                let _ = control_tx.send(DownloadControl::Paused);
+            })
+        };
+        let run = tokio::time::timeout(
+            Duration::from_secs(15),
+            run_segmented_download_with_stats(
+                &client,
+                &fixture.url,
+                &target,
+                &part,
+                &checkpoint,
+                BODY_SIZE as u64,
+                Some("\"v1\"".into()),
+                None,
+                control_rx,
+                Arc::new(GlobalRateLimiter::new()),
+                progress_tx,
+                Duration::from_secs(1),
+            ),
+        )
+        .await;
+        pauser.abort();
+        drop(control_tx);
+        let (run, _stats) = run
+            .expect("coordinator must return instead of looping forever")
+            .unwrap();
+        assert!(
+            matches!(run, SegmentedRun::Finished(DownloadOutcome::Paused)),
+            "run: {run:?}"
+        );
+        fixture.stop();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn transient_503_chunks_are_retried_and_complete() {
+        // MC3: the first two ranged GETs answer 503. Before the fix
+        // that was a terminal error; now the affected chunks retry
+        // with backoff on fresh connections and the run completes
+        // with exact bytes.
+        let fixture = spawn_flaky_server(2);
+        let directory = temp_dir("flaky-503");
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("file.bin")).await.unwrap();
+        let before = fixture.range_requests.load(Ordering::Relaxed);
+        let (run, stats, _events) =
+            run_dynamic(&fixture.url, &target, 8, Duration::from_secs(30)).await;
+        assert!(matches!(run, SegmentedRun::Finished(DownloadOutcome::Completed)), "run: {run:?}");
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(bytes, body());
+        // Rollback proof on the real counter, not the plan: the
+        // shared received counter must equal the true byte count
+        // after the retries. Bytes counted twice across a retried
+        // attempt would leave it above the total even though the
+        // file itself is byte-exact.
+        assert_eq!(
+            stats.received,
+            BODY_SIZE as u64,
+            "shared received counter must equal the true byte count after the 503 retries"
+        );
+        assert!(
+            fixture.range_requests.load(Ordering::Relaxed) - before
+                > chunk_ranges(BODY_SIZE as u64).len(),
+            "the 503s must have cost extra (retried) range requests"
+        );
+        fixture.stop();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn control_channel_close_keeps_segmented_checkpoint() {
+        // N1: dropping the control sender mid-run (host disconnected)
+        // is NOT a user Cancel — the run must error with the
+        // checkpoint kept, never delete the resume state. One chunk
+        // is stalled for the whole run so the download is guaranteed
+        // still in flight when the channel closes.
+        let stall_start = chunk_ranges(BODY_SIZE as u64)[3].0 as usize;
+        let fixture = spawn_stall_once_server(stall_start);
+        let directory = temp_dir("control-close-seg");
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("file.bin")).await.unwrap();
+        let server = ServerInfo {
+            total: Some(BODY_SIZE as u64),
+            supports_ranges: true,
+            etag: Some("\"v1\"".into()),
+            last_modified: None,
+            is_webpage: false,
+        };
+        let part = partial_download_path(&target);
+        let metadata_path = partial_download_metadata_path(&target);
+        let metadata =
+            fresh_segmented_metadata(&fixture.url, BODY_SIZE as u64, 8, &server, None);
+        ensure_segmented_part(&part, BODY_SIZE as u64).await.unwrap();
+        write_resume_metadata(&metadata_path, &metadata).await.unwrap();
+        let checkpoint = Arc::new(tokio::sync::Mutex::new(SegmentCheckpoint {
+            metadata_path: metadata_path.clone(),
+            metadata,
+            last_write: Instant::now(),
+        }));
+        let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        let client = super::client().unwrap();
+        let url = fixture.url.clone();
+        let part_for_run = part.clone();
+        let run = tokio::spawn(async move {
+            run_segmented_download_with_stats(
+                &client,
+                &url,
+                &target,
+                &part_for_run,
+                &checkpoint,
+                BODY_SIZE as u64,
+                Some("\"v1\"".into()),
+                None,
+                control_rx,
+                Arc::new(GlobalRateLimiter::new()),
+                progress_tx,
+                Duration::from_secs(30),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        drop(control_tx);
+        let result = tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("run hung after the control channel closed")
+            .unwrap();
+        assert!(result.is_err(), "a dropped control channel must error, not cancel");
+        assert!(
+            result.unwrap_err().to_string().contains("partial checkpoint kept"),
+            "the error must say the checkpoint was kept"
+        );
+        assert!(
+            tokio::fs::try_exists(&part).await.unwrap(),
+            "part file must be kept"
+        );
+        assert!(
+            tokio::fs::try_exists(&metadata_path).await.unwrap(),
+            "checkpoint metadata must be kept"
+        );
         fixture.stop();
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }

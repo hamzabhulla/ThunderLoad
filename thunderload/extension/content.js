@@ -34,8 +34,21 @@
       return YTDLP_HOSTS.some((listed) => host === listed || host.endsWith("." + listed));
     } catch (_) { return false; }
   }
+  function normalizeMissingTool(missing) {
+    if (Array.isArray(missing)) return typeof missing[0] === "string" && missing[0] ? missing[0] : null;
+    return typeof missing === "string" && missing ? missing : null;
+  }
+  function sanitizeSubtitleFilename(name) {
+    const cleaned = String(name || "subtitles.vtt").replace(/[\u0000-\u001f\\/:*?"<>|]+/g, "_");
+    const dot = cleaned.lastIndexOf(".");
+    if (dot > 0) {
+      return (cleaned.slice(0, dot).slice(0, 180) || "subtitles") + cleaned.slice(dot);
+    }
+    return cleaned.slice(0, 180) || "subtitles.vtt";
+  }
   function ytdlpDisplayName(tool) {
-    return tool === "deno" ? "Deno" : "yt-dlp";
+    const normalized = Array.isArray(tool) ? (tool[0] || "ytdlp") : tool;
+    return normalized === "deno" ? "Deno" : "yt-dlp";
   }
   // The grabber caps at 100 items per page (same cap as the engine);
   // `truncated` tells the popup the page held more.
@@ -64,8 +77,22 @@
   const PILL_AUTO_HIDE_MS = 3000;
   let autoHideTimer = null;
   // Slice 1b: shown when the nativeMessaging permission cannot be
-  // requested or is denied — one short sentence, no raw errors.
-  const MANUAL_PERMISSION_STEPS = "Allow it manually: chrome://extensions → ThunderLoad → Details → Permissions → enable native messaging, then reload.";
+  // requested or is denied — one short sentence, no raw errors. The
+  // extensions page differs per browser: about:addons on Firefox,
+  // edge://extensions on Edge, opera://extensions on Opera, and
+  // chrome://extensions everywhere else Chromium.
+  const MANUAL_PERMISSION_STEPS = (() => {
+    if (typeof globalThis.browser !== "undefined") {
+      return "Allow it manually: about:addons → ThunderLoad → Details → Permissions → enable native messaging, then reload.";
+    }
+    const userAgent = typeof navigator !== "undefined" ? navigator.userAgent || "" : "";
+    const extensionsPage = /Edg\//.test(userAgent)
+      ? "edge://extensions"
+      : /OPR\//.test(userAgent)
+        ? "opera://extensions"
+        : "chrome://extensions";
+    return "Allow it manually: " + extensionsPage + " → ThunderLoad → Details → Permissions → enable native messaging, then reload.";
+  })();
   let buttonHost = null;
   let button = null;
   let status = null;
@@ -359,14 +386,14 @@
         const result = await api.runtime.sendMessage({
           type: "NATIVE_REQUEST",
           action: "hls.subtitles.download",
-          payload: { playlistUrl: subtitle.url, url: subtitle.url, filename: (subtitle.language || "subtitles") + ".vtt", referer: location.href }
+          payload: { playlistUrl: subtitle.url, url: subtitle.url, filename: sanitizeSubtitleFilename((subtitle.language || "subtitles") + ".vtt"), referer: location.href }
         });
         if (!result?.ok) throw new Error(result?.error || "Could not download subtitles.");
       } else {
         const result = await api.runtime.sendMessage({
           type: "BROWSER_DOWNLOAD",
           url: subtitle.url,
-          filename: (subtitle.language || "subtitles") + "." + (subtitle.format || "vtt")
+          filename: sanitizeSubtitleFilename((subtitle.language || "subtitles") + "." + (subtitle.format || "vtt"))
         });
         if (!result?.ok) throw new Error(result?.error || "Could not download subtitles.");
       }
@@ -721,8 +748,9 @@
   // fetched until the user presses this button. The manual link
   // below it is only the backup.
   function ytdlpToolDownloadFragment(tool, onDone) {
+    const toolId = normalizeMissingTool(tool) || "ytdlp";
     const frag = document.createDocumentFragment();
-    const name = ytdlpDisplayName(tool);
+    const name = ytdlpDisplayName(toolId);
     const downloadBtn = document.createElement("button");
     downloadBtn.type = "button";
     downloadBtn.className = "p-connect";
@@ -739,7 +767,7 @@
       downloadBtn.disabled = true;
       note.classList.remove("show");
       try {
-        const result = await api.runtime.sendMessage({ type: "YTDLP_ENSURE_TOOL", tool });
+        const result = await api.runtime.sendMessage({ type: "YTDLP_ENSURE_TOOL", tool: toolId });
         if (result?.ok) {
           if (typeof onDone === "function") onDone();
         } else {
@@ -758,7 +786,7 @@
     manual.className = "p-link";
     manual.textContent = "or download it yourself";
     manual.addEventListener("click", () => {
-      api.runtime.sendMessage({ type: "YTDLP_OPEN_MANUAL_PAGE", tool }).catch(() => {});
+      api.runtime.sendMessage({ type: "YTDLP_OPEN_MANUAL_PAGE", tool: toolId }).catch(() => {});
     });
     frag.append(downloadBtn, progress, note, manual);
     return frag;
@@ -847,14 +875,15 @@
         const result = await api.runtime.sendMessage({ type: "YTDLP_INSPECT", pageUrl: location.href });
         if (panelTarget !== target || !panelEl()?.classList.contains("show")) return;
         if (!result?.ok) {
-          panelYtDlp = result?.toolsMissing
-            ? { toolsMissing: result.toolsMissing }
+          const missingTool = normalizeMissingTool(result?.toolsMissing);
+          panelYtDlp = missingTool
+            ? { toolsMissing: missingTool }
             : { error: result?.error || "Could not inspect this page." };
           // Slice 6 fix (MINOR 1): the normal inspect found nothing
           // usable — try the GenericIE fallback before settling on
           // the error state. toolsMissing is the exception: generic
           // needs the same yt-dlp binary, so it cannot run either.
-          if (!result?.toolsMissing) tryGenericInspect(target);
+          if (!missingTool) tryGenericInspect(target);
         } else {
           const variants = (result.variants || []).filter((item) => item?.downloadable && item?.url);
           variants.sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bandwidth || 0) - (a.bandwidth || 0));
@@ -1000,7 +1029,7 @@
         const download = document.createElement("button");
         download.type = "button";
         download.className = "p-dl";
-        download.textContent = "Download";
+        download.textContent = "Inspect";
         download.addEventListener("click", (event) => {
           event.preventDefault();
           event.stopPropagation();

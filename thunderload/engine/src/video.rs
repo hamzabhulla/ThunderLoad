@@ -22,11 +22,21 @@ const MAX_SEGMENT_URL_REFRESHES: usize = 2;
 /// signed URL (or a session the server no longer accepts). Segment
 /// fetchers use it to decide whether re-resolving the playlist is worth
 /// trying; every other failure keeps the checkpoint and fails as today.
+/// Walks the whole anyhow chain (same as `session::auth_failure_label`),
+/// so a `.context(...)` wrap between the request and this check does not
+/// hide the status.
 fn is_auth_error(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<reqwest::Error>()
-        .and_then(|error| error.status())
-        .is_some_and(|status| status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN)
+    auth_failure_label(error).is_some()
 }
+
+/// Error text when the control channel closes mid-transfer: the host
+/// disconnected, which is NOT a user Cancel — the partial files and
+/// checkpoint stay on disk for Resume, and the host marks the job
+/// Interrupted from this error. Same text as
+/// `download::CONTROL_CLOSED_ERROR`, kept in sync so the host's
+/// disconnect path labels it the same way.
+const CONTROL_CLOSED_ERROR: &str =
+    "Download control channel closed; partial checkpoint kept for Resume";
 
 /// The identity of a media URL for plan comparison: the URL with its
 /// query string and fragment stripped. Signed segment URLs rotate their
@@ -99,15 +109,20 @@ pub struct VideoVariant {
 fn client() -> Result<Client> {
     Ok(Client::builder()
         .user_agent("Mozilla/5.0 ThunderLoad/0.1")
-        .redirect(reqwest::redirect::Policy::limited(10))
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .read_timeout(std::time::Duration::from_secs(30))
+        .redirect(crate::session::validated_redirect_policy())
+        .dns_resolver(std::sync::Arc::new(
+            crate::session::ValidatingResolver::from_env(),
+        ))
         .build()?)
 }
 
 pub async fn inspect_video(url: &str, session: Option<&SessionHeaders>) -> Result<Vec<VideoVariant>> {
-    let parsed = Url::parse(url).context("Invalid media URL")?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(anyhow!("Only HTTP and HTTPS media URLs can be inspected"));
-    }
+    // N2: the full public-URL validator, not a scheme-only check —
+    // a localhost/private target is refused here, and every redirect
+    // hop is re-validated by the client's redirect policy.
+    let parsed = crate::session::validate_public_http_url(url).context("Invalid media URL")?;
     let lower = parsed.path().to_ascii_lowercase();
 
     if lower.ends_with(".m3u8") {
@@ -499,6 +514,23 @@ fn parse_hls_audio_renditions(body: &str, base: &Url) -> Vec<HlsAudioRendition> 
     out
 }
 
+/// The audio rendition for a variant: the rendition of the variant's
+/// own AUDIO group when it names one (falling back to the DEFAULT
+/// rendition when that group is not listed), or the DEFAULT rendition
+/// when the variant names no group at all. A variant with no group
+/// used to get no audio even when the master declares a DEFAULT —
+/// the download came out silent.
+fn select_hls_audio_rendition(renditions: &[HlsAudioRendition], group: Option<&str>) -> Option<String> {
+    match group {
+        Some(group) => renditions.iter()
+            .find(|rendition| rendition.group_id == group)
+            .or_else(|| renditions.iter().find(|rendition| rendition.is_default))
+            .map(|rendition| rendition.uri.clone()),
+        None => renditions.iter().find(|rendition| rendition.is_default)
+            .map(|rendition| rendition.uri.clone()),
+    }
+}
+
 fn attr(input: &str, name: &str) -> Option<String> {
     let prefix = format!("{name}=");
     split_attr_list(input).into_iter().find_map(|part| {
@@ -538,7 +570,7 @@ struct DashTimelinePoint {
     repeat: i64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct DashTemplate {
     media: Option<String>,
     initialization: Option<String>,
@@ -546,6 +578,19 @@ struct DashTemplate {
     duration: Option<u64>,
     start_number: u64,
     timeline: Vec<DashTimelinePoint>,
+}
+
+impl Default for DashTemplate {
+    fn default() -> Self {
+        Self {
+            media: None,
+            initialization: None,
+            timescale: 1,
+            duration: None,
+            start_number: 1,
+            timeline: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -602,6 +647,11 @@ struct DashAdaptation {
 #[derive(Debug, Clone, Default)]
 struct DashPeriod {
     duration_seconds: Option<f64>,
+    /// `Period@start`: the period's offset from the start of the
+    /// presentation, in seconds. Segment `$Time$` values are measured
+    /// in presentation time, so a second period's segments start here,
+    /// not at zero.
+    start_seconds: Option<f64>,
     base_url: Option<String>,
     template: Option<DashTemplate>,
     segment_list: Option<DashSegmentList>,
@@ -635,6 +685,10 @@ struct DashParserState {
     active_adaptation: Option<usize>,
     active_representation: Option<(usize, usize)>,
     active_template_scope: Option<DashScope>,
+    /// True once the current SegmentTemplate has seen its own `<S>`
+    /// element: the first `<S>` replaces the inherited timeline (see
+    /// the `"S"` arm), later ones append to it.
+    active_template_own_timeline: bool,
     active_segment_list_scope: Option<DashScope>,
     active_segment_base_scope: Option<DashScope>,
     base_scope: Option<DashScope>,
@@ -810,7 +864,6 @@ fn apply_dash_template_attributes(
         template.start_number = value;
     }
     if template.timescale == 0 { template.timescale = 1; }
-    if template.start_number == 0 { template.start_number = 1; }
     template
 }
 
@@ -926,40 +979,51 @@ fn dash_start_element(
         "Period" => {
             document.periods.push(DashPeriod {
                 duration_seconds: attributes.get("duration").and_then(|value| parse_iso_duration(value)),
+                start_seconds: attributes.get("start").and_then(|value| parse_iso_duration(value)),
                 ..DashPeriod::default()
             });
             state.active_period = Some(document.periods.len() - 1);
+            state.active_adaptation = None;
+            state.active_representation = None;
         }
         "AdaptationSet" => {
             if state.active_period.is_none() {
                 document.periods.push(DashPeriod::default());
                 state.active_period = Some(document.periods.len() - 1);
             }
-            let period_index = state.active_period.unwrap();
-            document.periods[period_index].adaptations.push(DashAdaptation {
-                content_type: attributes.get("contentType").cloned().unwrap_or_default(),
-                mime_type: attributes.get("mimeType").cloned().unwrap_or_default(),
-                frame_rate: attributes.get("frameRate").and_then(|value| parse_dash_frame_rate(value)),
-                audio_sampling_rate: attributes.get("audioSamplingRate").and_then(|value| value.trim().parse().ok()),
-                ..DashAdaptation::default()
-            });
-            state.active_adaptation = Some(document.periods[period_index].adaptations.len() - 1);
+            if let Some(period) = state.active_period.and_then(|index| document.periods.get_mut(index)) {
+                period.adaptations.push(DashAdaptation {
+                    content_type: attributes.get("contentType").cloned().unwrap_or_default(),
+                    mime_type: attributes.get("mimeType").cloned().unwrap_or_default(),
+                    frame_rate: attributes.get("frameRate").and_then(|value| parse_dash_frame_rate(value)),
+                    audio_sampling_rate: attributes.get("audioSamplingRate").and_then(|value| value.trim().parse().ok()),
+                    ..DashAdaptation::default()
+                });
+                state.active_adaptation = Some(period.adaptations.len() - 1);
+                state.active_representation = None;
+            }
         }
         "Representation" => {
             if let (Some(period_index), Some(adaptation_index)) = (state.active_period, state.active_adaptation) {
-                let representation_index = document.periods[period_index].adaptations[adaptation_index].representations.len();
-                document.periods[period_index].adaptations[adaptation_index].representations.push(DashRepresentation {
-                    id: attributes.get("id").cloned().unwrap_or_else(|| format!("representation-{representation_index}")),
-                    width: attributes.get("width").and_then(|value| value.parse().ok()),
-                    height: attributes.get("height").and_then(|value| value.parse().ok()),
-                    bandwidth: attributes.get("bandwidth").and_then(|value| value.parse().ok()),
-                    mime_type: attributes.get("mimeType").cloned().unwrap_or_default(),
-                    codecs: attributes.get("codecs").cloned(),
-                    frame_rate: attributes.get("frameRate").and_then(|value| parse_dash_frame_rate(value)),
-                    audio_sampling_rate: attributes.get("audioSamplingRate").and_then(|value| value.trim().parse().ok()),
-                    ..DashRepresentation::default()
-                });
-                state.active_representation = Some((adaptation_index, representation_index));
+                if let Some(adaptation) = document
+                    .periods
+                    .get_mut(period_index)
+                    .and_then(|period| period.adaptations.get_mut(adaptation_index))
+                {
+                    let representation_index = adaptation.representations.len();
+                    adaptation.representations.push(DashRepresentation {
+                        id: attributes.get("id").cloned().unwrap_or_else(|| format!("representation-{representation_index}")),
+                        width: attributes.get("width").and_then(|value| value.parse().ok()),
+                        height: attributes.get("height").and_then(|value| value.parse().ok()),
+                        bandwidth: attributes.get("bandwidth").and_then(|value| value.parse().ok()),
+                        mime_type: attributes.get("mimeType").cloned().unwrap_or_default(),
+                        codecs: attributes.get("codecs").cloned(),
+                        frame_rate: attributes.get("frameRate").and_then(|value| parse_dash_frame_rate(value)),
+                        audio_sampling_rate: attributes.get("audioSamplingRate").and_then(|value| value.trim().parse().ok()),
+                        ..DashRepresentation::default()
+                    });
+                    state.active_representation = Some((adaptation_index, representation_index));
+                }
             }
         }
         "SegmentTemplate" => {
@@ -973,20 +1037,26 @@ fn dash_start_element(
                 }
                 DashScope::Adaptation => {
                     if let Some(index) = state.active_adaptation {
-                        if let Some(period) = dash_period_mut(document, period_index) {
-                            period.adaptations[index].template = Some(template);
+                        if let Some(adaptation) = dash_period_mut(document, period_index)
+                            .and_then(|period| period.adaptations.get_mut(index))
+                        {
+                            adaptation.template = Some(template);
                         }
                     }
                 }
                 DashScope::Representation => {
                     if let Some((adaptation, representation)) = state.active_representation {
-                        if let Some(period) = dash_period_mut(document, period_index) {
-                            period.adaptations[adaptation].representations[representation].template = Some(template);
+                        if let Some(rep) = dash_period_mut(document, period_index)
+                            .and_then(|period| period.adaptations.get_mut(adaptation))
+                            .and_then(|adaptation| adaptation.representations.get_mut(representation))
+                        {
+                            rep.template = Some(template);
                         }
                     }
                 }
             }
             state.active_template_scope = Some(scope_before);
+            state.active_template_own_timeline = false;
         }
         "S" => {
             if let Some(scope) = state.active_template_scope {
@@ -997,6 +1067,16 @@ fn dash_start_element(
                 };
                 if point.duration > 0 {
                     if let Some(template) = dash_template_mut(document, scope, period_index, adaptation_index, representation_index) {
+                        // A child SegmentTemplate that declares its own
+                        // SegmentTimeline replaces the inherited one:
+                        // the first `<S>` clears the parent's points
+                        // instead of appending onto them (which
+                        // duplicated every segment). A template with no
+                        // `<S>` of its own keeps inheriting.
+                        if !state.active_template_own_timeline {
+                            template.timeline.clear();
+                            state.active_template_own_timeline = true;
+                        }
                         template.timeline.push(point);
                     }
                 }
@@ -1011,15 +1091,20 @@ fn dash_start_element(
                 }
                 DashScope::Adaptation => {
                     if let Some(index) = state.active_adaptation {
-                        if let Some(period) = dash_period_mut(document, period_index) {
-                            period.adaptations[index].segment_list = Some(list);
+                        if let Some(adaptation) = dash_period_mut(document, period_index)
+                            .and_then(|period| period.adaptations.get_mut(index))
+                        {
+                            adaptation.segment_list = Some(list);
                         }
                     }
                 }
                 DashScope::Representation => {
                     if let Some((adaptation, representation)) = state.active_representation {
-                        if let Some(period) = dash_period_mut(document, period_index) {
-                            period.adaptations[adaptation].representations[representation].segment_list = Some(list);
+                        if let Some(rep) = dash_period_mut(document, period_index)
+                            .and_then(|period| period.adaptations.get_mut(adaptation))
+                            .and_then(|adaptation| adaptation.representations.get_mut(representation))
+                        {
+                            rep.segment_list = Some(list);
                         }
                     }
                 }
@@ -1049,15 +1134,20 @@ fn dash_start_element(
                 }
                 DashScope::Adaptation => {
                     if let Some(index) = state.active_adaptation {
-                        if let Some(period) = dash_period_mut(document, period_index) {
-                            period.adaptations[index].segment_base = Some(base);
+                        if let Some(adaptation) = dash_period_mut(document, period_index)
+                            .and_then(|period| period.adaptations.get_mut(index))
+                        {
+                            adaptation.segment_base = Some(base);
                         }
                     }
                 }
                 DashScope::Representation => {
                     if let Some((adaptation, representation)) = state.active_representation {
-                        if let Some(period) = dash_period_mut(document, period_index) {
-                            period.adaptations[adaptation].representations[representation].segment_base = Some(base);
+                        if let Some(rep) = dash_period_mut(document, period_index)
+                            .and_then(|period| period.adaptations.get_mut(adaptation))
+                            .and_then(|adaptation| adaptation.representations.get_mut(representation))
+                        {
+                            rep.segment_base = Some(base);
                         }
                     }
                 }
@@ -1132,7 +1222,10 @@ fn dash_end_element(document: &mut DashDocument, state: &mut DashParserState, na
             }
             state.base_text.clear();
         }
-        "SegmentTemplate" => state.active_template_scope = None,
+        "SegmentTemplate" => {
+            state.active_template_scope = None;
+            state.active_template_own_timeline = false;
+        }
         "SegmentList" => state.active_segment_list_scope = None,
         "SegmentBase" => state.active_segment_base_scope = None,
         "Representation" => state.active_representation = None,
@@ -1243,6 +1336,19 @@ fn effective_dash_mime_type(adaptation: &DashAdaptation, representation: &DashRe
     if representation.mime_type.is_empty() { adaptation.mime_type.clone() } else { representation.mime_type.clone() }
 }
 
+/// Largest zero-padded width a DASH template token may ask for: a
+/// manifest that asks for `$Number%099999d$` is asking the formatter to
+/// build an unbounded string from one small number. 64 digits is far
+/// beyond any real segment number, time or bandwidth.
+const MAX_DASH_TEMPLATE_WIDTH: usize = 64;
+
+/// Largest byte span `fetch_dash_range_bytes` will ever fetch: a
+/// SegmentBase index (sidx box) is kilobytes, so 16 MiB is generous.
+/// Anything larger is a malicious or broken manifest, not an index —
+/// refuse it before any bytes are read, instead of buffering an
+/// unbounded response into RAM.
+const MAX_DASH_INDEX_BYTES: u64 = 16 * 1024 * 1024;
+
 fn expand_dash_template(
     template: &str,
     representation: &DashRepresentation,
@@ -1275,9 +1381,22 @@ fn expand_dash_template(
             number.to_string()
         } else if token == "Time" {
             time.to_string()
-        } else if let Some(format_spec) = token.strip_prefix("Number%0").and_then(|value| value.strip_suffix('d')) {
-            let width: usize = format_spec.parse().context("Invalid DASH Number format width")?;
-            format!("{number:0width$}")
+        } else if let Some((kind, format_spec)) = ["Number", "Time", "Bandwidth"].iter().find_map(|kind| {
+            token.strip_prefix(*kind)?.strip_prefix("%0")?.strip_suffix('d').map(|spec| (*kind, spec))
+        }) {
+            // `$Number%0Nd$` / `$Time%0Nd$` / `$Bandwidth%0Nd$`: the
+            // width is capped — an uncapped width lets a manifest
+            // demand an arbitrarily large padded string.
+            let width: usize = format_spec.parse().context("Invalid DASH template format width")?;
+            if width > MAX_DASH_TEMPLATE_WIDTH {
+                return Err(anyhow!("DASH template format width {width} exceeds the maximum of {MAX_DASH_TEMPLATE_WIDTH}"));
+            }
+            let value = match kind {
+                "Number" => number,
+                "Time" => time,
+                _ => representation.bandwidth.unwrap_or(0),
+            };
+            format!("{value:0width$}")
         } else {
             return Err(anyhow!("Unsupported DASH template token ${token}$"));
         };
@@ -1417,9 +1536,16 @@ fn resolve_dash_track(
     let timescale = template.timescale.max(1);
     let period_duration = period.duration_seconds.or(document.duration_seconds)
         .ok_or_else(|| anyhow!("DASH static VOD MPD does not declare a period duration"))?;
+    // Segment `$Time$` values are presentation time: a period that
+    // starts at `Period@start` has its first segment there, not at
+    // zero, and a repeat-to-end timeline ends at start + duration.
+    let period_start_units = period.start_seconds
+        .map(|start| (start * timescale as f64).round() as u64)
+        .unwrap_or(0);
+    let period_end_units = ((period.start_seconds.unwrap_or(0.0) + period_duration) * timescale as f64).ceil() as u64;
     let mut sequence = Vec::<(u64, u64)>::new();
-    let mut current_time = 0_u64;
-    let mut current_number = template.start_number.max(1);
+    let mut current_time = period_start_units;
+    let mut current_number = template.start_number;
     const MAX_DASH_SEGMENTS: u64 = 100_000;
 
     if !template.timeline.is_empty() {
@@ -1429,7 +1555,7 @@ fn resolve_dash_track(
                 point.repeat as u64 + 1
             } else {
                 let end_time = template.timeline.get(index + 1).and_then(|next| next.time)
-                    .unwrap_or_else(|| (period_duration * timescale as f64).ceil() as u64);
+                    .unwrap_or(period_end_units);
                 end_time.saturating_sub(current_time).saturating_add(point.duration - 1) / point.duration
             };
             if sequence.len() as u64 + count > MAX_DASH_SEGMENTS {
@@ -1458,7 +1584,7 @@ fn resolve_dash_track(
     if sequence.is_empty() { return Err(anyhow!("DASH representation contains no media segments")); }
 
     let initialization_url = template.initialization.as_deref()
-        .map(|value| expand_dash_template(value, representation, template.start_number.max(1), 0))
+        .map(|value| expand_dash_template(value, representation, template.start_number, 0))
         .transpose()?
         .map(|value| join_dash_resource(&base, &value).map(|url| url.to_string()))
         .transpose()?;
@@ -1776,11 +1902,42 @@ fn hidden_command<S: AsRef<std::ffi::OsStr>>(program: S) -> TokioCommand {
     };
     #[cfg(not(target_os = "windows"))]
     let std_command = std::process::Command::new(program);
-    TokioCommand::from(std_command)
+    let mut command = TokioCommand::from(std_command);
+    command.kill_on_drop(true);
+    command
+}
+
+static FFMPEG_OVERRIDE: std::sync::OnceLock<std::sync::RwLock<Option<std::path::PathBuf>>> =
+    std::sync::OnceLock::new();
+
+pub fn set_ffmpeg_override(path: Option<std::path::PathBuf>) {
+    let lock = FFMPEG_OVERRIDE.get_or_init(|| std::sync::RwLock::new(None));
+    let mut guard = match lock.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = path.filter(|p| !p.as_os_str().is_empty());
+}
+
+pub(crate) fn configured_ffmpeg_path() -> Option<std::path::PathBuf> {
+    if let Some(lock) = FFMPEG_OVERRIDE.get() {
+        let guard = match lock.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(path) = guard.as_ref() {
+            if !path.as_os_str().is_empty() {
+                return Some(path.clone());
+            }
+        }
+    }
+    std::env::var_os("THUNDERLOAD_FFMPEG")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
 }
 
 pub(crate) async fn ffmpeg_available() -> bool {
-    let executable = std::env::var_os("THUNDERLOAD_FFMPEG").unwrap_or_else(|| "ffmpeg".into());
+    let executable = configured_ffmpeg_path().unwrap_or_else(|| PathBuf::from("ffmpeg"));
     hidden_command(executable).arg("-version").output().await
         .map(|output| output.status.success()).unwrap_or(false)
 }
@@ -1824,12 +1981,15 @@ async fn unique_video_path(directory: &Path, stem: &str, extension: &str) -> Res
 /// byte range (`EXT-X-BYTERANGE`) of a larger resource.
 ///
 /// Equality is the segment's IDENTITY — its URL with the query stripped
-/// plus its byte range — not its encryption key. The key is fetched fresh
-/// per segment at download time, and a finished segment is already
-/// plaintext on disk, so a key-URI rotation (or a re-key) must not make
-/// a checkpoint look like a different job: the media is the same, the
-/// old plaintext is still correct, and only the query (the signature)
-/// changed. See `url_identity`.
+/// plus its byte range — not its encryption key, init segment or
+/// discontinuity flag. The key is fetched fresh per segment at download
+/// time, and a finished segment is already plaintext on disk, so a
+/// key-URI rotation (or a re-key) must not make a checkpoint look like
+/// a different job: the media is the same, the old plaintext is still
+/// correct, and only the query (the signature) changed. See
+/// `url_identity`. The init/discontinuity are playback metadata, not
+/// identity: a resume swaps the fresh refs in, so they stay current
+/// even when the checkpoint is reused.
 #[derive(Debug, Clone, Serialize, Deserialize, Eq)]
 struct HlsSegmentRef {
     url: String,
@@ -1840,6 +2000,21 @@ struct HlsSegmentRef {
     /// IV are stored, so a resume re-fetches the key fresh.
     #[serde(default)]
     key: Option<HlsKeyRef>,
+    /// The EXT-X-MAP init segment in force for this segment — the most
+    /// recent MAP before it — if the playlist declares one. A playlist
+    /// with several MAPs (e.g. after a discontinuity) no longer has
+    /// them all collapse into one slot: each segment remembers which
+    /// init it belongs to. The init itself is container metadata and
+    /// is never encrypted, so its key stays None even when a KEY tag
+    /// is in force for the media segments.
+    #[serde(default)]
+    init: Option<Box<HlsSegmentRef>>,
+    /// True when an `#EXT-X-DISCONTINUITY` tag precedes this segment:
+    /// timestamps (and possibly the init segment / key) reset here.
+    /// Recorded, not ignored, so a later assembly step can tell where
+    /// one continuous run ends and the next begins.
+    #[serde(default)]
+    discontinuity: bool,
 }
 
 impl PartialEq for HlsSegmentRef {
@@ -1935,9 +2110,9 @@ impl HlsJobState {
     /// different job, or a resume after a refresh would restart.
     fn matches_plan(&self, plan: &HlsJobState) -> bool {
         self.version == plan.version
-            && self.playlist_url == plan.playlist_url
-            && self.media_url == plan.media_url
-            && self.audio_playlist_url == plan.audio_playlist_url
+            && url_identity(&self.playlist_url) == url_identity(&plan.playlist_url)
+            && url_identity(&self.media_url) == url_identity(&plan.media_url)
+            && self.audio_playlist_url.as_deref().map(url_identity) == plan.audio_playlist_url.as_deref().map(url_identity)
             && self.selected_media_url == plan.selected_media_url
             && self.selected_audio_group == plan.selected_audio_group
             && self.session.as_ref().map(|session| session.credential_identity())
@@ -2009,6 +2184,11 @@ fn parse_hls_media_playlist_inner(body: &str, base: &Url, live: bool) -> Result<
     // The `#EXT-X-KEY` in force for the next segment, if any. A KEY with
     // METHOD=NONE clears it; a KEY with METHOD=AES-128 sets it.
     let mut current_key: Option<HlsKeyRef> = None;
+    // The `#EXT-X-MAP` in force for the next segment: the most recent
+    // MAP seen so far. Each segment records it (see `HlsSegmentRef::init`).
+    let mut current_init: Option<HlsSegmentRef> = None;
+    // Set by `#EXT-X-DISCONTINUITY`, consumed by the next segment line.
+    let mut pending_discontinuity = false;
     for line in body.lines().map(str::trim).filter(|l| !l.is_empty()) {
         if let Some(attributes) = line.strip_prefix("#EXT-X-MAP:") {
             let uri = attr(attributes, "URI").and_then(|u| base.join(&u).ok()).map(|u| u.to_string());
@@ -2024,7 +2204,17 @@ fn parse_hls_media_playlist_inner(body: &str, base: &Url, live: bool) -> Result<
             }
             // The init segment is container metadata, never encrypted:
             // the KEY in force applies to media segments only.
-            init = uri.map(|url| HlsSegmentRef { url, range, key: None });
+            let map_ref = uri.map(|url| HlsSegmentRef { url, range, key: None, init: None, discontinuity: false });
+            if let Some(map_ref) = &map_ref {
+                // The most recent MAP is the init for every segment
+                // that follows it, until another MAP replaces it. The
+                // playlist-level init stays the FIRST one — that is
+                // what precedes segment 0 at assembly time.
+                current_init = Some(map_ref.clone());
+                if init.is_none() {
+                    init = Some(map_ref.clone());
+                }
+            }
         } else if let Some(attributes) = line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
             media_sequence = attributes.trim().parse::<u64>()
                 .context("Invalid EXT-X-MEDIA-SEQUENCE")?;
@@ -2048,6 +2238,11 @@ fn parse_hls_media_playlist_inner(body: &str, base: &Url, live: bool) -> Result<
             }
         } else if let Some(value) = line.strip_prefix("#EXT-X-BYTERANGE:") {
             pending_range = Some(parse_hls_byterange(value.trim())?);
+        } else if line == "#EXT-X-DISCONTINUITY" {
+            // Timestamps (and possibly the init segment / key) reset at
+            // the next segment: mark it instead of silently ignoring
+            // the tag, so the discontinuity is visible downstream.
+            pending_discontinuity = true;
         } else if line.starts_with('#') {
             continue;
         } else {
@@ -2070,7 +2265,8 @@ fn parse_hls_media_playlist_inner(body: &str, base: &Url, live: bool) -> Result<
                 });
                 HlsKeyRef { uri: key_ref.uri, iv: Some(iv) }
             });
-            segments.push(HlsSegmentRef { url, range, key });
+            let discontinuity = std::mem::take(&mut pending_discontinuity);
+            segments.push(HlsSegmentRef { url, range, key, init: current_init.clone().map(Box::new), discontinuity });
         }
     }
     Ok(HlsMediaPlaylist { init, segments, media_sequence })
@@ -2097,8 +2293,19 @@ async fn fetch_text_with(client: &Client, url: &str, session: Option<&SessionHea
     // manifest fetch is the first request that meets the login wall,
     // so relabel it before it reaches the panel (Slice 5).
     let response = request.send().await.map_err(map_auth_error)?;
-    let response = response.error_for_status().map_err(map_auth_error)?;
-    Ok(response.text().await?)
+    let mut response = response.error_for_status().map_err(map_auth_error)?;
+    const MAX_MANIFEST_BYTES: usize = 10 * 1024 * 1024;
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len().saturating_add(chunk.len()) > MAX_MANIFEST_BYTES {
+            return Err(anyhow!(
+                "Response body exceeded maximum allowed size ({} bytes)",
+                MAX_MANIFEST_BYTES
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 /// Fetches the playlist (master first, then the chosen media playlist and
@@ -2150,24 +2357,14 @@ async fn resolve_hls_plan(playlist_url: &str, selection: &HlsSelection, session:
                     Some(wanted) => Some(renditions.iter().find(|rendition| rendition.group_id == wanted)
                         .map(|rendition| rendition.uri.clone())
                         .ok_or_else(|| anyhow!("The selected HLS audio track is no longer listed in the master playlist"))?),
-                    None => variant.audio_representation_id.as_deref().and_then(|group| {
-                        renditions.iter()
-                            .find(|rendition| rendition.group_id == group)
-                            .or_else(|| renditions.iter().find(|rendition| rendition.is_default))
-                            .map(|rendition| rendition.uri.clone())
-                    }),
+                    None => select_hls_audio_rendition(&renditions, variant.audio_representation_id.as_deref()),
                 };
                 (media_url, audio)
             }
         } else {
             let variant = variants.first().expect("non-empty variant list");
             let media_url = variant.url.clone();
-            let audio = variant.audio_representation_id.as_deref().and_then(|group| {
-                renditions.iter()
-                    .find(|rendition| rendition.group_id == group)
-                    .or_else(|| renditions.iter().find(|rendition| rendition.is_default))
-                    .map(|rendition| rendition.uri.clone())
-            });
+            let audio = select_hls_audio_rendition(&renditions, variant.audio_representation_id.as_deref());
             (media_url, audio)
         }
     } else {
@@ -2195,13 +2392,18 @@ async fn resolve_hls_plan(playlist_url: &str, selection: &HlsSelection, session:
         }
         None => (None, Vec::new()),
     };
+    let extension = if media.init.is_some() || audio_playlist_url.is_some() {
+        "mp4".to_string()
+    } else {
+        "ts".to_string()
+    };
     Ok(HlsJobState {
         version: 1,
         playlist_url: playlist_url.to_string(),
         media_url,
         audio_playlist_url,
         session: session.cloned(),
-        extension: if media.init.is_some() { "mp4".into() } else { "ts".into() },
+        extension,
         video_init: media.init,
         video_segments: media.segments,
         video_init_done: false,
@@ -2321,12 +2523,21 @@ async fn fetch_hls_key(client: &Client, uri: &str, session: Option<&SessionHeade
     if let Some(key) = locked.get(uri) {
         return Ok(key.clone());
     }
-    let bytes = apply_session(session, client.get(uri), uri)
+    let mut response = apply_session(session, client.get(uri), uri)
         .send().await
         .with_context(|| format!("Could not fetch the HLS AES-128 key at {uri}"))?
         .error_for_status()
-        .with_context(|| format!("The HLS AES-128 key at {uri} was refused"))?
-        .bytes().await?;
+        .with_context(|| format!("The HLS AES-128 key at {uri} was refused"))?;
+    const MAX_HLS_KEY_BYTES: usize = 64;
+    let mut bytes = Vec::with_capacity(16);
+    while let Some(chunk) = response.chunk().await? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_HLS_KEY_BYTES {
+            return Err(anyhow!(
+                "The HLS AES-128 key at {uri} exceeds {MAX_HLS_KEY_BYTES} bytes"
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
     if bytes.len() != 16 {
         return Err(anyhow!("The HLS AES-128 key at {uri} is {} bytes, not 16", bytes.len()));
     }
@@ -2397,8 +2608,28 @@ async fn decrypt_aes128_segment(raw: &Path, out: &Path, key: &[u8; 16], iv: &[u8
 /// Fetches one segment (whole file, or one EXT-X-BYTERANGE window of a
 /// larger resource) into `path`. A server that ignores Range and answers
 /// 200 is handled by slicing the requested window out of the full body;
-/// a 206 answer must contain exactly the requested length.
+/// a 206 answer must contain exactly the requested length. A failed
+/// fetch removes the partial file (and the ciphertext temp file for an
+/// encrypted segment) instead of leaving it behind: a later attempt
+/// re-downloads from scratch, and nothing can mistake the partial for
+/// a finished segment.
 async fn fetch_hls_segment(
+    client: &Client,
+    segment: &HlsSegmentRef,
+    session: Option<&SessionHeaders>,
+    path: &Path,
+    rate_limiter: &Arc<GlobalRateLimiter>,
+    key_cache: &HlsKeyCache,
+) -> Result<u64> {
+    let result = fetch_hls_segment_inner(client, segment, session, path, rate_limiter, key_cache).await;
+    if result.is_err() {
+        let _ = fs::remove_file(path).await;
+        let _ = fs::remove_file(path.with_extension("tmp")).await;
+    }
+    result
+}
+
+async fn fetch_hls_segment_inner(
     client: &Client,
     segment: &HlsSegmentRef,
     session: Option<&SessionHeaders>,
@@ -2537,7 +2768,7 @@ async fn assemble_hls_track(work_dir: &Path, state: &HlsJobState, audio: bool, o
 /// checkpoint is kept so installing FFmpeg and retrying resumes straight
 /// at the mux step instead of re-downloading.
 async fn mux_hls_tracks(video_track: &Path, audio_track: &Path, output: &Path) -> Result<()> {
-    let executable = std::env::var_os("THUNDERLOAD_FFMPEG").unwrap_or_else(|| "ffmpeg".into());
+    let executable = configured_ffmpeg_path().unwrap_or_else(|| PathBuf::from("ffmpeg"));
     let result = hidden_command(&executable)
         .arg("-hide_banner").arg("-loglevel").arg("error").arg("-y")
         .arg("-i").arg(video_track)
@@ -2593,7 +2824,10 @@ fn hls_segment_path(work_dir: &Path, mark: HlsSegmentMark) -> PathBuf {
 /// a slow segment returns as soon as the control flips instead of after
 /// the in-flight segment finishes. The watch guard is only ever borrowed
 /// at loop tops — never held across an await — so the `!Send`
-/// `watch::Ref` never escapes the loop.
+/// `watch::Ref` never escapes the loop. A closed control channel (host
+/// disconnected) interrupts the run the same way — promptly, with the
+/// checkpoint kept — instead of draining the playlist to completion
+/// detached from the host.
 async fn run_hls_segments(
     client: &Client,
     state: &mut HlsJobState,
@@ -2632,8 +2866,14 @@ async fn run_hls_segments(
     // A second receiver watches for control changes: `changed()` needs
     // &mut, and the coordinator's own receiver is borrowed at loop tops.
     let mut control_watch = control.clone();
-    let mut watch_alive = true;
     let mut stopped: Option<DownloadControl> = None;
+    // Throttle for the per-segment checkpoint write (below): the
+    // checkpoint is a full serialization of the whole segment list,
+    // so writing it after every segment is O(N^2) bytes for a long
+    // playlist. A lagging checkpoint only costs re-downloading the
+    // segments finished since the last write, and pause/cancel always
+    // write one explicitly before returning.
+    let mut last_checkpoint_write = std::time::Instant::now();
     while !work.is_empty() || !tasks.is_empty() {
         if matches!(*control.borrow(), DownloadControl::Paused | DownloadControl::Cancelled) {
             stopped = Some(*control.borrow());
@@ -2652,22 +2892,25 @@ async fn run_hls_segments(
             });
         }
         // Wait for the next finished segment, or for the control to
-        // change — whichever comes first. When the sender is gone the
-        // watch arm is dropped and the loop waits on tasks alone.
-        // `join_next()` is cancel-safe: dropping its future on the
-        // control arm leaves the tasks running.
-        let result = if watch_alive {
-            tokio::select! {
-                result = tasks.join_next() => result,
-                changed = control_watch.changed() => {
-                    if changed.is_err() {
-                        watch_alive = false;
-                    }
-                    continue;
+        // change — whichever comes first. A closed control channel
+        // (host disconnected) is an interrupt, not a drain to
+        // completion: stop promptly with the checkpoint kept, exactly
+        // like the direct-download path — never keep downloading
+        // detached from the host. `join_next()` is cancel-safe:
+        // dropping its future on the control arm leaves the tasks
+        // running, so they are aborted below before returning.
+        let result = tokio::select! {
+            biased;
+            changed = control_watch.changed() => {
+                if changed.is_err() {
+                    tasks.abort_all();
+                    while tasks.join_next().await.is_some() {}
+                    write_hls_checkpoint(meta_path, state).await?;
+                    return Err(anyhow!(CONTROL_CLOSED_ERROR));
                 }
+                continue;
             }
-        } else {
-            tasks.join_next().await
+            result = tasks.join_next() => result,
         };
         let Some(result) = result else { break; };
         match result {
@@ -2684,8 +2927,24 @@ async fn run_hls_segments(
                 }
                 // Only the coordinator writes the checkpoint, so the
                 // on-disk state can never race with a segment task.
-                write_hls_checkpoint(meta_path, state).await?;
+                // Throttled to one write per second (plus a write when
+                // the last segment lands): a full re-serialization per
+                // segment is O(N^2) for a long playlist. The first
+                // completion writes too: without it a short download
+                // finishes before any progress is ever visible on disk,
+                // so a pause/cancel/resume observer polling the
+                // checkpoint (and the tests that do) can never catch the
+                // job mid-flight — it either misses the window entirely
+                // or arrives after completion. One extra write per
+                // download is negligible against the throttle's saving.
                 let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                if done == 1
+                    || done >= total
+                    || last_checkpoint_write.elapsed() >= Duration::from_secs(1)
+                {
+                    write_hls_checkpoint(meta_path, state).await?;
+                    last_checkpoint_write = std::time::Instant::now();
+                }
                 let transferred = downloaded_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
                 let phase = match mark {
                     HlsSegmentMark::VideoInit | HlsSegmentMark::Video(_) => "video-segments",
@@ -3020,7 +3279,37 @@ async fn resolve_hls_live_media_url(playlist_url: &str, selection: &HlsSelection
         }
         return Err(anyhow!("The selected HLS quality is no longer listed in the master playlist"));
     }
+    // An explicitly selected audio group with no variant choice is an
+    // audio-only live recording: follow that rendition's playlist
+    // instead of silently recording the first video variant.
+    if let Some(wanted) = selection.audio_group.as_deref() {
+        return renditions.iter().find(|rendition| rendition.group_id == wanted)
+            .map(|rendition| rendition.uri.clone())
+            .ok_or_else(|| anyhow!("The selected HLS audio track is no longer listed in the master playlist"));
+    }
     Ok(variants.first().expect("non-empty variant list").url.clone())
+}
+
+/// How many segments of a live window to skip, given the next sequence
+/// number still to record. Normally the window has advanced past some
+/// of it (`next - media_sequence`). But when the encoder resets
+/// MEDIA-SEQUENCE (e.g. back to 0 on a restart), the next position is
+/// past the whole new window: skipping would skip every segment forever
+/// and stall after 10 polls, so re-sync to the new window instead and
+/// record from its start. Returns the skip plus a re-synced position
+/// when a reset was detected.
+fn live_window_skip(next_sequence: Option<u64>, media_sequence: u64, window_len: usize) -> (usize, Option<u64>) {
+    match next_sequence {
+        None => (0, None),
+        Some(next) => {
+            let window_end = media_sequence.saturating_add(window_len as u64);
+            if next > window_end {
+                (0, Some(media_sequence))
+            } else {
+                (next.saturating_sub(media_sequence) as usize, None)
+            }
+        }
+    }
 }
 
 /// How many consecutive polls with no new segment stop a live
@@ -3106,13 +3395,31 @@ pub async fn download_hls_live(
             }
             return Err(anyhow!("Live stream in this format can't be recorded yet."));
         }
-        let skip = match next_sequence {
-            None => 0,
-            Some(next) => next.saturating_sub(parsed.media_sequence) as usize,
-        };
+        let (skip, resynced) = live_window_skip(next_sequence, parsed.media_sequence, parsed.segments.len());
+        if let Some(resynced) = resynced {
+            next_sequence = Some(resynced);
+        }
         let mut recorded_this_poll = 0_u64;
         let mut attempted_this_poll = 0_u64;
         for (index, segment) in parsed.segments.iter().enumerate().skip(skip) {
+            // Check the control between segments, not only at the top
+            // of a poll: a pause/cancel during a slow poll window used
+            // to wait for every remaining segment to finish first.
+            // Copy the value out first, as at the loop top: matching on
+            // `*control.borrow()` directly would hold the watch Ref
+            // across the awaits in the arms, and the Ref is not Send.
+            let current = *control.borrow();
+            match current {
+                DownloadControl::Cancelled => {
+                    let _ = fs::remove_file(&segment_temp).await;
+                    return Ok(DownloadOutcome::Cancelled);
+                }
+                DownloadControl::Paused => {
+                    let _ = fs::remove_file(&segment_temp).await;
+                    return Ok(DownloadOutcome::Paused);
+                }
+                DownloadControl::Running => {}
+            }
             attempted_this_poll += 1;
             let sequence = parsed.media_sequence + index as u64;
             match fetch_hls_segment(&client, segment, session, &segment_temp, &rate_limiter, &key_cache).await {
@@ -3197,11 +3504,18 @@ pub async fn download_hls_live(
         }
         // Wait for the next window: TARGETDURATION from the playlist
         // itself (default 6 s, clamped 2–30 s), woken early when the
-        // user pauses or cancels.
+        // user pauses or cancels — or when the control channel closes
+        // (host disconnected): the recording stops at once with the
+        // partial file kept, instead of polling forever detached.
         let poll = parse_hls_target_duration(&body).unwrap_or(6).clamp(2, 30);
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(poll)) => {}
-            _ = control.changed() => {}
+        let closed = tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(poll)) => false,
+            changed = control.changed() => changed.is_err(),
+        };
+        if closed {
+            let _ = fs::remove_file(&segment_temp).await;
+            let _ = output.flush().await;
+            return Err(anyhow!(CONTROL_CLOSED_ERROR));
         }
     }
 }
@@ -3236,28 +3550,54 @@ pub async fn download_hls_subtitles(
     if parsed.segments.is_empty() {
         return Err(anyhow!("No subtitle segments were found in this playlist"));
     }
+    // Segments go through the same fetcher as media segments, so an
+    // AES-128 key, a byte range and the rate limiter all apply — the
+    // old direct text fetch ignored all three. The temp file is
+    // removed on every exit path, success or failure.
+    let key_cache = HlsKeyCache::default();
+    let segment_temp = target.with_extension("sub-seg");
     let mut out = fs::File::create(target).await?;
     let mut first = true;
-    for segment in &parsed.segments {
-        // Subtitle segments are small text; fetched whole (with the
-        // session, so a login-walled track labels as auth, not 403).
-        let text = fetch_text_with(&client, &segment.url, session).await?;
-        let _ = rate_limiter.reserve(text.len() as u64).await;
-        let mut text = text.as_str();
-        // Every fragment repeats the WEBVTT header; keep only the
-        // first, so the joined file is one valid WebVTT document.
-        if !first {
-            if let Some(rest) = text.strip_prefix("WEBVTT") {
-                text = rest.trim_start_matches(['\r', '\n']);
+    let result = async {
+        for segment in &parsed.segments {
+            let _bytes = fetch_hls_segment(&client, segment, session, &segment_temp, &rate_limiter, &key_cache).await?;
+            let bytes = fs::read(&segment_temp).await?;
+            let mut text = String::from_utf8_lossy(&bytes).into_owned();
+            // A UTF-8 byte-order mark at the start of a fragment is
+            // not WebVTT content; strip it wherever it appears.
+            if let Some(rest) = text.strip_prefix('\u{feff}') {
+                text = rest.to_string();
             }
+            // Every fragment repeats the WEBVTT header (and, on
+            // MPEG-TS-sourced tracks, an X-TIMESTAMP-MAP line); keep
+            // only the first copy, so the joined file is one valid
+            // WebVTT document.
+            if !first {
+                if let Some(rest) = text.strip_prefix("WEBVTT") {
+                    text = rest.trim_start_matches(['\r', '\n']).to_string();
+                }
+                let mut kept = String::new();
+                for line in text.lines() {
+                    if line.starts_with("X-TIMESTAMP-MAP") {
+                        continue;
+                    }
+                    kept.push_str(line);
+                    kept.push('\n');
+                }
+                text = kept.trim_end_matches('\n').to_string();
+            }
+            if !first && !text.is_empty() {
+                out.write_all(b"\n").await?;
+            }
+            out.write_all(text.as_bytes()).await?;
+            first = false;
         }
-        if !first && !text.is_empty() {
-            out.write_all(b"\n").await?;
-        }
-        out.write_all(text.as_bytes()).await?;
-        first = false;
+        out.flush().await?;
+        Ok::<(), anyhow::Error>(())
     }
-    out.flush().await?;
+    .await;
+    let _ = fs::remove_file(&segment_temp).await;
+    result?;
     Ok(target.to_path_buf())
 }
 
@@ -3330,7 +3670,13 @@ fn parse_dash_sidx(bytes: &[u8], index_start: u64) -> Result<Vec<(u64, u64)>> {
         return Err(anyhow!("DASH sidx box is truncated"));
     }
     let mut ranges = Vec::with_capacity(reference_count);
-    let mut position = index_start + size as u64 + first_offset;
+    // `first_offset` is untrusted manifest data: a v1 sidx can carry
+    // u64::MAX here, and unchecked `+` would wrap silently in release
+    // (panic in debug). Every step rejects overflow cleanly.
+    let mut position = index_start
+        .checked_add(size as u64)
+        .and_then(|value| value.checked_add(first_offset))
+        .ok_or_else(|| anyhow!("DASH sidx first offset overflows the media byte range"))?;
     for index in 0..reference_count {
         let entry = &bytes[cursor + index * 12..cursor + (index + 1) * 12];
         let referenced_size = u32::from_be_bytes(entry[0..4].try_into().unwrap());
@@ -3341,8 +3687,12 @@ fn parse_dash_sidx(bytes: &[u8], index_start: u64) -> Result<Vec<(u64, u64)>> {
         if referenced_size == 0 {
             return Err(anyhow!("DASH sidx entry {index} has a zero segment size"));
         }
-        ranges.push((position, position + referenced_size - 1));
-        position += referenced_size;
+        let end = position.checked_add(referenced_size)
+            .and_then(|value| value.checked_sub(1))
+            .ok_or_else(|| anyhow!("DASH sidx entry {index} overflows the media byte range"))?;
+        ranges.push((position, end));
+        position = position.checked_add(referenced_size)
+            .ok_or_else(|| anyhow!("DASH sidx entry {index} overflows the media byte range"))?;
     }
     Ok(ranges)
 }
@@ -3360,7 +3710,16 @@ async fn fetch_dash_range_bytes(
     session: Option<&SessionHeaders>,
 ) -> Result<Vec<u8>> {
     let (start, end) = range;
-    let expected = end - start + 1;
+    // The span is untrusted manifest data (`0-u64::MAX` is a legal
+    // parse): reject an overflowing or over-cap span before any bytes
+    // are read, so neither the 206 buffer nor the 200 window can be
+    // sized by a hostile indexRange.
+    let expected = end.checked_sub(start)
+        .and_then(|span| span.checked_add(1))
+        .ok_or_else(|| anyhow!("DASH range {start}-{end} is invalid or overflows"))?;
+    if expected > MAX_DASH_INDEX_BYTES {
+        return Err(anyhow!("DASH range {start}-{end} spans {expected} bytes, over the {MAX_DASH_INDEX_BYTES}-byte limit for a segment index"));
+    }
     let request = apply_session(session, client.get(url), url);
     let response = request
         .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
@@ -3377,11 +3736,22 @@ async fn fetch_dash_range_bytes(
                 return Err(anyhow!("DASH server returned {length} bytes for a {expected}-byte range request"));
             }
         }
-        let bytes = response.bytes().await?;
+        // Stream with a running cap instead of `response.bytes()`: a
+        // server that ignores its own Content-Length must not be able
+        // to grow this buffer past the requested span.
+        let mut bytes = Vec::with_capacity(expected.min(1 << 20) as usize);
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if bytes.len() as u64 + chunk.len() as u64 > expected {
+                return Err(anyhow!("DASH server returned more than {expected} bytes for a {expected}-byte range request"));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
         if bytes.len() as u64 != expected {
             return Err(anyhow!("DASH server returned {} bytes for a {expected}-byte range request", bytes.len()));
         }
-        return Ok(bytes.to_vec());
+        return Ok(bytes);
     }
     let response = response.error_for_status()?;
     let mut stream = response.bytes_stream();
@@ -3390,11 +3760,11 @@ async fn fetch_dash_range_bytes(
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         let chunk_start = position;
-        let chunk_end = position + chunk.len() as u64;
+        let chunk_end = position.saturating_add(chunk.len() as u64);
         position = chunk_end;
         if chunk_end <= start || chunk_start > end { continue; }
         let keep_start = start.saturating_sub(chunk_start) as usize;
-        let keep_end = (end + 1 - chunk_start).min(chunk.len() as u64) as usize;
+        let keep_end = (end.saturating_add(1).saturating_sub(chunk_start)).min(chunk.len() as u64) as usize;
         kept.extend_from_slice(&chunk[keep_start..keep_end]);
         if position > end { break; }
     }
@@ -3426,38 +3796,51 @@ async fn expand_dash_segment_base(
 
 /// What one DASH track download finished as: the assembled track file, or
 /// a stop (pause/cancel) observed mid-track — the finished segments stay on
-/// disk for the next call, which skips them via its done-set.
+/// disk for the next call, which skips them via its done-set. A closed
+/// control channel is not a stop: it errors out of `download_dash_track`
+/// with the segments kept instead.
 enum DashTrackOutcome {
     Assembled(PathBuf),
     Stopped(DownloadControl),
 }
 
+/// What waiting on a segment `JoinSet` plus the control channel
+/// produced: the next finished task, a control change, or a closed
+/// control channel (host disconnected).
+enum JoinNextOutcome<T> {
+    Ready(Result<T, tokio::task::JoinError>),
+    ControlChanged,
+    Interrupted,
+}
+
 /// Awaits the next finished task in a segment `JoinSet`, or a control
-/// change, whichever comes first (Slice 4, Gemini claim 5). Returns `None`
-/// when the control changed — the caller re-checks `control.borrow()` at
-/// its loop top and stops, or carries on when the change was a no-op
-/// (e.g. a Running send) — or when the task set is empty. `watch_alive`
-/// tracks whether the control sender is still alive; once it is gone the
-/// watch arm is dropped and the loop waits on tasks alone. `join_next()`
-/// is cancel-safe, so dropping its future on the control arm leaves the
-/// tasks running.
+/// change, whichever comes first (Slice 4, Gemini claim 5).
+/// `ControlChanged` means the control changed — the caller re-checks
+/// `control.borrow()` and stops, or carries on when the change was a
+/// no-op (e.g. a Running send) — or the task set is empty. A closed
+/// control channel is `Interrupted`, never a drain to completion: the
+/// caller must stop promptly with the finished segments kept. The
+/// select is `biased` with the control arm first, so a close is never
+/// masked by a task finishing (or an empty set) in the same instant.
+/// `join_next()` is cancel-safe, so dropping its future on the control
+/// arm leaves the tasks running.
 async fn join_next_or_control<T: Send + 'static>(
     tasks: &mut tokio::task::JoinSet<T>,
     control: &mut watch::Receiver<DownloadControl>,
-    watch_alive: &mut bool,
-) -> Option<Result<T, tokio::task::JoinError>> {
-    if *watch_alive {
-        tokio::select! {
-            result = tasks.join_next() => result,
-            changed = control.changed() => {
-                if changed.is_err() {
-                    *watch_alive = false;
-                }
-                None
+) -> JoinNextOutcome<T> {
+    tokio::select! {
+        biased;
+        changed = control.changed() => {
+            if changed.is_err() {
+                JoinNextOutcome::Interrupted
+            } else {
+                JoinNextOutcome::ControlChanged
             }
         }
-    } else {
-        tasks.join_next().await
+        result = tasks.join_next() => match result {
+            Some(result) => JoinNextOutcome::Ready(result),
+            None => JoinNextOutcome::ControlChanged,
+        },
     }
 }
 
@@ -3515,7 +3898,6 @@ async fn download_dash_track(
     // claim 5): `changed()` needs &mut, and the coordinator's own
     // receiver is borrowed at loop tops only.
     let mut control_watch = control.clone();
-    let mut watch_alive = true;
     let mut stopped: Option<DownloadControl> = None;
     for (index, (segment_url, range)) in refs.into_iter().enumerate() {
         // Already on disk from an earlier call: the segment file is the
@@ -3558,7 +3940,9 @@ async fn download_dash_track(
                     if let Some(length) = response.headers().get(reqwest::header::CONTENT_LENGTH)
                         .and_then(|value| value.to_str().ok())
                         .and_then(|value| value.parse::<u64>().ok()) {
-                        let expected = end - start + 1;
+                        let expected = end.checked_sub(start)
+                            .and_then(|span| span.checked_add(1))
+                            .ok_or_else(|| anyhow!("DASH segment range {start}-{end} is invalid or overflows"))?;
                         if length != expected {
                             return Err(anyhow!("DASH server returned {length} bytes for a {expected}-byte segment range"));
                         }
@@ -3584,11 +3968,11 @@ async fn download_dash_track(
                 // 200 response to a ranged request: stream a bounded window.
                 let (start, end) = range.unwrap();
                 let chunk_start = position;
-                let chunk_end = position + chunk.len() as u64;
+                let chunk_end = position.saturating_add(chunk.len() as u64);
                 position = chunk_end;
                 if chunk_end <= start || chunk_start > end { continue; }
                 let keep_start = start.saturating_sub(chunk_start) as usize;
-                let keep_end = (end + 1 - chunk_start).min(chunk.len() as u64) as usize;
+                let keep_end = (end.saturating_add(1).saturating_sub(chunk_start)).min(chunk.len() as u64) as usize;
                 let keep = &chunk[keep_start..keep_end];
                 file.write_all(keep).await?;
                 bytes = bytes.saturating_add(keep.len() as u64);
@@ -3599,7 +3983,9 @@ async fn download_dash_track(
             file.flush().await?;
             if bytes == 0 { return Err(anyhow!("DASH server returned an empty initialization/segment file")); }
             if let Some((start, end)) = range {
-                let expected = end - start + 1;
+                let expected = end.checked_sub(start)
+                    .and_then(|span| span.checked_add(1))
+                    .ok_or_else(|| anyhow!("DASH segment range {start}-{end} is invalid or overflows"))?;
                 if bytes != expected {
                     return Err(anyhow!("DASH server returned {bytes} bytes for a {expected}-byte segment range"));
                 }
@@ -3626,14 +4012,25 @@ async fn download_dash_track(
         // The drain waits on the next finished segment OR a control
         // change, so a pause/cancel during a slow segment returns
         // promptly instead of after the in-flight segment finishes.
+        // A closed control channel interrupts here too — the finished
+        // segments stay on disk for Resume, only the temp files go.
         if tasks.len() >= connections {
-            if let Some(result) = join_next_or_control(&mut tasks, &mut control_watch, &mut watch_alive).await {
-                if let Err(error) = result? {
+            match join_next_or_control(&mut tasks, &mut control_watch).await {
+                JoinNextOutcome::Interrupted => {
                     tasks.abort_all();
                     while tasks.join_next().await.is_some() {}
                     remove_dash_segment_temps(work_dir, prefix).await;
-                    return Err(error);
+                    return Err(anyhow!(CONTROL_CLOSED_ERROR));
                 }
+                JoinNextOutcome::Ready(result) => {
+                    if let Err(error) = result? {
+                        tasks.abort_all();
+                        while tasks.join_next().await.is_some() {}
+                        remove_dash_segment_temps(work_dir, prefix).await;
+                        return Err(error);
+                    }
+                }
+                JoinNextOutcome::ControlChanged => {}
             }
         }
     }
@@ -3646,34 +4043,47 @@ async fn download_dash_track(
 
     let mut failures = Vec::new();
     loop {
-        let Some(result) = join_next_or_control(&mut tasks, &mut control_watch, &mut watch_alive).await else {
-            // The task set is empty, or the control changed. A stop
-            // aborts the in-flight tasks; a no-op change (e.g. a Running
-            // send) just resumes the drain; an empty set ends it.
-            if matches!(*control.borrow(), DownloadControl::Paused | DownloadControl::Cancelled) {
+        match join_next_or_control(&mut tasks, &mut control_watch).await {
+            JoinNextOutcome::Interrupted => {
+                // The control channel closed (host disconnected): stop
+                // promptly with the finished segments kept for Resume —
+                // never drain the rest of the track detached.
                 tasks.abort_all();
                 while tasks.join_next().await.is_some() {}
                 remove_dash_segment_temps(work_dir, prefix).await;
-                return Ok(DashTrackOutcome::Stopped(*control.borrow()));
+                return Err(anyhow!(CONTROL_CLOSED_ERROR));
             }
-            if tasks.is_empty() {
-                break;
+            JoinNextOutcome::ControlChanged => {
+                // The task set is empty, or the control changed. A stop
+                // aborts the in-flight tasks; a no-op change (e.g. a Running
+                // send) just resumes the drain; an empty set ends it.
+                if matches!(*control.borrow(), DownloadControl::Paused | DownloadControl::Cancelled) {
+                    tasks.abort_all();
+                    while tasks.join_next().await.is_some() {}
+                    remove_dash_segment_temps(work_dir, prefix).await;
+                    return Ok(DashTrackOutcome::Stopped(*control.borrow()));
+                }
+                if tasks.is_empty() {
+                    break;
+                }
+                continue;
             }
-            continue;
-        };
-        // Copy the value out first: the borrow guard must not be held
-        // across the awaits below (watch::Ref is not Send).
-        let current = *control.borrow();
-        if let control @ (DownloadControl::Paused | DownloadControl::Cancelled) = current {
-            tasks.abort_all();
-            while tasks.join_next().await.is_some() {}
-            remove_dash_segment_temps(work_dir, prefix).await;
-            return Ok(DashTrackOutcome::Stopped(control));
-        }
-        match result {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => failures.push(error),
-            Err(error) => failures.push(anyhow!(error)),
+            JoinNextOutcome::Ready(result) => {
+                // Copy the value out first: the borrow guard must not be held
+                // across the awaits below (watch::Ref is not Send).
+                let current = *control.borrow();
+                if let control @ (DownloadControl::Paused | DownloadControl::Cancelled) = current {
+                    tasks.abort_all();
+                    while tasks.join_next().await.is_some() {}
+                    remove_dash_segment_temps(work_dir, prefix).await;
+                    return Ok(DashTrackOutcome::Stopped(control));
+                }
+                match result {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => failures.push(error),
+                    Err(error) => failures.push(anyhow!(error)),
+                }
+            }
         }
     }
     if let Some(error) = failures.into_iter().next() {
@@ -3701,19 +4111,53 @@ async fn download_dash_track(
     Ok(DashTrackOutcome::Assembled(assembled))
 }
 
+/// The container a muxed DASH download produces: WebM when both
+/// tracks are WebM — by mime type or by VP8/VP9/Opus/Vorbis codecs — and
+/// MP4 otherwise. Forcing `.mp4` + `+faststart` on WebM tracks fails
+/// in FFmpeg; the container follows the tracks, mirroring the webm
+/// branch in `dash_output_extension` for single-track downloads.
+fn dash_mux_extension(video: &DashResolvedTrack, audio: &DashResolvedTrack) -> &'static str {
+    fn is_webm(mime_type: &str, codecs: &Option<String>) -> bool {
+        if mime_type.to_ascii_lowercase().contains("webm") {
+            return true;
+        }
+        let codecs = codecs.as_deref().unwrap_or("").to_ascii_lowercase();
+        ["vp8", "vp08", "vp9", "vp09", "opus", "vorbis"].iter()
+            .any(|codec| codecs.contains(*codec))
+    }
+    // WebM only when BOTH tracks are WebM-family: the container must
+    // hold both codecs. VP9 video with AAC audio goes to MP4 (VP9-in-MP4
+    // is valid; AAC-in-WebM is not), and H.264 video with Opus audio
+    // goes to MP4 too (H.264 cannot go in WebM at all). Either-track
+    // WebM would mux an unplayable file for those mixed pairs. The
+    // audit's real case — VP9 + Opus both WebM — still lands in .webm.
+    if is_webm(&video.mime_type, &video.codecs) && is_webm(&audio.mime_type, &audio.codecs) {
+        "webm"
+    } else {
+        "mp4"
+    }
+}
+
 async fn ffmpeg_mux_dash_tracks(
     video_file: &Path,
     audio_file: &Path,
     output: &Path,
 ) -> Result<()> {
-    let executable = std::env::var_os("THUNDERLOAD_FFMPEG").unwrap_or_else(|| "ffmpeg".into());
-    let result = hidden_command(executable)
+    let executable = configured_ffmpeg_path().unwrap_or_else(|| PathBuf::from("ffmpeg"));
+    let mut command = hidden_command(executable);
+    command
         .arg("-hide_banner").arg("-loglevel").arg("error").arg("-y")
         .arg("-i").arg(video_file)
         .arg("-i").arg(audio_file)
         .arg("-map").arg("0:v:0").arg("-map").arg("1:a:0")
-        .arg("-c").arg("copy")
-        .arg("-movflags").arg("+faststart")
+        .arg("-c").arg("copy");
+    // `+faststart` is an MP4 (moov) flag: it is meaningless — and an
+    // error on some builds — for a WebM mux.
+    if output.extension().and_then(|value| value.to_str())
+        .map(|value| !value.eq_ignore_ascii_case("webm")).unwrap_or(true) {
+        command.arg("-movflags").arg("+faststart");
+    }
+    let result = command
         .arg("-shortest")
         .arg(output)
         .output().await.context("Could not launch FFmpeg to combine DASH audio and video")?;
@@ -3732,17 +4176,29 @@ async fn ffmpeg_concat_dash_tracks(files: &[PathBuf], output: &Path) -> Result<(
     let list_path = output.with_extension("concat.txt");
     let mut list = String::new();
     for file in files {
-        let escaped = file.to_string_lossy().replace('\'', "'\\''");
+        let full = file.to_string_lossy();
+        if full.chars().any(|c| matches!(c, '\n' | '\r' | '\0')) {
+            return Err(anyhow!("Invalid character in DASH track path"));
+        }
+        let name = file
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| anyhow!("DASH track path has no valid file name"))?;
+        let escaped = name.replace('\'', "'\\''");
         list.push_str(&format!("file '{escaped}'\n"));
     }
     fs::write(&list_path, list).await?;
-    let executable = std::env::var_os("THUNDERLOAD_FFMPEG").unwrap_or_else(|| "ffmpeg".into());
-    let result = hidden_command(executable)
+    let executable = configured_ffmpeg_path().unwrap_or_else(|| PathBuf::from("ffmpeg"));
+    let mut command = hidden_command(executable);
+    command
         .arg("-hide_banner").arg("-loglevel").arg("error").arg("-y")
-        .arg("-f").arg("concat").arg("-safe").arg("0")
+        .arg("-f").arg("concat")
         .arg("-i").arg(&list_path)
-        .arg("-c").arg("copy")
-        .arg("-movflags").arg("+faststart")
+        .arg("-c").arg("copy");
+    if output.extension().and_then(|e| e.to_str()).map(|e| !e.eq_ignore_ascii_case("webm")).unwrap_or(true) {
+        command.arg("-movflags").arg("+faststart");
+    }
+    let result = command
         .arg(output)
         .output().await.context("Could not launch FFmpeg to concatenate DASH periods")?;
     let _ = fs::remove_file(&list_path).await;
@@ -3829,7 +4285,10 @@ pub async fn dash_output_extension(
 ) -> Result<String> {
     let plan = resolve_dash_plan(manifest_url, representation_id, audio_representation_id, session).await?;
     let extension = if audio_representation_id.is_some() {
-        "mp4"
+        match (plan.video_tracks.first(), plan.audio_tracks.first()) {
+            (Some(video), Some(audio)) => dash_mux_extension(video, audio),
+            _ => "mp4",
+        }
     } else if plan.video_tracks.first().map(|track| track.mime_type.to_ascii_lowercase().contains("webm")).unwrap_or(false) {
         "webm"
     } else {
@@ -3878,7 +4337,12 @@ async fn download_dash_into(
     // that wants pause/resume uses `download_dash_resumable` directly.
     let plan = resolve_dash_plan(manifest_url, representation_id, audio_representation_id, session).await?;
     let track_extension = |mime_type: &str| if mime_type.to_ascii_lowercase().contains("webm") { "webm" } else { "mp4" };
-    let extension = if audio_representation_id.is_some() { "mp4" } else { track_extension(&plan.video_tracks[0].mime_type) };
+    let extension = if audio_representation_id.is_some() {
+        match (plan.video_tracks.first(), plan.audio_tracks.first()) {
+            (Some(video), Some(audio)) => dash_mux_extension(video, audio),
+            _ => "mp4",
+        }
+    } else { track_extension(&plan.video_tracks[0].mime_type) };
     let safe = safe_filename(filename, "video");
     let stem = Path::new(&safe).file_stem().and_then(|value| value.to_str()).unwrap_or("video");
     let target = unique_video_path(out_dir, stem, extension).await?;
@@ -4110,7 +4574,7 @@ impl DashJobState {
     /// scratch instead of joining two different files.
     fn matches_plan(&self, plan: &DashJobState) -> bool {
         self.version == plan.version
-            && self.manifest_url == plan.manifest_url
+            && url_identity(&self.manifest_url) == url_identity(&plan.manifest_url)
             && self.representation_id == plan.representation_id
             && self.audio_representation_id == plan.audio_representation_id
             && self.session.as_ref().map(|session| session.credential_identity())
@@ -4397,7 +4861,13 @@ async fn download_dash_resumable_with_plan(
         } else {
             audio_files.into_iter().next().unwrap()
         };
-        let muxed = work_dir.join("muxed.mp4");
+        let muxed = work_dir.join(format!(
+            "muxed.{}",
+            match (plan.video_tracks.first(), plan.audio_tracks.first()) {
+                (Some(video), Some(audio)) => dash_mux_extension(video, audio),
+                _ => "mp4",
+            }
+        ));
         ffmpeg_mux_dash_tracks(&video_file, &audio_file, &muxed).await?;
         muxed
     } else {
@@ -4449,7 +4919,9 @@ mod tests {
         hls_audio_only_variant, hls_single_variant, is_complete_vod_playlist, parse_dash_document,
         parse_dash_representations, parse_dash_sidx, parse_hls_live_media_playlist,
         parse_hls_master, parse_hls_media_playlist, parse_iso_duration, resolve_dash_track,
-        unsupported_hls_master_reason, unsupported_hls_reason, attr, DashCheckpointTrack,
+        unsupported_hls_master_reason, unsupported_hls_reason, attr, client,
+        dash_mux_extension, fetch_dash_range_bytes, live_window_skip,
+        parse_hls_audio_renditions, select_hls_audio_rendition, DashCheckpointTrack,
         DashJobState, DownloadControl, DownloadOutcome, partial_download_metadata_path,
         SessionHeaders, DEFAULT_RESUMABLE_CONNECTIONS,
     };
@@ -4694,7 +5166,7 @@ mod tests {
     fn hls_segment_identity_ignores_signed_url_query() {
         // The same segment under a rotated signature is the same segment
         // (resume must not restart); a different path is a different one.
-        let segment = |url: &str| super::HlsSegmentRef { url: url.to_string(), range: None, key: None };
+        let segment = |url: &str| super::HlsSegmentRef { url: url.to_string(), range: None, key: None, init: None, discontinuity: false };
         assert_eq!(segment("https://cdn.example.test/seg0.ts?token=aaa"), segment("https://cdn.example.test/seg0.ts?token=bbb"));
         assert_ne!(segment("https://cdn.example.test/seg0.ts?token=aaa"), segment("https://cdn.example.test/seg1.ts?token=aaa"));
         // A fragment is never sent to the server, so it is not part of
@@ -4702,8 +5174,8 @@ mod tests {
         assert_eq!(segment("https://cdn.example.test/seg0.ts"), segment("https://cdn.example.test/seg0.ts#frag"));
         assert_eq!(segment("https://cdn.example.test/seg0.ts"), segment("https://cdn.example.test/seg0.ts"));
         assert_ne!(
-            super::HlsSegmentRef { url: "https://cdn.example.test/seg0.ts".into(), range: Some((0, 100)), key: None },
-            super::HlsSegmentRef { url: "https://cdn.example.test/seg0.ts".into(), range: Some((100, 100)), key: None },
+            super::HlsSegmentRef { url: "https://cdn.example.test/seg0.ts".into(), range: Some((0, 100)), key: None, init: None, discontinuity: false },
+            super::HlsSegmentRef { url: "https://cdn.example.test/seg0.ts".into(), range: Some((100, 100)), key: None, init: None, discontinuity: false },
         );
     }
 
@@ -5066,6 +5538,153 @@ mod tests {
         assert!(parse_dash_sidx(&short_v0, 0).is_err());
     }
 
+    #[test]
+    fn dash_sidx_overflowing_first_offset_is_an_error_not_a_wrap() {
+        // A v1 sidx with first_offset u64::MAX: index_start + size +
+        // first_offset overflows, and must error instead of wrapping
+        // (release) or panicking (debug).
+        let sidx = build_dash_sidx(1, u64::MAX, &[10]);
+        assert!(parse_dash_sidx(&sidx, 0).is_err());
+        let sidx = build_dash_sidx(1, u64::MAX - 5, &[10]);
+        assert!(parse_dash_sidx(&sidx, 0).is_err());
+        // Just inside the limit it still parses: index_start 0 + box
+        // size 52 + first_offset (u64::MAX - 100) lands at u64::MAX
+        // - 48, and one 10-byte segment ends at u64::MAX - 39.
+        let sidx = build_dash_sidx(1, u64::MAX - 100, &[10]);
+        assert_eq!(
+            parse_dash_sidx(&sidx, 0).unwrap(),
+            vec![(u64::MAX - 48, u64::MAX - 39)]
+        );
+    }
+
+    #[test]
+    fn dash_template_format_width_is_capped_and_time_bandwidth_pad() {
+        let representation = super::DashRepresentation {
+            id: "video-main".into(), bandwidth: Some(1_800_000), ..Default::default()
+        };
+        // An uncapped width lets a manifest demand an arbitrarily
+        // large padded string; anything over 64 is refused.
+        assert!(expand_dash_template("$Number%099d$", &representation, 7, 12000).is_err());
+        assert!(expand_dash_template("$Time%099d$", &representation, 7, 12000).is_err());
+        assert!(expand_dash_template("$Bandwidth%065d$", &representation, 7, 12000).is_err());
+        let expanded = expand_dash_template(
+            "$Time%05d$-$Bandwidth%03d$-$Number%02d$",
+            &representation, 7, 12000,
+        ).unwrap();
+        assert_eq!(expanded, "12000-1800000-07");
+    }
+
+    #[tokio::test]
+    async fn dash_range_bytes_rejects_oversized_index_range_before_fetching() {
+        // The span check runs before any request is built: even an
+        // unreachable host fails fast with the cap error, never hangs
+        // or allocates a u64::MAX-sized buffer.
+        let client = client().unwrap();
+        let error = fetch_dash_range_bytes(&client, "http://127.0.0.1:9/media.mp4", (0, u64::MAX), None)
+            .await.unwrap_err();
+        assert!(error.to_string().contains("overflows"), "{error}");
+        let error = fetch_dash_range_bytes(&client, "http://127.0.0.1:9/media.mp4", (0, 16 * 1024 * 1024), None)
+            .await.unwrap_err();
+        assert!(error.to_string().contains("over the"), "{error}");
+    }
+
+    #[test]
+    fn hls_parser_tracks_init_per_segment_and_discontinuity() {
+        let playlist = "#EXTM3U\n#EXT-X-MAP:URI=\"init1.mp4\"\n#EXTINF:4,\nseg0.m4s\n#EXT-X-DISCONTINUITY\n#EXT-X-MAP:URI=\"init2.mp4\"\n#EXTINF:4,\nseg1.m4s\n#EXT-X-ENDLIST\n";
+        let base = Url::parse("https://cdn.example.test/hls/").unwrap();
+        let parsed = parse_hls_media_playlist(playlist, &base).unwrap();
+        assert_eq!(parsed.segments.len(), 2);
+        // The playlist-level init stays the first MAP (what precedes
+        // segment 0); each segment remembers the MAP in force for it.
+        assert_eq!(parsed.init.as_ref().unwrap().url, "https://cdn.example.test/hls/init1.mp4");
+        assert_eq!(parsed.segments[0].init.as_ref().unwrap().url, "https://cdn.example.test/hls/init1.mp4");
+        assert!(!parsed.segments[0].discontinuity);
+        assert_eq!(parsed.segments[1].init.as_ref().unwrap().url, "https://cdn.example.test/hls/init2.mp4");
+        assert!(parsed.segments[1].discontinuity);
+    }
+
+    #[test]
+    fn live_window_skip_resyncs_on_sequence_reset() {
+        assert_eq!(live_window_skip(None, 0, 3), (0, None));
+        assert_eq!(live_window_skip(Some(5), 3, 3), (2, None));
+        // Encoder reset MEDIA-SEQUENCE to 0 while we were at 500:
+        // re-sync to the new window instead of skipping everything.
+        assert_eq!(live_window_skip(Some(500), 0, 3), (0, Some(0)));
+        // Position exactly at the window end: nothing new, no reset.
+        assert_eq!(live_window_skip(Some(6), 3, 3), (3, None));
+    }
+
+    #[test]
+    fn hls_audio_selection_falls_back_to_default_when_variant_names_no_group() {
+        let base = Url::parse("https://cdn.example.test/master.m3u8").unwrap();
+        let body = "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",LANGUAGE=\"en\",NAME=\"English\",DEFAULT=YES,URI=\"audio.m3u8\"\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"other\",LANGUAGE=\"fr\",NAME=\"French\",URI=\"other.m3u8\"\n";
+        let renditions = parse_hls_audio_renditions(body, &base);
+        assert_eq!(select_hls_audio_rendition(&renditions, None).as_deref(), Some("https://cdn.example.test/audio.m3u8"));
+        assert_eq!(select_hls_audio_rendition(&renditions, Some("other")).as_deref(), Some("https://cdn.example.test/other.m3u8"));
+        assert_eq!(select_hls_audio_rendition(&renditions, Some("missing")).as_deref(), Some("https://cdn.example.test/audio.m3u8"));
+    }
+
+    #[test]
+    fn dash_child_timeline_replaces_parent_and_period_start_shifts_time() {
+        let manifest = r#"<MPD type="static" mediaPresentationDuration="PT12S">
+          <Period duration="PT6S" start="PT6S">
+            <AdaptationSet contentType="video" mimeType="video/mp4">
+              <SegmentTemplate timescale="1" startNumber="1" media="seg-$Number$-$Time$.m4s">
+                <SegmentTimeline><S t="0" d="2" r="2"/></SegmentTimeline>
+              </SegmentTemplate>
+              <Representation id="v1" bandwidth="900000" width="640" height="360">
+                <SegmentTemplate media="child-$Number$-$Time$.m4s">
+                  <SegmentTimeline><S d="3" r="1"/></SegmentTimeline>
+                </SegmentTemplate>
+              </Representation>
+            </AdaptationSet>
+          </Period>
+        </MPD>"#;
+        let document = parse_dash_document(manifest).unwrap();
+        assert_eq!(document.periods[0].start_seconds, Some(6.0));
+        let period = &document.periods[0];
+        let adaptation = &period.adaptations[0];
+        let representation = &adaptation.representations[0];
+        let track = resolve_dash_track(&document, period, adaptation, representation, "https://cdn.example.test/video.mpd", false).unwrap();
+        // The child's own timeline (2 segments of 3s) replaces the
+        // parent's (3 segments of 2s) instead of appending onto it,
+        // and $Time$ starts at Period@start (6s), not zero.
+        assert_eq!(track.segment_urls.len(), 2);
+        assert!(track.segment_urls[0].ends_with("/child-1-6.m4s"));
+        assert!(track.segment_urls[1].ends_with("/child-2-9.m4s"));
+    }
+
+    #[test]
+    fn dash_mux_container_follows_webm_tracks() {
+        let track = |mime_type: &str, codecs: Option<&str>| super::DashResolvedTrack {
+            mime_type: mime_type.to_string(),
+            codecs: codecs.map(str::to_string),
+            width: None, height: None, frame_rate: None,
+            audio_sampling_rate: None, audio_channels: None,
+            initialization_url: None, initialization_range: None,
+            segment_urls: Vec::new(), segment_ranges: Vec::new(), segment_base: None,
+        };
+        let mp4_video = track("video/mp4", Some("avc1.640028"));
+        let mp4_audio = track("audio/mp4", Some("mp4a.40.2"));
+        assert_eq!(dash_mux_extension(&mp4_video, &mp4_audio), "mp4");
+        // A WebM video with MP4 (AAC) audio stays MP4: AAC cannot go in
+        // a WebM container, while VP9-in-MP4 is valid.
+        let webm_video = track("video/webm", Some("vp9"));
+        assert_eq!(dash_mux_extension(&webm_video, &mp4_audio), "mp4");
+        // H.264 video with Opus audio stays MP4 too: H.264 cannot go in
+        // WebM at all.
+        let opus_audio = track("audio/webm", Some("opus"));
+        assert_eq!(dash_mux_extension(&mp4_video, &opus_audio), "mp4");
+        // Both tracks WebM-family is the real WebM case (the audit's
+        // VP9 + Opus pair, previously muxed to .mp4 with +faststart).
+        assert_eq!(dash_mux_extension(&webm_video, &opus_audio), "webm");
+        // Codecs alone (no webm mime) still mean WebM — but only when
+        // the audio is WebM-family too.
+        let vp8_video = track("video/mp4", Some("vp8"));
+        assert_eq!(dash_mux_extension(&vp8_video, &mp4_audio), "mp4");
+        assert_eq!(dash_mux_extension(&vp8_video, &opus_audio), "webm");
+    }
+
     /// Minimal static-file HTTP fixture for DASH tests. Serves the bytes in
     /// `routes` (shared so the test can add the MPD after learning the base
     /// URL), honors `Range: bytes=a-b` with 206 + Content-Range unless the
@@ -5253,7 +5872,7 @@ mod tests {
     /// FFmpeg-missing error path instead of the real-media path.
     async fn generate_dash_fmp4_track(dir: &std::path::Path, video: bool) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
         tokio::fs::create_dir_all(dir).await.ok()?;
-        let executable = std::env::var_os("THUNDERLOAD_FFMPEG").unwrap_or_else(|| "ffmpeg".into());
+        let executable = super::configured_ffmpeg_path().unwrap_or_else(|| std::path::PathBuf::from("ffmpeg"));
         let mut command = hidden_command(&executable);
         command.arg("-y");
         if video {
@@ -6331,6 +6950,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dash_control_close_stops_promptly_and_keeps_checkpoint() {
+        // Every response takes 3 s (response_delay). Draining the track
+        // would take ~3 s; with the control channel closed mid-run the
+        // download must stop in well under two seconds with an error,
+        // and the checkpoint and work dir must survive so a resume
+        // completes.
+        let segment_count = 4;
+        let routes: Arc<RwLock<HashMap<String, Vec<u8>>>> = Arc::new(RwLock::new(HashMap::new()));
+        let (base, _counts, _range_counts, shutdown, server) =
+            spawn_dash_server_with_delay(routes.clone(), Arc::new(HashSet::new()), Duration::from_secs(3));
+        {
+            let mut map = routes.write().unwrap();
+            map.insert("/v1/init.mp4".into(), b"FAKEINIT".to_vec());
+            for index in 1..=segment_count {
+                map.insert(format!("/v1/seg-{index:03}.m4s"), format!("SEGMENT-{index:03}-DATA").into_bytes());
+            }
+            map.insert("/video.mpd".into(), dash_segment_template_mpd(segment_count).into_bytes());
+        }
+        let directory = dash_test_dir("control-close");
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("movie.mp4")).await.unwrap();
+        let url = format!("{base}/video.mpd");
+        let (control_tx, control_rx) = fresh_dash_control();
+        let task_target = target.clone();
+        let task_url = url.clone();
+        let task = tokio::spawn(async move { run_dash_resumable(&task_url, &task_target, control_rx).await });
+        // The response delay applies to the MPD fetch too, so the close
+        // must wait until the manifest is resolved and the track loop has
+        // started: the checkpoint sidecar is written right before the
+        // first segment is fetched, so its appearance means the slow
+        // segment fetches are in flight.
+        let meta_path = partial_download_metadata_path(&target);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if tokio::fs::try_exists(&meta_path).await.unwrap_or(false) { break; }
+            assert!(tokio::time::Instant::now() < deadline, "checkpoint never appeared");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let started = tokio::time::Instant::now();
+        drop(control_tx);
+        let joined = tokio::time::timeout(Duration::from_secs(10), task).await
+            .expect("a closed control channel must stop the download instead of draining the track");
+        let elapsed = started.elapsed();
+        let result = joined.unwrap();
+        assert!(result.is_err(), "a closed control channel must fail the run, got {result:?}");
+        let error = result.unwrap_err();
+        assert!(elapsed < Duration::from_secs(2),
+            "control close took {elapsed:?} — it must stop promptly during a slow segment, not after the track drains");
+        assert!(error.to_string().contains("control channel closed"),
+            "expected the control-closed error, got: {error}");
+        // The checkpoint and the work dir survive: nothing is deleted
+        // on this path, so a resume picks up where it stopped.
+        assert!(tokio::fs::try_exists(partial_download_metadata_path(&target)).await.unwrap());
+        assert!(tokio::fs::try_exists(dash_work_dir(&target)).await.unwrap());
+        // And the resume really does complete with the exact bytes.
+        let (_control_tx, control_rx) = fresh_dash_control();
+        let outcome = run_dash_resumable(&url, &target, control_rx).await.unwrap();
+        assert_eq!(outcome, DownloadOutcome::Completed);
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        let mut expected = b"FAKEINIT".to_vec();
+        for index in 1..=segment_count {
+            expected.extend_from_slice(format!("SEGMENT-{index:03}-DATA").as_bytes());
+        }
+        assert_eq!(bytes, expected);
+        stop_dash_server(shutdown, server);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn dash_cancel_removes_partial_files() {
         let segment_count = 48;
         let routes: Arc<RwLock<HashMap<String, Vec<u8>>>> = Arc::new(RwLock::new(HashMap::new()));
@@ -7061,7 +7749,7 @@ mod hls_download_tests {
     /// depended on.
     async fn generate_fmp4_track(dir: &std::path::Path, video: bool) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
         tokio::fs::create_dir_all(dir).await.ok()?;
-        let executable = std::env::var_os("THUNDERLOAD_FFMPEG").unwrap_or_else(|| "ffmpeg".into());
+        let executable = super::configured_ffmpeg_path().unwrap_or_else(|| std::path::PathBuf::from("ffmpeg"));
         let mut command = hidden_command(&executable);
         command.arg("-y");
         if video {
@@ -8135,6 +8823,54 @@ mod hls_download_tests {
     }
 
     #[tokio::test]
+    async fn hls_control_close_stops_promptly_and_keeps_checkpoint() {
+        // Eight 512 KiB segments, each taking ~4 s to trickle in (1 KiB
+        // chunks at 8 ms). Draining the playlist would take ~4 s; with
+        // the control channel closed mid-run the download must stop in
+        // well under two seconds with an error, and the checkpoint and
+        // work dir must survive so a resume completes.
+        let (mut routes, bodies) = segment_routes(8, 512 * 1024);
+        routes.insert("/media.m3u8".into(), media_playlist(8).into_bytes());
+        let (base, _counts, _range_206, shutdown, server) =
+            spawn_hls_server(routes, Duration::from_millis(8), HlsServerOptions::default());
+        let directory = std::env::temp_dir().join(format!("thunderload-hls-control-close-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("movie.ts")).await.unwrap();
+        let url = format!("{base}/media.m3u8");
+        let (control_tx, control_rx) = fresh_control();
+        let task_target = target.clone();
+        let task_url = url.clone();
+        let task = tokio::spawn(async move { run_resumable(&task_url, &task_target, control_rx).await });
+        // The playlist fetch is instant (tiny body); the segments take
+        // seconds, so a short sleep puts the close squarely mid-segment.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let started = tokio::time::Instant::now();
+        drop(control_tx);
+        let joined = tokio::time::timeout(Duration::from_secs(10), task).await
+            .expect("a closed control channel must stop the download instead of draining the playlist");
+        let elapsed = started.elapsed();
+        let result = joined.unwrap();
+        assert!(result.is_err(), "a closed control channel must fail the run, got {result:?}");
+        let error = result.unwrap_err();
+        assert!(elapsed < Duration::from_secs(2),
+            "control close took {elapsed:?} — it must stop promptly during a slow segment, not after the playlist drains");
+        assert!(error.to_string().contains("control channel closed"),
+            "expected the control-closed error, got: {error}");
+        // The checkpoint and the work dir survive: nothing is deleted
+        // on this path, so a resume picks up where it stopped.
+        assert!(tokio::fs::try_exists(partial_download_metadata_path(&target)).await.unwrap());
+        assert!(tokio::fs::try_exists(hls_work_dir(&target)).await.unwrap());
+        // And the resume really does complete with the exact bytes.
+        let (_control_tx, control_rx) = fresh_control();
+        let outcome = run_resumable(&url, &target, control_rx).await.unwrap();
+        assert_eq!(outcome, DownloadOutcome::Completed);
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(bytes, bodies.concat());
+        stop_server(shutdown, server);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn hls_parallel_fetch_uses_eight_concurrent_segments() {
         // 24 segments of 128 KiB, each taking ~1 s to trickle in (1 KiB
         // chunks at 8 ms). The engine must fill all of its connections —
@@ -8601,6 +9337,46 @@ mod hls_download_tests {
         assert!(error.to_string().contains("The partial recording was kept."), "a stall after segments arrived must say the partial was kept, got: {error}");
         let bytes = tokio::fs::read(&target).await.unwrap();
         assert_eq!(bytes, b"SEG0SEG1SEG2", "the partial recording of the stalled stream is kept");
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = server.join();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hls_live_control_close_stops_recording_and_keeps_partial() {
+        // The stalled fixture serves the same SEG0–SEG2 window on every
+        // fetch (TARGETDURATION 2, no ENDLIST): without the interrupt
+        // the recorder would keep polling for ~20 s until the stall
+        // limit. With the control channel closed mid-recording it must
+        // stop at once with an error, and the partial recording of what
+        // arrived stays on disk.
+        let (base, shutdown, server) = spawn_stalled_live_hls_server();
+        let directory = std::env::temp_dir().join(format!("thunderload-hls-live-control-close-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("live.ts")).await.unwrap();
+        let url = format!("{base}/live.m3u8");
+        let (control_tx, control_rx) = fresh_control();
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        let task_target = target.clone();
+        let task_url = url.clone();
+        let task = tokio::spawn(async move { download_hls_live(&task_url, &HlsSelection::none(), &task_target, None, control_rx, progress_tx, Arc::new(GlobalRateLimiter::new())).await });
+        // The first poll records the whole window in milliseconds; a
+        // short sleep puts the close squarely in the poll wait.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let started = tokio::time::Instant::now();
+        drop(control_tx);
+        let joined = tokio::time::timeout(Duration::from_secs(10), task).await
+            .expect("a closed control channel must stop the recording instead of polling on");
+        let elapsed = started.elapsed();
+        let result = joined.unwrap();
+        assert!(result.is_err(), "a closed control channel must fail the recording, got {result:?}");
+        let error = result.unwrap_err();
+        assert!(elapsed < Duration::from_secs(2),
+            "control close took {elapsed:?} — the recording must stop promptly, not after the next poll window");
+        assert!(error.to_string().contains("control channel closed"),
+            "expected the control-closed error, got: {error}");
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(bytes, b"SEG0SEG1SEG2", "the partial recording of what arrived before the close is kept");
         shutdown.store(true, Ordering::Relaxed);
         let _ = server.join();
         tokio::fs::remove_dir_all(directory).await.unwrap();

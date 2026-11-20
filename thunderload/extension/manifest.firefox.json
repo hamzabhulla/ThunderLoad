@@ -4,7 +4,7 @@
   "short_name": "ThunderLoad",
   "version": "0.3.4",
   "description": "A quiet, lightweight download companion with automatic media detection and optional desktop acceleration.",
-  "permissions": ["activeTab", "scripting", "downloads", "contextMenus", "webRequest", "webRequestBlocking", "cookies", "storage"],
+  "permissions": ["activeTab", "scripting", "downloads", "contextMenus", "webRequest", "webRequestBlocking", "cookies", "storage", "alarms"],
   "optional_permissions": ["nativeMessaging"],
   "host_permissions": ["<all_urls>"],
   "content_scripts": [

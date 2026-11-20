@@ -11,10 +11,10 @@ Do not label a build production-ready until every applicable item is complete.
 - [ ] Uninstaller safely removes registry entries and local host files.
 - [x] Desktop direct-HTTP queue history persists locally.
 - [x] Direct-HTTP checkpoint pause/resume, cancel and startup recovery are implemented; automated tests and Windows CI must pass for each release.
-- [ ] Multi-connection resume and HLS pause/resume/cancel implemented and tested.
+- [x] Multi-connection resume and HLS pause/resume/cancel implemented and tested.
 - [x] Windows one-time Task Scheduler wake task registration/cancellation is implemented with WakeToRun and StartWhenAvailable settings.
 - [ ] Validate scheduled wake, missed triggers, logged-out behavior, cancellation and duplicate-launch handling on clean Windows 10/11 VMs; wake still depends on Windows power settings.
-- [ ] Browser-native jobs controllable (pause/resume/cancel) from the desktop queue, not only tracked.
+- [x] Browser-native jobs controllable (pause/resume/cancel) from the desktop queue, not only tracked.
 - [ ] Test checkpoint recovery across server range support changes, ETag changes, disk-full and force-kill scenarios.
 - [ ] Verify aggregate speed cap across concurrent direct, HLS and DASH segment downloads in both desktop and browser-native processes.
 - [ ] Update channel, rollback, checksums and release provenance documented.
@@ -33,12 +33,12 @@ Do not label a build production-ready until every applicable item is complete.
 ## Download engine
 - [ ] Range requests validated against test servers and malformed Content-Range rejected.
 - [ ] Retry, timeout, cancel, partial cleanup and disk-full behavior tested.
-- [ ] HLS byte ranges, discontinuities, live playlists, fMP4, encryption rejection and quality selection tested.
+- [ ] HLS byte ranges, discontinuities, live playlists, fMP4, AES-128 decryption / non-AES-128 rejection and quality selection tested.
 - [ ] Verify configured FFmpeg path is loaded by both desktop and browser native-host processes; test missing/invalid binary and mux failures.
 - [x] Static DASH SegmentTemplate/SegmentTimeline, inherited templates, BaseURL resolution, audio/video representation selection and FFmpeg stream-copy mux code implemented; Windows CI fixtures must remain green.
 - [ ] End-to-end DASH download fixtures against real MPD providers, including unusual timescales, negative repeats, signed BaseURLs, and audio/video codec combinations.
-- [ ] DASH SegmentList/SegmentBase and multi-period support; DRM/ContentProtection intentionally remains unsupported.
-- [ ] Cookie/custom-header handoff is explicit and local.
+- [x] DASH SegmentList/SegmentBase and multi-period support; DRM/ContentProtection intentionally remains unsupported.
+- [x] Cookie/custom-header handoff is explicit and local.
 - [ ] No DRM decryption, paywall bypass or unauthorized access.
 
 ## Store submission

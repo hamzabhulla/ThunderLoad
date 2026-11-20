@@ -31,16 +31,21 @@
 //!   handoff either.
 
 use anyhow::{anyhow, Context, Result};
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::header::{self, HeaderValue};
 use reqwest::RequestBuilder;
 use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use url::Url;
 
 /// The browser session for one download job.
 ///
 /// `None` (the default) means "no browser session": desktop-started
 /// jobs, and any job whose handoff was absent or failed validation.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+//
+// No derived `Debug`: the cookies are a bearer credential and must
+// never appear in a log line via `{:?}` — see the manual impl below.
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionHeaders {
     /// Raw `Cookie` header value (`"name=value; name2=value2"`) for
     /// `origin`. Only ever sent to requests whose origin equals
@@ -51,12 +56,27 @@ pub struct SessionHeaders {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub referer: Option<String>,
     /// Browser User-Agent, used instead of the engine default when set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The extension sends camelCase `userAgent`; the alias keeps that
+    /// handoff from silently dropping the browser's User-Agent (P1-26).
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "userAgent")]
     pub user_agent: Option<String>,
     /// Origin the cookies belong to, e.g. `"https://example.com"`.
     /// Cookies are only sent to requests whose origin equals this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+}
+
+impl std::fmt::Debug for SessionHeaders {
+    /// Cookies are a bearer credential: show only that one is present,
+    /// never its value. Everything else debugs normally.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionHeaders")
+            .field("cookies", &self.cookies.as_ref().map(|_| "[redacted]"))
+            .field("referer", &self.referer)
+            .field("user_agent", &self.user_agent)
+            .field("origin", &self.origin)
+            .finish()
+    }
 }
 
 impl SessionHeaders {
@@ -129,6 +149,9 @@ impl SessionHeaders {
             }
         }
         if let Some(referer) = &self.referer {
+            if referer.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
+                return Err(anyhow!("Session referer contains control characters"));
+            }
             let parsed = Url::parse(referer).context("Invalid session referer")?;
             if !matches!(parsed.scheme(), "http" | "https") {
                 return Err(anyhow!("Session referer is not an HTTP(S) URL"));
@@ -148,15 +171,22 @@ impl SessionHeaders {
     pub fn cookies_apply_to(&self, url: &str) -> bool {
         match (&self.cookies, &self.origin) {
             (Some(cookies), Some(origin)) if !cookies.trim().is_empty() => {
-                Self::origin_of(url).as_deref() == Some(origin.as_str())
+                let normalized_origin = Url::parse(origin)
+                    .ok()
+                    .filter(|u| matches!(u.scheme(), "http" | "https"))
+                    .map(|u| u.origin().ascii_serialization());
+                normalized_origin.is_some() && Self::origin_of(url) == normalized_origin
             }
             _ => false,
         }
     }
 
     /// Apply this session to one request: Cookie only when the request
-    /// URL is in scope, Referer and User-Agent whenever set. Never
-    /// panics on a malformed header value — that header is skipped.
+    /// URL is in scope, User-Agent whenever set, Referer only when the
+    /// request URL is same-origin with the page it came from — a
+    /// cross-origin Referer would leak the user's browsing to a host
+    /// that never served the page. Never panics on a malformed header
+    /// value — that header is skipped.
     pub fn apply(&self, request: RequestBuilder, url: &str) -> RequestBuilder {
         let mut request = request;
         if self.cookies_apply_to(url) {
@@ -167,8 +197,11 @@ impl SessionHeaders {
             }
         }
         if let Some(referer) = &self.referer {
-            if let Ok(value) = HeaderValue::from_str(referer) {
-                request = request.header(header::REFERER, value);
+            let referer_origin = Self::origin_of(referer);
+            if referer_origin.is_some() && referer_origin == Self::origin_of(url) {
+                if let Ok(value) = HeaderValue::from_str(referer) {
+                    request = request.header(header::REFERER, value);
+                }
             }
         }
         if let Some(user_agent) = &self.user_agent {
@@ -296,6 +329,208 @@ pub fn download_failure_label(error: &anyhow::Error) -> Option<String> {
     None
 }
 
+/// True when the bench-only localhost opt-in is set
+/// (`THUNDERLOAD_ALLOW_LOCALHOST=1`). The bench binary sets it for
+/// itself at startup; nothing in production ever sets it. It exempts
+/// loopback only — every other blocked range still applies.
+pub fn localhost_allowed() -> bool {
+    std::env::var("THUNDERLOAD_ALLOW_LOCALHOST").is_ok_and(|value| value == "1")
+}
+
+/// True when an IPv4 address is not a public address: loopback,
+/// RFC1918, link-local, unspecified, CGNAT (`100.64.0.0/10`),
+/// multicast (`224.0.0.0/4`), broadcast, benchmarking (`198.18.0.0/15`)
+/// and reserved (`240.0.0.0/4`) space. Kept as a plain predicate so it
+/// can be unit-tested without a live server.
+pub fn is_blocked_ipv4(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        || (224..=239).contains(&octets[0])
+        || octets == [255, 255, 255, 255]
+        || (octets[0] == 198 && (18..=19).contains(&octets[1]))
+        || octets[0] >= 240
+}
+
+/// True when an IPv6 address is not a public address: loopback,
+/// unspecified, link-local (`fe80::/10`), unique-local (`fc00::/7`),
+/// multicast (`ff00::/8`), NAT64 (`64:ff9b::/96`), plus anything that
+/// maps to a blocked IPv4 address. Kept as a plain predicate so it can
+/// be unit-tested without a live server.
+pub fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
+    // Loopback/unspecified first: `to_ipv4()` maps `::1` to the
+    // IPv4-compatible `0.0.0.1`, which none of the IPv4 checks catch,
+    // so the mapped path below must never see them.
+    if ip.is_loopback() || ip.is_unspecified() {
+        return true;
+    }
+    if let Some(mapped) = ip.to_ipv4() {
+        return is_blocked_ipv4(mapped);
+    }
+    let segments = ip.segments();
+    (segments[0] & 0xffc0) == 0xfe80
+        || (segments[0] & 0xfe00) == 0xfc00
+        || (segments[0] & 0xff00) == 0xff00
+        || (segments[0] == 0x0064
+            && segments[1] == 0xff9b
+            && segments[2] == 0
+            && segments[3] == 0
+            && segments[4] == 0
+            && segments[5] == 0)
+}
+
+/// True when an IP address (v4 or v6) is not a public address.
+pub fn is_blocked_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => is_blocked_ipv4(ip),
+        IpAddr::V6(ip) => is_blocked_ipv6(ip),
+    }
+}
+
+/// True when a URL host is blocked: a `localhost` name, or a blocked
+/// IP. With `allow_loopback` (unit tests, and the bench binary's
+/// opt-in) loopback is exempt; every other range still blocks.
+/// Only called from the `#[cfg(not(test))]` arm of
+/// `validate_public_http_url`, so test builds would warn it is dead.
+#[cfg_attr(test, allow(dead_code))]
+fn host_is_blocked(host: &url::Host<&str>, allow_loopback: bool) -> bool {
+    match host {
+        url::Host::Domain(domain) => {
+            let normalized = domain.trim_end_matches('.').to_ascii_lowercase();
+            let is_localhost =
+                normalized == "localhost" || normalized.ends_with(".localhost");
+            is_localhost && !allow_loopback
+        }
+        url::Host::Ipv4(ip) => {
+            if allow_loopback && ip.is_loopback() {
+                false
+            } else {
+                is_blocked_ipv4(*ip)
+            }
+        }
+        url::Host::Ipv6(ip) => {
+            if allow_loopback && ip.is_loopback() {
+                false
+            } else {
+                is_blocked_ipv6(*ip)
+            }
+        }
+    }
+}
+
+/// A DNS resolver that drops every resolved address the SSRF blocklist
+/// forbids, before reqwest ever connects to it. The URL-string check in
+/// `validate_public_http_url` is the first layer; this is the
+/// enforcement at connect time, so a hostname that resolves to a
+/// private address (DNS rebinding, or a record that changes between
+/// the check and the connect) is caught here — the addresses handed to
+/// `connect` are exactly the addresses that were checked.
+///
+/// Residual gap, stated honestly: DNS is re-resolved per request, so a
+/// record that flips public-to-private between two requests is
+/// re-checked on the next request, not the in-flight one — but no
+/// in-flight connection ever goes to an unchecked address.
+#[derive(Debug, Clone, Copy)]
+pub struct ValidatingResolver {
+    allow_loopback: bool,
+}
+
+impl ValidatingResolver {
+    pub fn new(allow_loopback: bool) -> Self {
+        Self { allow_loopback }
+    }
+
+    /// The resolver the engine clients use: loopback is allowed in unit
+    /// tests (local fixtures) and in the bench binary, which opts in via
+    /// `THUNDERLOAD_ALLOW_LOCALHOST=1`; everywhere else it is blocked.
+    pub fn from_env() -> Self {
+        Self::new(cfg!(test) || localhost_allowed())
+    }
+}
+
+impl Resolve for ValidatingResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let allow_loopback = self.allow_loopback;
+        Box::pin(async move {
+            let addrs = tokio::net::lookup_host((name.as_str(), 0))
+                .await
+                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
+            let kept: Vec<std::net::SocketAddr> = addrs
+                .filter(|addr| {
+                    (allow_loopback && addr.ip().is_loopback()) || !is_blocked_ip(addr.ip())
+                })
+                .collect();
+            if kept.is_empty() {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "DNS resolved only to blocked (local or private) addresses",
+                )) as Box<dyn std::error::Error + Send + Sync>);
+            }
+            Ok(Box::new(kept.into_iter()) as Addrs)
+        })
+    }
+}
+
+/// Validate that `url` is an HTTP(S) URL targeting a public host.
+/// Rejects non-HTTP(S) schemes unconditionally, and (outside unit tests,
+/// which bind local `127.0.0.1` mock servers) rejects localhost,
+/// unspecified, loopback, link-local, and private addresses — including
+/// the audit ranges (CGNAT, multicast, broadcast, benchmarking,
+/// reserved, NAT64) — to guard against SSRF. The bench binary opts
+/// into a loopback exemption via `THUNDERLOAD_ALLOW_LOCALHOST=1`.
+///
+/// The URL-string check here is the first layer only: the
+/// `ValidatingResolver` wired into the engine clients re-checks every
+/// resolved address before connecting, which is what closes the
+/// DNS-rebinding gap.
+pub fn validate_public_http_url(url: &str) -> Result<Url> {
+    let parsed = Url::parse(url).context("Invalid URL")?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(anyhow!("Only HTTP and HTTPS URLs are supported"));
+    }
+    let host = parsed
+        .host()
+        .ok_or_else(|| anyhow!("URL must include a host"))?;
+    #[cfg(not(test))]
+    {
+        if host_is_blocked(&host, localhost_allowed()) {
+            return Err(anyhow!(
+                "Refusing to connect to a local or private network address"
+            ));
+        }
+    }
+    #[cfg(test)]
+    let _ = host;
+    Ok(parsed)
+}
+
+/// Redirect policy for every engine HTTP client: at most 10 hops
+/// (the same limit `Policy::limited(10)` enforced before), and every
+/// hop's target must pass `validate_public_http_url`. A hop to a
+/// non-HTTP(S) URL or a local/private address fails the whole request
+/// with a clear error instead of being followed silently — so a
+/// public URL that redirects at a private host can no longer turn the
+/// engine into an SSRF probe. Each hop is also resolved through the
+/// client's `ValidatingResolver`, so a redirect target that resolves
+/// to a private address is blocked at connect time, not just by URL
+/// string.
+pub fn validated_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() > 10 {
+            return attempt.error("Too many redirects (limit 10)");
+        }
+        match validate_public_http_url(attempt.url().as_str()) {
+            Ok(_) => attempt.follow(),
+            Err(error) => attempt.error(format!(
+                "Redirect target failed validation: {error}"
+            )),
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,6 +594,102 @@ mod tests {
             ..Default::default()
         };
         assert!(session.validate("https://example.com/video.mp4").is_err());
+    }
+
+    #[test]
+    fn debug_hides_cookie_values() {
+        let rendered = format!("{:?}", session());
+        assert!(
+            !rendered.contains("session=abc"),
+            "cookies must never appear in Debug output: {rendered}"
+        );
+        assert!(rendered.contains("[redacted]"), "Debug must still show a cookie is present: {rendered}");
+        assert!(rendered.contains("https://example.com/page"));
+    }
+
+    #[test]
+    fn user_agent_deserializes_from_camel_case_alias() {
+        // P1-26: the extension sends `userAgent`; without the alias the
+        // browser's User-Agent was silently dropped on every request.
+        let parsed: SessionHeaders =
+            serde_json::from_str(r#"{"userAgent":"Mozilla/5.0","origin":"https://example.com"}"#)
+                .unwrap();
+        assert_eq!(parsed.user_agent.as_deref(), Some("Mozilla/5.0"));
+        // snake_case still works, and serialization keeps snake_case.
+        let snake: SessionHeaders =
+            serde_json::from_str(r#"{"user_agent":"Other/1.0"}"#).unwrap();
+        assert_eq!(snake.user_agent.as_deref(), Some("Other/1.0"));
+        assert!(serde_json::to_string(&parsed)
+            .unwrap()
+            .contains("\"user_agent\":\"Mozilla/5.0\""));
+    }
+
+    #[test]
+    fn ssrf_blocklist_covers_the_audit_ranges() {
+        // Previously blocked (kept): loopback, RFC1918, link-local, ULA.
+        for ip in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "0.0.0.0",
+            "::1",
+            "fe80::1",
+            "fc00::1",
+        ] {
+            let parsed: std::net::IpAddr = ip.parse().unwrap();
+            assert!(is_blocked_ip(parsed), "{ip} must be blocked");
+        }
+        // New ranges (P0-1 remainder): CGNAT, multicast, broadcast,
+        // benchmarking, reserved, IPv6 multicast, NAT64.
+        for ip in [
+            "100.64.0.1",
+            "100.127.255.255",
+            "224.0.0.1",
+            "239.255.255.255",
+            "255.255.255.255",
+            "198.18.0.1",
+            "198.19.255.255",
+            "240.0.0.1",
+            "255.0.0.1",
+            "ff02::1",
+            "64:ff9b::8.8.8.8",
+            "64:ff9b::1",
+            "::ffff:127.0.0.1",
+        ] {
+            let parsed: std::net::IpAddr = ip.parse().unwrap();
+            assert!(is_blocked_ip(parsed), "{ip} must be blocked");
+        }
+        // Public addresses stay reachable.
+        for ip in ["8.8.8.8", "1.1.1.1", "93.184.216.34", "2001:4860:4860::8888"] {
+            let parsed: std::net::IpAddr = ip.parse().unwrap();
+            assert!(!is_blocked_ip(parsed), "{ip} must not be blocked");
+        }
+    }
+
+    #[tokio::test]
+    async fn validating_resolver_rejects_private_addresses() {
+        use reqwest::dns::Resolve as _;
+        // No live server or DNS involved: literal IPs resolve locally.
+        let strict = ValidatingResolver::new(false);
+        for name in ["127.0.0.1", "100.64.0.1", "10.0.0.1", "::1"] {
+            let parsed: reqwest::dns::Name = name.parse().unwrap();
+            assert!(
+                strict.resolve(parsed).await.is_err(),
+                "{name} must not resolve through the validating resolver"
+            );
+        }
+        let public: reqwest::dns::Name = "8.8.8.8".parse().unwrap();
+        let addrs = strict.resolve(public).await.unwrap();
+        assert_eq!(addrs.count(), 1);
+        // The loopback exemption (tests / bench opt-in) allows 127.0.0.1
+        // and nothing else extra: CGNAT still blocks.
+        let loopback_ok = ValidatingResolver::new(true);
+        let local: reqwest::dns::Name = "127.0.0.1".parse().unwrap();
+        assert!(loopback_ok.resolve(local).await.is_ok());
+        let cgnat: reqwest::dns::Name = "100.64.0.1".parse().unwrap();
+        assert!(loopback_ok.resolve(cgnat).await.is_err());
     }
 
     #[test]
@@ -509,5 +840,178 @@ mod tests {
             download_failure_label(&wrapped).as_deref(),
             Some("Could not reach the server. Check your connection and try again.")
         );
+    }
+
+    #[tokio::test]
+    async fn validated_redirect_policy_revalidates_each_hop() {
+        // N2: a redirect hop to a non-HTTP(S) URL must fail the
+        // request, while a hop to another public-URL-shaped target
+        // is still followed. (In test builds the validator allows
+        // localhost, so the "public" hop here is a second local
+        // path; the scheme check is what this test can prove. A
+        // `file:` hop is not used: tower-http cannot resolve it to
+        // a URI at all, so it returns the 302 un-followed without
+        // ever consulting the policy — still never fetched, but not
+        // a policy test. `ftp:` resolves and reaches the policy.)
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let thread_requests = requests.clone();
+        let serve = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(connection) => connection,
+                    Err(_) => return,
+                };
+                thread_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    match stream.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => {
+                            request.extend_from_slice(&buffer[..count]);
+                            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let text = String::from_utf8_lossy(&request);
+                let path = text.split_whitespace().nth(1).unwrap_or("");
+                let reply = match path {
+                    "/hop" => "HTTP/1.1 302 Found\r\nLocation: ftp://example.com/evil\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                    "/ok" => format!("HTTP/1.1 302 Found\r\nLocation: http://{addr}/final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+                    "/final" => "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndone".to_string(),
+                    _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                };
+                if stream.write_all(reply.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let client = reqwest::Client::builder()
+            .redirect(validated_redirect_policy())
+            .build()
+            .unwrap();
+        let blocked = client
+            .get(format!("http://{addr}/hop"))
+            .send()
+            .await;
+        assert!(blocked.is_err(), "a redirect to ftp:// must fail, not be followed");
+        // The validation message rides on the error's source chain
+        // ("error following redirect for url (...)" wraps it).
+        let blocked_err = blocked.unwrap_err();
+        let mut chain = blocked_err.to_string();
+        {
+            use std::error::Error as _;
+            let mut source = blocked_err.source();
+            while let Some(err) = source {
+                chain.push_str(&format!(" <- {err}"));
+                source = err.source();
+            }
+        }
+        assert!(
+            chain.contains("Redirect target failed validation"),
+            "the error must name the failed redirect validation: {chain}"
+        );
+        let followed = client
+            .get(format!("http://{addr}/ok"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(followed.status(), reqwest::StatusCode::OK);
+        assert_eq!(followed.text().await.unwrap(), "done");
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "exactly /hop once and the /ok -> /final chain: the blocked hop was never followed"
+        );
+        serve.abort();
+    }
+
+    #[tokio::test]
+    async fn validated_redirect_policy_stops_after_ten_redirects() {
+        // The cap at `validated_redirect_policy`: a chain of 11
+        // redirects must fail with the limit named, and the final
+        // URL must never be fetched. Paths /0 .. /10 each redirect
+        // to the next hop; /11 is the final 200. `attempt.previous()`
+        // includes the initial URL, so the `> 10` check fires on
+        // the 11th redirect decision — 10 hops followed, 11 requests
+        // served — and the chain never reaches /11.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let thread_requests = requests.clone();
+        let serve = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(connection) => connection,
+                    Err(_) => return,
+                };
+                thread_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    match stream.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => {
+                            request.extend_from_slice(&buffer[..count]);
+                            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let text = String::from_utf8_lossy(&request);
+                let path = text.split_whitespace().nth(1).unwrap_or("");
+                let hop: Option<u32> =
+                    path.strip_prefix('/').and_then(|n| n.parse().ok());
+                let reply = match hop {
+                    Some(n) if n <= 10 => format!(
+                        "HTTP/1.1 302 Found\r\nLocation: http://{addr}/{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        n + 1
+                    ),
+                    Some(11) => "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndone"
+                        .to_string(),
+                    _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string(),
+                };
+                if stream.write_all(reply.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let client = reqwest::Client::builder()
+            .redirect(validated_redirect_policy())
+            .build()
+            .unwrap();
+        let result = client.get(format!("http://{addr}/0")).send().await;
+        assert!(
+            result.is_err(),
+            "an 11-redirect chain must fail at the cap, not be followed to the end"
+        );
+        let err = result.unwrap_err();
+        let mut chain = err.to_string();
+        {
+            use std::error::Error as _;
+            let mut source = err.source();
+            while let Some(e) = source {
+                chain.push_str(&format!(" <- {e}"));
+                source = e.source();
+            }
+        }
+        assert!(
+            chain.contains("Too many redirects (limit 10)"),
+            "the error must name the redirect limit: {chain}"
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::Relaxed),
+            11,
+            "exactly the initial request plus the 10 hops the cap allows: /11 must never be fetched"
+        );
+        serve.abort();
     }
 }
