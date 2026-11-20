@@ -1,6 +1,6 @@
 [package]
 name = "thunderload-desktop"
-version = "0.3.4"
+version = "0.3.5"
 description = "ThunderLoad desktop download manager"
 authors = ["ThunderLoad contributors"]
 edition = "2021"
