@@ -7,17 +7,35 @@
 // No .crx is produced on purpose: Chrome refuses to install a .crx from
 // outside the Web Store, so the developer-mode path is ZIP + Load unpacked.
 // Run: node scripts/package-extensions.mjs
-import { mkdir, mkdtemp, readdir, rm, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
 import { deflateRawSync } from "node:zlib";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const extDir = resolve(root, "extension");
 const outDir = resolve(root, "dist", "extensions");
 
-// Minimal CRC-32 (IEEE) for ZIP entries.
+// Explicit allowlist: the ONLY files that ship in either package.
+// A denylist (copy the whole dir, remove a few names) silently ships
+// anything new that lands in extension/ — a mockup, a scratch file,
+// a stray manifest — so both packagers build from this list and
+// nothing else. The two manifests are handled per-browser below:
+// Chromium ships manifest.json, Firefox ships manifest.firefox.json
+// renamed to manifest.json.
+const EXTENSION_FILES = [
+  "background.js",
+  "content.js",
+  "hook.js",
+  "popup.css",
+  "popup.html",
+  "popup.js",
+  "icons/16.png",
+  "icons/32.png",
+  "icons/48.png",
+  "icons/128.png",
+];
 const CRC_TABLE = (() => {
   const table = new Uint32Array(256);
   for (let n = 0; n < 256; n++) {
@@ -98,32 +116,28 @@ function buildZip(entries) {
   return Buffer.concat([...chunks, ...central, end]);
 }
 
-async function collectFiles(dir, base = dir) {
-  const out = [];
-  for (const name of (await readdir(dir)).sort()) {
-    const path = join(dir, name);
-    const entryStat = await stat(path);
-    if (entryStat.isDirectory()) {
-      out.push({ name: relative(base, path).split(sep).join("/") + "/", data: Buffer.alloc(0), directory: true });
-      out.push(...await collectFiles(path, base));
-    } else {
-      out.push({ name: relative(base, path).split(sep).join("/"), data: await readFile(path), directory: false });
-    }
+async function collectAllowlisted(manifestFile) {
+  // Entries are built from EXTENSION_FILES only, in sorted order,
+  // with forward-slash names (relative().split(sep).join("/") would
+  // do the same, but the names here are already slash-separated, so
+  // a Windows run cannot smuggle a backslash into the archive).
+  // A missing allowlisted file fails the build (readFile throws)
+  // instead of shipping a broken package.
+  const entries = [{ name: "icons/", data: Buffer.alloc(0), directory: true }];
+  const names = [...EXTENSION_FILES, manifestFile].sort();
+  for (const name of names) {
+    const archiveName = name === "manifest.firefox.json" ? "manifest.json" : name;
+    entries.push({ name: archiveName, data: await readFile(join(extDir, name)), directory: false });
   }
-  return out;
+  return entries;
 }
 
 async function main() {
   const stage = await mkdtemp(join(tmpdir(), "thunderload-"));
   try {
     await mkdir(outDir, { recursive: true });
-    const all = await collectFiles(extDir);
-    const chromium = all.filter((entry) => basename(entry.name) !== "manifest.firefox.json");
-    const firefox = all
-      .filter((entry) => basename(entry.name) !== "manifest.json")
-      .map((entry) => basename(entry.name) === "manifest.firefox.json"
-        ? { ...entry, name: entry.name.replace("manifest.firefox.json", "manifest.json") }
-        : entry);
+    const chromium = await collectAllowlisted("manifest.json");
+    const firefox = await collectAllowlisted("manifest.firefox.json");
     await writeFile(join(outDir, "ThunderLoad-Chromium.zip"), buildZip(chromium));
     const firefoxZip = buildZip(firefox);
     await writeFile(join(outDir, "ThunderLoad-Firefox.zip"), firefoxZip);

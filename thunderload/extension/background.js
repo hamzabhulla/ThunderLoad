@@ -3,6 +3,11 @@ const HOST_NAME = "com.thunderload.host";
 let nativePort = null;
 let nextRequestId = 1;
 const pendingRequests = new Map();
+// Timeout handle per pending requestNative call, so a response (or a
+// port disconnect) can cancel the timer instead of letting it fire
+// later against an already-resolved request.
+const pendingRequestTimers = new Map();
+const jobTabById = new Map();
 const sourcesByTab = new Map();
 const truncatedByTab = new Map();
 const MAX_SOURCES_PER_TAB = 100;
@@ -47,6 +52,18 @@ const YTDLP_RELEASE_PAGES = {
   ytdlp: "https://github.com/yt-dlp/yt-dlp/releases/tag/2026.10.26",
   deno: "https://github.com/denoland/deno/releases/tag/v2.9.8"
 };
+function normalizeMissingTool(missing) {
+  if (Array.isArray(missing)) return typeof missing[0] === "string" && missing[0] ? missing[0] : null;
+  return typeof missing === "string" && missing ? missing : null;
+}
+async function getActiveTab() {
+  try {
+    const [tab] = await api.tabs.query({ active: true, currentWindow: true });
+    return tab || null;
+  } catch (_) {
+    return null;
+  }
+}
 
 // Fix 3: the ThunderLoad app / native host is required for Direct
 // media. A googlevideo segment downloaded by the browser is one
@@ -87,6 +104,25 @@ async function hasNativePermission() {
   try { return await api.permissions.contains({ permissions: ["nativeMessaging"] }); }
   catch (_) { return false; }
 }
+// H7: Firefox MV3 <all_urls> host access is granted at install (FF
+// >=127) but the user can revoke it with one click in about:addons,
+// after which content-script injection and webRequest observation
+// silently stop — no error surfaces anywhere, and there is no
+// permissions event the popup could rely on. So the background
+// carries the hostPermissionGranted field on GET_ACTIVE_SOURCES,
+// which the popup reads on every open, and also answers the
+// standalone GET_HOST_PERMISSION_STATUS check for any caller that
+// needs the status without a source scan; REQUEST_HOST_PERMISSION
+// re-prompts when revoked. A missing permissions API or a thrown check fails OPEN
+// (assumes granted) so a browser quirk can never cry wolf; only an
+// explicit `false` from contains() counts as revoked.
+const HOST_ORIGINS = ["<all_urls>"];
+async function hasHostPermission() {
+  try {
+    if (typeof api.permissions?.contains !== "function") return true;
+    return await api.permissions.contains({ origins: HOST_ORIGINS });
+  } catch (_) { return true; }
+}
 function ensureNativePort() {
   if (nativePort) return nativePort;
   // Chrome only exposes runtime.connectNative while the optional
@@ -104,15 +140,36 @@ function ensureNativePort() {
     if (message && message.id && pendingRequests.has(message.id)) {
       const resolve = pendingRequests.get(message.id);
       pendingRequests.delete(message.id);
+      clearTimeout(pendingRequestTimers.get(message.id));
+      pendingRequestTimers.delete(message.id);
       resolve(message);
       return;
     }
     api.runtime.sendMessage({ type: "NATIVE_EVENT", event: message }).catch(() => {});
+    if (message?.jobId && jobTabById.has(message.jobId)) {
+      const tabId = jobTabById.get(message.jobId);
+      api.tabs?.sendMessage?.(tabId, { type: "NATIVE_EVENT", event: message })?.catch?.(() => {});
+      if (message.event === "download.complete" || message.event === "download.error" || message.event === "download.cancelled") {
+        jobTabById.delete(message.jobId);
+      }
+    }
+    if (message?.event === "ytdlp.tool_progress" && typeof api.tabs?.query === "function") {
+      api.tabs.query({ active: true }).then((tabs) => {
+        for (const tab of tabs || []) {
+          if (typeof tab?.id === "number") {
+            api.tabs?.sendMessage?.(tab.id, { type: "NATIVE_EVENT", event: message })?.catch?.(() => {});
+          }
+        }
+      }).catch(() => {});
+    }
   });
   nativePort.onDisconnect.addListener(() => {
     nativePort = null;
+    jobTabById.clear();
     for (const [id, resolve] of pendingRequests) resolve({ id, ok: false, error: api.runtime.lastError?.message || "Native host disconnected" });
     pendingRequests.clear();
+    for (const timer of pendingRequestTimers.values()) clearTimeout(timer);
+    pendingRequestTimers.clear();
     api.runtime.sendMessage({ type: "NATIVE_DISCONNECTED" }).catch(() => {});
   });
   // Slice 6: the port is back — retry any intercepted download that
@@ -138,13 +195,16 @@ async function requestNative(action, payload = {}, timeoutMs = 30000) {
     try {
       const port = ensureNativePort();
       pendingRequests.set(id, resolve);
-      port.postMessage({ id, action, ...payload });
+      port.postMessage({ ...payload, id, action });
       // Slice 3: tool downloads (22 MB yt-dlp + 41 MB Deno) outlast
       // the 30 s default, so ensure_tool passes a 10-minute timeout.
-      setTimeout(() => {
-        if (pendingRequests.has(id)) { pendingRequests.delete(id); resolve({ id, ok: false, error: "Native host timed out" }); }
+      // The handle is stored so a response or disconnect clears it.
+      const timer = setTimeout(() => {
+        if (pendingRequests.has(id)) { pendingRequests.delete(id); pendingRequestTimers.delete(id); resolve({ id, ok: false, error: "Native host timed out" }); }
       }, timeoutMs);
+      pendingRequestTimers.set(id, timer);
     } catch (error) {
+      pendingRequests.delete(id);
       resolve({ id, ok: false, error: error?.message || String(error) });
     }
   });
@@ -363,7 +423,19 @@ function queueIntercept(url, filename, referer) {
   persistInterceptQueue();
   tryIntercept(entry).catch(() => {});
 }
-setInterval(() => { flushInterceptQueue(); }, 30000);
+// MV3 service workers are suspended, so a plain setInterval is not
+// a reliable 30 s ticker — use chrome.alarms when the API is
+// available (it needs the "alarms" manifest permission; without it
+// api.alarms is undefined and the setInterval fallback below keeps
+// the old behaviour). The alarm name is namespaced so a future
+// alarm cannot collide with it.
+const INTERCEPT_FLUSH_ALARM = "thunderload-intercept-flush";
+if (typeof api.alarms?.create === "function" && typeof api.alarms?.onAlarm?.addListener === "function") {
+  api.alarms.create(INTERCEPT_FLUSH_ALARM, { periodInMinutes: 0.5 });
+  api.alarms.onAlarm.addListener((alarm) => { if (alarm?.name === INTERCEPT_FLUSH_ALARM) flushInterceptQueue(); });
+} else {
+  setInterval(() => { flushInterceptQueue(); }, 30000);
+}
 // Rehydrate the queue after a worker restart (see above): entries
 // recorded before the restart retry at once — the desktop app may
 // already be back by now, so waiting for the next delay would waste
@@ -395,7 +467,7 @@ if (IS_FIREFOX && api.webRequest?.onBeforeRequest) {
     if (!interceptEnabled) return {};
     if (!/^https?:\/\//i.test(details.url || "")) return {};
     if (!MEDIA_FILE_NAV_EXT.test(details.url)) return {};
-    queueIntercept(details.url, safeFilenameFromUrl(details.url, "download.bin"), details.initiator || "");
+    queueIntercept(details.url, safeFilenameFromUrl(details.url, "download.bin"), details.initiator || details.originUrl || details.documentUrl || "");
     return { cancel: true };
   }, { urls: ["<all_urls>"], types: ["main_frame", "sub_frame"] }, ["blocking"]);
 }
@@ -482,6 +554,10 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
           sources = sources.filter((item) => !isGoogleVideoRow(item) && !item.isYouTubeDash);
         }
         sendResponse({ ok: true, tabId: tab.id, sources, pageUrl: tab.url || "", truncated: !!truncatedByTab.get(tab.id),
+          // H7: host access may have been revoked in about:addons
+          // since install — the popup shows a re-enable notice when
+          // this is false instead of a bare "No media found".
+          hostPermissionGranted: await hasHostPermission(),
           ytdlp: ytdlpForPage ? { variants: ytdlpForPage.variants, title: ytdlpForPage.title } : null,
           // Slice 6: downloads intercepted while the desktop app was
           // down, still waiting for the handoff — the popup shows them
@@ -494,7 +570,13 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message?.type === "NATIVE_REQUEST") {
-    requestNative(message.action, message.payload || {}).then(sendResponse);
+    const senderTabId = sender.tab?.id;
+    requestNative(message.action, message.payload || {}).then((result) => {
+      if (result?.ok && result.data?.jobId && typeof senderTabId === "number") {
+        jobTabById.set(result.data.jobId, senderTabId);
+      }
+      sendResponse(result);
+    });
     return true;
   }
   // Slice 1b: the in-page panel's "Connect desktop app" button.
@@ -519,6 +601,32 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
     })();
     return true;
   }
+  // H7: host-permission status check and re-grant prompt. The
+  // popup reads hostPermissionGranted from GET_ACTIVE_SOURCES on
+  // every open; GET_HOST_PERMISSION_STATUS below is the standalone
+  // check for callers that need the status without a source scan.
+  // When revoked the popup shows a notice with a re-enable button. The button calls
+  // permissions.request directly from the popup when it can (the
+  // click's user gesture survives there); this background handler
+  // is the fallback for callers without a gesture, e.g. the in-page
+  // panel. A failed request is NOT an error — the notice stays and
+  // points at the manual steps in about:addons / chrome://extensions.
+  if (message?.type === "GET_HOST_PERMISSION_STATUS") {
+    hasHostPermission().then((granted) => sendResponse({ ok: true, granted }));
+    return true;
+  }
+  if (message?.type === "REQUEST_HOST_PERMISSION") {
+    (async () => {
+      try {
+        if (typeof api.permissions?.request !== "function") return sendResponse({ ok: true, granted: false });
+        const granted = await api.permissions.request({ origins: HOST_ORIGINS });
+        sendResponse({ ok: true, granted: !!granted });
+      } catch (error) {
+        sendResponse({ ok: true, granted: false, error: error?.message || String(error) });
+      }
+    })();
+    return true;
+  }
   if (message?.type === "INSPECT_MEDIA") {
     requestNative("video.inspect", { url: message.url, referer: message.pageUrl || "" }).then((result) => {
       sendResponse(result?.ok
@@ -533,7 +641,13 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "YTDLP_INSPECT") {
     (async () => {
       const pageUrl = message.pageUrl || "";
-      const tabId = sender.tab?.id;
+      let tabId = typeof sender.tab?.id === "number"
+        ? sender.tab.id
+        : (typeof message.tabId === "number" ? message.tabId : undefined);
+      if (typeof tabId !== "number") {
+        const activeTab = await getActiveTab();
+        if (typeof activeTab?.id === "number") tabId = activeTab.id;
+      }
       const cached = ytdlpCache.get(pageUrl);
       if (cached && Date.now() - cached.at < YTDLP_CACHE_TTL_MS) {
         if (typeof tabId === "number") ytdlpByTab.set(tabId, { pageUrl, variants: cached.variants, title: cached.title });
@@ -549,7 +663,7 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // requestNative; only the referer was missing here.)
       const result = await requestNative("ytdlp.inspect", { url: pageUrl, referer: pageUrl }, 65000);
       if (!result?.ok) {
-        sendResponse({ ok: false, error: result?.error || "yt-dlp could not inspect this page.", toolsMissing: result?.toolsMissing || null });
+        sendResponse({ ok: false, error: result?.error || "yt-dlp could not inspect this page.", toolsMissing: normalizeMissingTool(result?.toolsMissing) });
         return;
       }
       const variants = Array.isArray(result.data?.variants) ? result.data.variants : [];
@@ -582,7 +696,7 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       const result = await requestNative("ytdlp.inspect", { url: pageUrl, referer: pageUrl, generic: true }, 65000);
       if (!result?.ok) {
-        sendResponse({ ok: false, error: result?.error || "yt-dlp could not inspect this page.", toolsMissing: result?.toolsMissing || null });
+        sendResponse({ ok: false, error: result?.error || "yt-dlp could not inspect this page.", toolsMissing: normalizeMissingTool(result?.toolsMissing) });
         return;
       }
       const variants = Array.isArray(result.data?.variants) ? result.data.variants : [];
@@ -604,9 +718,12 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // the same session, or a gated video fails after the inspect
     // succeeded. jobId is passed through so the panel can show live
     // progress for this download.
+    const senderTabId = sender.tab?.id;
     requestNative("ytdlp.download", { url: message.pageUrl, formatSelector: message.formatSelector, filename: message.filename, referer: message.pageUrl }).then((result) => {
+      const jobId = result?.ok ? (result.data?.jobId || null) : null;
+      if (jobId && typeof senderTabId === "number") jobTabById.set(jobId, senderTabId);
       sendResponse(result?.ok
-        ? { ok: true, jobId: result.data?.jobId || null, message: result.message || "Download started in ThunderLoad." }
+        ? { ok: true, jobId, message: result.message || "Download started in ThunderLoad." }
         : { ok: false, error: nativeErrorMessage(result?.error || "ThunderLoad could not start this download.") });
     });
     return true;
@@ -618,9 +735,10 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // Progress arrives as NATIVE_EVENTs (ytdlp.tool_progress) forwarded
   // by ensureNativePort, not through this response.
   if (message?.type === "YTDLP_ENSURE_TOOL") {
-    requestNative("ytdlp.ensure_tool", { tool: message.tool }, 600000).then((result) => {
+    const tool = Array.isArray(message.tool) ? (message.tool[0] || "ytdlp") : message.tool;
+    requestNative("ytdlp.ensure_tool", { tool }, 600000).then((result) => {
       sendResponse(result?.ok
-        ? { ok: true, path: result.path || "" }
+        ? { ok: true, path: result.data?.path || result.path || "" }
         : { ok: false, error: result?.error || "The tool could not be downloaded." });
     });
     return true;
@@ -633,7 +751,7 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message?.type === "YTDLP_CHECK_UPDATE") {
     requestNative("ytdlp.check_update", {}).then((result) => {
-      sendResponse(result?.ok ? { ok: true, message: result.message || "" } : { ok: false, error: result?.error || "Could not check for updates." });
+      sendResponse(result?.ok ? { ok: true, message: result.data?.message || result.message || "" } : { ok: false, error: result?.error || "Could not check for updates." });
     });
     return true;
   }
@@ -641,23 +759,38 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // release page so the user can download the tool themselves; the
   // app picks it up from the tools dir.
   if (message?.type === "YTDLP_OPEN_MANUAL_PAGE") {
-    const url = YTDLP_RELEASE_PAGES[message.tool] || YTDLP_RELEASE_PAGES.ytdlp;
+    const tool = Array.isArray(message.tool) ? (message.tool[0] || "ytdlp") : message.tool;
+    const url = YTDLP_RELEASE_PAGES[tool] || YTDLP_RELEASE_PAGES.ytdlp;
     if (typeof api.tabs?.create === "function") api.tabs.create({ url }).catch(() => {});
     sendResponse({ ok: true });
     return false;
   }
   if (message?.type === "QUICK_DOWNLOAD_MEDIA") {
-    quickDownloadMedia(message).then(sendResponse).catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
+    const senderTabId = sender.tab?.id;
+    quickDownloadMedia(message).then((result) => {
+      if (result?.ok && result.jobId && typeof senderTabId === "number") {
+        jobTabById.set(result.jobId, senderTabId);
+      }
+      sendResponse(result);
+    }).catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
     return true;
   }
   if (message?.type === "BROWSER_DOWNLOAD") {
-    browserDownload(message.url, message.filename).then(sendResponse).catch((error) => sendResponse({ ok: false, error: error.message }));
+    let safeFilename = message.filename;
+    if (typeof safeFilename === "string" && safeFilename) {
+      const cleaned = safeFilename.replace(/[\u0000-\u001f\\/:*?"<>|]+/g, "_");
+      const dot = cleaned.lastIndexOf(".");
+      safeFilename = dot > 0
+        ? (cleaned.slice(0, dot).slice(0, 180) || "download") + cleaned.slice(dot)
+        : cleaned.slice(0, 180);
+    }
+    browserDownload(message.url, safeFilename).then(sendResponse).catch((error) => sendResponse({ ok: false, error: error.message }));
     return true;
   }
   return false;
 });
 
-api.tabs.onRemoved.addListener((tabId) => { sourcesByTab.delete(tabId); truncatedByTab.delete(tabId); ytdlpByTab.delete(tabId); removePersistedTabSources(tabId); });
+api.tabs.onRemoved.addListener((tabId) => { sourcesByTab.delete(tabId); truncatedByTab.delete(tabId); ytdlpByTab.delete(tabId); for (const [jobId, tid] of jobTabById) { if (tid === tabId) jobTabById.delete(jobId); } removePersistedTabSources(tabId); });
 
 // IDM-style network backstop: catch media the DOM scan cannot see
 // (fetch/XHR-loaded streams, cross-origin iframes). Observation only —
@@ -1012,7 +1145,7 @@ if (api.webRequest?.onHeadersReceived) {
     if (kind) {
       recordNetworkSource(details.tabId, details.url, kind, {
         referer: takeReferer(details.requestId),
-        initiator: details.initiator || ""
+        initiator: details.initiator || details.originUrl || details.documentUrl || ""
       });
     } else {
       // No media: still drop the Referer entry so the map does not

@@ -1,0 +1,9 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "resources": {
+      "../../native-host/register-native-host.ps1": "native-host/register-native-host.ps1",
+      "../../native-host/unregister-native-host.ps1": "native-host/unregister-native-host.ps1"
+    }
+  }
+}

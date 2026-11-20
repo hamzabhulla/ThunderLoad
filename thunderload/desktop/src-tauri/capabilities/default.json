@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Default ThunderLoad desktop permissions",
   "windows": ["main"],
-  "permissions": ["core:default", "core:event:default", "dialog:allow-save"]
+  "permissions": ["core:default", "core:event:default", "dialog:allow-save", "dialog:allow-confirm", "clipboard-manager:allow-read-text"]
 }

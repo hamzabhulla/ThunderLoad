@@ -10,9 +10,10 @@ use anyhow::{anyhow, Result};
 use std::{collections::HashMap, sync::{Arc, Mutex, OnceLock}};
 use serde_json::{json, Value};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::{mpsc, watch}};
-use thunderload_engine::{check_ytdlp_update, dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_live, download_hls_resumable, download_hls_subtitles, download_page, download_url_resumable, ensure_tool, error_text, hls_output_extension, hls_work_dir, inspect_page_with, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, tool_status, tools_dir, DownloadControl, DownloadOutcome, GlobalRateLimiter, HlsSelection, SessionHeaders, ToolDownloadProgress, ToolsMissing, YtDlpTool, DEFAULT_RESUMABLE_CONNECTIONS};
+use thunderload_engine::{check_ytdlp_update, dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_live, download_hls_resumable, download_hls_subtitles, download_page, download_url_resumable, ensure_tool, error_text, hls_output_extension, hls_work_dir, inspect_page_with, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, set_ffmpeg_override, tool_status, tools_dir, DownloadControl, DownloadOutcome, GlobalRateLimiter, HlsSelection, SessionHeaders, ToolDownloadProgress, ToolsMissing, YtDlpTool, DEFAULT_RESUMABLE_CONNECTIONS};
 
-const MAX_MESSAGE: usize = 64 * 1024 * 1024;
+const MAX_INCOMING_MESSAGE: usize = 64 * 1024 * 1024;
+const MAX_OUTGOING_MESSAGE: usize = 1024 * 1024;
 
 async fn read_message<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> Result<Option<Value>> {
     let mut header = [0_u8; 4];
@@ -22,7 +23,7 @@ async fn read_message<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> Result
         Err(error) => return Err(error.into()),
     }
     let length = u32::from_le_bytes(header) as usize;
-    if length == 0 || length > MAX_MESSAGE { return Err(anyhow!("Invalid native messaging frame size")); }
+    if length == 0 || length > MAX_INCOMING_MESSAGE { return Err(anyhow!("Invalid native messaging frame size")); }
     let mut body = vec![0_u8; length];
     reader.read_exact(&mut body).await?;
     Ok(Some(serde_json::from_slice(&body)?))
@@ -30,7 +31,7 @@ async fn read_message<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> Result
 
 async fn write_message<W: tokio::io::AsyncWrite + Unpin>(writer: &mut W, value: &Value) -> Result<()> {
     let body = serde_json::to_vec(value)?;
-    if body.len() > MAX_MESSAGE { return Err(anyhow!("Outgoing native message is too large")); }
+    if body.len() > MAX_OUTGOING_MESSAGE { return Err(anyhow!("Outgoing native message is too large")); }
     writer.write_all(&(body.len() as u32).to_le_bytes()).await?;
     writer.write_all(&body).await?;
     writer.flush().await?;
@@ -39,6 +40,29 @@ async fn write_message<W: tokio::io::AsyncWrite + Unpin>(writer: &mut W, value: 
 
 fn output_name(value: Option<&Value>, fallback: &str) -> String {
     safe_filename(value.and_then(Value::as_str).unwrap_or(fallback), fallback)
+}
+
+/// Mirrors the extension's `withExtension` (background.js, same
+/// known-extension list): only a KNOWN media/subtitle extension is
+/// replaced. A bare `file_stem()` strips whatever follows the last
+/// dot, so "my.video" became "my.mp4". A name with no extension, or
+/// one ending in something that is not a media extension, keeps its
+/// full name and gains the extension ("my.video.mp4").
+fn with_extension(name: &str, extension: &str) -> String {
+    const KNOWN_FILE_EXTENSIONS: &[&str] = &[
+        "mp4", "mkv", "webm", "mov", "avi", "m4v", "ts", "m2ts", "mp3", "m4a", "aac", "opus", "flac",
+        "wav", "ogg", "oga", "wmv", "flv", "3gp", "m3u8", "mpd", "vtt", "srt", "ass", "ssa",
+    ];
+    let trimmed = name.trim_end_matches('.');
+    if trimmed.is_empty() {
+        return format!(".{extension}");
+    }
+    match trimmed.rfind('.') {
+        Some(dot) if dot > 0 && KNOWN_FILE_EXTENSIONS.contains(&trimmed[dot + 1..].to_lowercase().as_str()) => {
+            format!("{}.{}", &trimmed[..dot], extension)
+        }
+        _ => format!("{trimmed}.{extension}"),
+    }
 }
 
 fn timestamp_ms() -> u64 {
@@ -119,8 +143,42 @@ async fn save_native_job_state(state: &Value) -> Result<()> {
     let id = safe_filename(state.get("id").and_then(Value::as_str).unwrap_or("job"), "job");
     let destination = root.join(format!("{id}.json"));
     let temporary = root.join(format!("{id}.json.tmp"));
-    let bytes = serde_json::to_vec(state)?;
-    tokio::fs::write(&temporary, bytes).await?;
+    let status = state.get("status").and_then(Value::as_str);
+    // MC2: the browser session is the resume credential. Scrub it only
+    // on the two truly-terminal states — Completed (nothing left to
+    // resume) and Cancelled (the checkpoint was deleted). Interrupted
+    // and Failed jobs keep it: the desktop mirrors the state file into
+    // JobStore on every poll (get_native_downloads → native_value_to_record
+    // → upsert, a full replace), so scrubbing here would wipe the stored
+    // handoff there too and a resume would lose its cookies. Paused
+    // keeps it as well (a live Paused recording is terminal but its
+    // session is harmless to keep; the scrub is about resume, not pause).
+    let scrub_session = matches!(status, Some("Completed" | "Cancelled"));
+    let bytes = if scrub_session {
+        let mut scrubbed = state.clone();
+        if let Some(obj) = scrubbed.as_object_mut() {
+            obj.remove("session");
+        }
+        serde_json::to_vec(&scrubbed)?
+    } else {
+        serde_json::to_vec(state)?
+    };
+    #[cfg(unix)]
+    {
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&temporary)
+            .await?;
+        file.write_all(&bytes).await?;
+        file.flush().await?;
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::fs::write(&temporary, &bytes).await?;
+    }
     // Atomic replace: rename over the destination in one step (this
     // replaces the file on Windows and Unix alike). The old code
     // removed the destination first, leaving a microsecond window in
@@ -169,6 +227,61 @@ static NATIVE_CONTROLS: OnceLock<Mutex<HashMap<String, watch::Sender<DownloadCon
 
 fn native_controls() -> &'static Mutex<HashMap<String, watch::Sender<DownloadControl>>> {
     NATIVE_CONTROLS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Set when stdin hits EOF and the host is draining for shutdown, so
+/// a job task that is still resolving its output extension (HLS/DASH
+/// register their control channel inside the task, after an async
+/// lookup) does not register a fresh sender after the drain already
+/// cleared the map — that sender would never be signalled and the
+/// transfer would run on while main is trying to exit.
+static NATIVE_SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Registers a job's control sender unless the host is already
+/// draining for shutdown. Returns false when draining (or when the
+/// registry is poisoned); the caller must then abandon the job
+/// instead of starting a transfer nobody will drain.
+fn register_native_control(job_id: &str, sender: watch::Sender<DownloadControl>) -> bool {
+    if NATIVE_SHUTDOWN.load(std::sync::atomic::Ordering::SeqCst) {
+        return false;
+    }
+    native_controls()
+        .lock()
+        .map(|mut controls| {
+            controls.insert(job_id.to_string(), sender);
+        })
+        .is_ok()
+}
+
+/// Drains all running jobs after stdin EOF (the browser closed, or
+/// the extension disconnected). Without this, `main` returns while
+/// job tasks are still mid-transfer and the Tokio runtime aborts
+/// them: the partial file survives but the state file keeps saying
+/// "Downloading" forever, so the desktop never offers Resume.
+///
+/// The signal is dropping every control sender, not sending
+/// Cancelled: the engine treats a closed control channel as its N1
+/// error mid-transfer ("partial checkpoint kept for Resume"), and a
+/// job waiting in Paused/Failed sees `wait_native_job_control`
+/// return None — both paths write status "Interrupted" and keep the
+/// checkpoint. Sending Cancelled would be wrong here: the job loop
+/// deletes the partial file on Cancelled. The join is bounded at
+/// 30 s: a transfer notices the closed channel at its next chunk
+/// boundary, but a stuck job must not wedge host exit forever.
+async fn drain_native_jobs(handles: Vec<tokio::task::JoinHandle<()>>) {
+    NATIVE_SHUTDOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+    if let Ok(mut controls) = native_controls().lock() {
+        controls.clear();
+    }
+    if handles.is_empty() {
+        return;
+    }
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        for handle in handles {
+            let _ = handle.await;
+        }
+    })
+    .await;
 }
 
 async fn cleanup_native_partial(target: &std::path::Path) {
@@ -270,17 +383,23 @@ fn desktop_config_dir() -> Option<std::path::PathBuf> {
     )
 }
 
-fn load_desktop_settings() -> bool {
+async fn load_desktop_settings() -> bool {
     let mut has_saved_ffmpeg = false;
     if let Some(config_dir) = desktop_config_dir() {
-        if let Ok(value) = std::fs::read_to_string(config_dir.join("ffmpeg.path")) {
+        if let Ok(value) = tokio::fs::read_to_string(config_dir.join("ffmpeg.path")).await {
             let value = value.trim();
             if !value.is_empty() {
-                std::env::set_var("THUNDERLOAD_FFMPEG", value);
+                // The saved path goes through the engine's RwLock
+                // override (P1-27), never the process environment:
+                // the env var stays a startup/read fallback only
+                // (configured_ffmpeg_path reads it when no override
+                // was ever set), so concurrent readers can never see
+                // a half-written value.
+                set_ffmpeg_override(Some(std::path::PathBuf::from(value)));
                 has_saved_ffmpeg = true;
             }
         }
-        if let Ok(value) = std::fs::read_to_string(config_dir.join("speed-limit.bytes")) {
+        if let Ok(value) = tokio::fs::read_to_string(config_dir.join("speed-limit.bytes")).await {
             if let Ok(limit) = value.trim().parse::<u64>() {
                 rate_limiter().set_limit(limit);
             }
@@ -289,23 +408,18 @@ fn load_desktop_settings() -> bool {
     has_saved_ffmpeg
 }
 
-/// Sets THUNDERLOAD_FFMPEG only when the value actually changed, so
-/// the 2 s desktop-settings watcher does not rewrite the process
-/// environment on every tick. (Gemini claim 12: the watcher, the
-/// desktop's set_ffmpeg_path and the engine's var_os reads all touch
-/// the same variable; an unchanged value must not be re-written.)
+/// Applies a new ffmpeg path through the engine's thread-safe
+/// RwLock override (P1-27). The process environment is never written
+/// here: `std::env::set_var`/`remove_var` are not thread-safe, and
+/// the watcher, the desktop's set_ffmpeg_path and the engine's reads
+/// all touched the same variable. A repeated write of the same value
+/// is a cheap idempotent RwLock store, so no change guard is needed.
 fn set_ffmpeg_env(value: Option<&str>) {
-    if ffmpeg_env_needs_update(std::env::var_os("THUNDERLOAD_FFMPEG").as_deref(), value) {
-        match value {
-            Some(value) => std::env::set_var("THUNDERLOAD_FFMPEG", value),
-            None => std::env::remove_var("THUNDERLOAD_FFMPEG"),
-        }
-    }
-}
-
-/// Whether the wanted ffmpeg env value differs from the current one.
-fn ffmpeg_env_needs_update(current: Option<&std::ffi::OsStr>, wanted: Option<&str>) -> bool {
-    current != wanted.map(std::ffi::OsStr::new)
+    set_ffmpeg_override(
+        value
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from),
+    );
 }
 
 fn start_desktop_settings_watcher(mut has_saved_ffmpeg: bool) {
@@ -317,12 +431,12 @@ fn start_desktop_settings_watcher(mut has_saved_ffmpeg: bool) {
             let Some(config_dir) = desktop_config_dir() else {
                 continue;
             };
-            if let Ok(value) = std::fs::read_to_string(config_dir.join("speed-limit.bytes")) {
+            if let Ok(value) = tokio::fs::read_to_string(config_dir.join("speed-limit.bytes")).await {
                 if let Ok(limit) = value.trim().parse::<u64>() {
                     limiter.set_limit(limit);
                 }
             }
-            match std::fs::read_to_string(config_dir.join("ffmpeg.path")) {
+            match tokio::fs::read_to_string(config_dir.join("ffmpeg.path")).await {
                 Ok(value) if !value.trim().is_empty() => {
                     set_ffmpeg_env(Some(value.trim()));
                     has_saved_ffmpeg = true;
@@ -344,9 +458,14 @@ fn start_desktop_settings_watcher(mut has_saved_ffmpeg: bool) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let has_saved_ffmpeg = load_desktop_settings();
+    let has_saved_ffmpeg = load_desktop_settings().await;
     start_desktop_settings_watcher(has_saved_ffmpeg);
     start_native_job_control_watcher();
+    // Every state-writing download job task, so the stdin-EOF drain
+    // below can join them (P1-30). One-shot inspect/subtitle tasks
+    // are not tracked: they write no state file and their reply is
+    // undeliverable once the browser is gone.
+    let mut job_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let (incoming_tx, mut incoming_rx) = mpsc::unbounded_channel::<Value>();
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<Value>();
 
@@ -408,9 +527,8 @@ async fn main() -> Result<()> {
                 };
                 let job_id = uuid::Uuid::new_v4().to_string();
                 let (control_tx, mut control_rx) = watch::channel(DownloadControl::Running);
-                if let Ok(mut controls) = native_controls().lock() {
-                    controls.insert(job_id.clone(), control_tx);
-                } else {
+                let registered = register_native_control(&job_id, control_tx);
+                if !registered {
                     cleanup_native_partial(&target).await;
                     let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": "Native download control registry is unavailable"}));
                     continue;
@@ -424,7 +542,7 @@ async fn main() -> Result<()> {
                 }
                 let _ = save_native_job_state(&state).await;
                 let _ = outgoing_tx.send(json!({"id": id, "ok": true, "data": {"accepted": true, "jobId": job_id}}));
-                tokio::spawn(async move {
+                job_handles.push(tokio::spawn(async move {
                     'job: loop {
                         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
                         let tx_progress = tx.clone();
@@ -559,7 +677,7 @@ async fn main() -> Result<()> {
                     if let Ok(mut controls) = native_controls().lock() {
                         controls.remove(&job_id);
                     }
-                });
+                }));
             }
             "video.download" => {
                 let url = message.get("url").and_then(Value::as_str).unwrap_or("").to_string();
@@ -595,63 +713,61 @@ async fn main() -> Result<()> {
                     let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": "Only HTTP and HTTPS playlist URLs are supported"}));
                     continue;
                 }
-                // Resolve the playlist first so the reserved target gets
-                // the right extension (ts for plain TS playlists, mp4 for
-                // fMP4) — the one-shot download did this, and reserving
-                // from the caller's filename alone would misname a TS
-                // stream as .mp4. Skipped for live: the resolver rejects
-                // live playlists, and a live recording is always .ts.
-                let extension = if live {
-                    "ts".to_string()
-                } else {
-                    match hls_output_extension(&master_url, &selection, session.as_ref()).await {
-                        Ok(extension) => extension,
-                        Err(error) => {
-                            let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": error.to_string()}));
-                            continue;
-                        }
-                    }
-                };
-                let stem = std::path::Path::new(&filename).file_stem().and_then(|value| value.to_str()).unwrap_or("video");
-                let target = match reserve_download_path(&default_download_dir().join(format!("{stem}.{extension}"))).await {
-                    Ok(path) => path,
-                    Err(error) => {
-                        let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": error.to_string()}));
-                        continue;
-                    }
-                };
-                let job_id = uuid::Uuid::new_v4().to_string();
-                let (control_tx, mut control_rx) = watch::channel(DownloadControl::Running);
-                if let Ok(mut controls) = native_controls().lock() {
-                    controls.insert(job_id.clone(), control_tx);
-                } else {
-                    cleanup_native_partial(&target).await;
-                    let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": "Native download control registry is unavailable"}));
-                    continue;
-                }
-
                 let tx = outgoing_tx.clone();
-                // The stored URL is the MASTER playlist, and the selection
-                // rides in the state: a desktop resume of this native job
-                // re-resolves the master with the same variant and audio
-                // instead of falling back to the first variant.
-                let mut state = native_job_state(&job_id, &filename, &master_url, "hls");
-                state["targetPath"] = json!(target.to_string_lossy().to_string());
-                if live {
-                    state["live"] = json!(true);
-                }
-                if let Some(media_url) = &selection.media_url {
-                    state["representationId"] = json!(media_url);
-                }
-                if let Some(audio_group) = &selection.audio_group {
-                    state["audioRepresentationId"] = json!(audio_group);
-                }
-                if let Some(session) = &session {
-                    state["session"] = serde_json::to_value(session).unwrap_or(Value::Null);
-                }
-                let _ = save_native_job_state(&state).await;
-                let _ = outgoing_tx.send(json!({"id": id, "ok": true, "data": {"accepted": true, "jobId": job_id}}));
-                tokio::spawn(async move {
+                job_handles.push(tokio::spawn(async move {
+                    // Resolve the playlist first so the reserved target gets
+                    // the right extension (ts for plain TS playlists, mp4 for
+                    // fMP4) — the one-shot download did this, and reserving
+                    // from the caller's filename alone would misname a TS
+                    // stream as .mp4. Skipped for live: the resolver rejects
+                    // live playlists, and a live recording is always .ts.
+                    let extension = if live {
+                        "ts".to_string()
+                    } else {
+                        match hls_output_extension(&master_url, &selection, session.as_ref()).await {
+                            Ok(extension) => extension,
+                            Err(error) => {
+                                let _ = tx.send(json!({"id": id, "ok": false, "error": error.to_string()}));
+                                return;
+                            }
+                        }
+                    };
+                    let target = match reserve_download_path(&default_download_dir().join(with_extension(&filename, &extension))).await {
+                        Ok(path) => path,
+                        Err(error) => {
+                            let _ = tx.send(json!({"id": id, "ok": false, "error": error.to_string()}));
+                            return;
+                        }
+                    };
+                    let job_id = uuid::Uuid::new_v4().to_string();
+                    let (control_tx, mut control_rx) = watch::channel(DownloadControl::Running);
+                    let registered = register_native_control(&job_id, control_tx);
+                    if !registered {
+                        cleanup_native_partial(&target).await;
+                        let _ = tx.send(json!({"id": id, "ok": false, "error": "Native download control registry is unavailable"}));
+                        return;
+                    }
+
+                    // The stored URL is the MASTER playlist, and the selection
+                    // rides in the state: a desktop resume of this native job
+                    // re-resolves the master with the same variant and audio
+                    // instead of falling back to the first variant.
+                    let mut state = native_job_state(&job_id, &filename, &master_url, "hls");
+                    state["targetPath"] = json!(target.to_string_lossy().to_string());
+                    if live {
+                        state["live"] = json!(true);
+                    }
+                    if let Some(media_url) = &selection.media_url {
+                        state["representationId"] = json!(media_url);
+                    }
+                    if let Some(audio_group) = &selection.audio_group {
+                        state["audioRepresentationId"] = json!(audio_group);
+                    }
+                    if let Some(session) = &session {
+                        state["session"] = serde_json::to_value(session).unwrap_or(Value::Null);
+                    }
+                    let _ = save_native_job_state(&state).await;
+                    let _ = tx.send(json!({"id": id, "ok": true, "data": {"accepted": true, "jobId": job_id}}));
                     'job: loop {
                         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
                         let tx_progress = tx.clone();
@@ -812,7 +928,7 @@ async fn main() -> Result<()> {
                     if let Ok(mut controls) = native_controls().lock() {
                         controls.remove(&job_id);
                     }
-                });
+                }));
             }
             // Slice 6: one-shot subtitle download for an HLS subtitle
             // media playlist (format "m3u8"). Single-file subtitles
@@ -828,8 +944,7 @@ async fn main() -> Result<()> {
                     let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": "Only HTTP and HTTPS subtitle playlist URLs are supported"}));
                     continue;
                 }
-                let stem = std::path::Path::new(&filename).file_stem().and_then(|value| value.to_str()).unwrap_or("subtitles");
-                let target = match reserve_download_path(&default_download_dir().join(format!("{stem}.vtt"))).await {
+                let target = match reserve_download_path(&default_download_dir().join(with_extension(&filename, "vtt"))).await {
                     Ok(path) => path,
                     Err(error) => {
                         let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": error.to_string()}));
@@ -869,42 +984,40 @@ async fn main() -> Result<()> {
                     let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": "Only HTTP and HTTPS DASH manifests are supported"}));
                     continue;
                 }
-                let extension = match dash_output_extension(&url, &representation_id, audio_representation_id.as_deref(), session.as_ref()).await {
-                    Ok(extension) => extension,
-                    Err(error) => {
-                        let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": error.to_string()}));
-                        continue;
-                    }
-                };
-                let stem = std::path::Path::new(&filename).file_stem().and_then(|value| value.to_str()).unwrap_or("video");
-                let target = match reserve_download_path(&default_download_dir().join(format!("{stem}.{extension}"))).await {
-                    Ok(path) => path,
-                    Err(error) => {
-                        let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": error.to_string()}));
-                        continue;
-                    }
-                };
-                let job_id = uuid::Uuid::new_v4().to_string();
-                let (control_tx, mut control_rx) = watch::channel(DownloadControl::Running);
-                if let Ok(mut controls) = native_controls().lock() {
-                    controls.insert(job_id.clone(), control_tx);
-                } else {
-                    cleanup_native_partial(&target).await;
-                    let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": "Native download control registry is unavailable"}));
-                    continue;
-                }
-
                 let tx = outgoing_tx.clone();
-                let mut state = native_job_state(&job_id, &filename, &url, "dash");
-                state["targetPath"] = json!(target.to_string_lossy().to_string());
-                if let Some(session) = &session {
-                    state["session"] = serde_json::to_value(session).unwrap_or(Value::Null);
-                }
-                state["representationId"] = json!(representation_id);
-                state["audioRepresentationId"] = audio_representation_id.clone().map(Value::from).unwrap_or(Value::Null);
-                let _ = save_native_job_state(&state).await;
-                let _ = outgoing_tx.send(json!({"id": id, "ok": true, "data": {"accepted": true, "jobId": job_id}}));
-                tokio::spawn(async move {
+                job_handles.push(tokio::spawn(async move {
+                    let extension = match dash_output_extension(&url, &representation_id, audio_representation_id.as_deref(), session.as_ref()).await {
+                        Ok(extension) => extension,
+                        Err(error) => {
+                            let _ = tx.send(json!({"id": id, "ok": false, "error": error.to_string()}));
+                            return;
+                        }
+                    };
+                    let target = match reserve_download_path(&default_download_dir().join(with_extension(&filename, &extension))).await {
+                        Ok(path) => path,
+                        Err(error) => {
+                            let _ = tx.send(json!({"id": id, "ok": false, "error": error.to_string()}));
+                            return;
+                        }
+                    };
+                    let job_id = uuid::Uuid::new_v4().to_string();
+                    let (control_tx, mut control_rx) = watch::channel(DownloadControl::Running);
+                    let registered = register_native_control(&job_id, control_tx);
+                    if !registered {
+                        cleanup_native_partial(&target).await;
+                        let _ = tx.send(json!({"id": id, "ok": false, "error": "Native download control registry is unavailable"}));
+                        return;
+                    }
+
+                    let mut state = native_job_state(&job_id, &filename, &url, "dash");
+                    state["targetPath"] = json!(target.to_string_lossy().to_string());
+                    if let Some(session) = &session {
+                        state["session"] = serde_json::to_value(session).unwrap_or(Value::Null);
+                    }
+                    state["representationId"] = json!(representation_id);
+                    state["audioRepresentationId"] = audio_representation_id.clone().map(Value::from).unwrap_or(Value::Null);
+                    let _ = save_native_job_state(&state).await;
+                    let _ = tx.send(json!({"id": id, "ok": true, "data": {"accepted": true, "jobId": job_id}}));
                     'job: loop {
                         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
                         let tx_progress = tx.clone();
@@ -1039,7 +1152,7 @@ async fn main() -> Result<()> {
                     if let Ok(mut controls) = native_controls().lock() {
                         controls.remove(&job_id);
                     }
-                });
+                }));
             }
             // Slice 3: yt-dlp routing for YouTube/social pages.
             // The extension sends the PAGE URL (never a sniffed media
@@ -1166,9 +1279,8 @@ async fn main() -> Result<()> {
                 };
                 let job_id = uuid::Uuid::new_v4().to_string();
                 let (control_tx, mut control_rx) = watch::channel(DownloadControl::Running);
-                if let Ok(mut controls) = native_controls().lock() {
-                    controls.insert(job_id.clone(), control_tx);
-                } else {
+                let registered = register_native_control(&job_id, control_tx);
+                if !registered {
                     cleanup_native_partial(&target).await;
                     let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": "Native download control registry is unavailable"}));
                     continue;
@@ -1182,7 +1294,7 @@ async fn main() -> Result<()> {
                 }
                 let _ = save_native_job_state(&state).await;
                 let _ = outgoing_tx.send(json!({"id": id, "ok": true, "data": {"accepted": true, "jobId": job_id}}));
-                tokio::spawn(async move {
+                job_handles.push(tokio::spawn(async move {
                     'job: loop {
                         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
                         let tx_progress = tx.clone();
@@ -1315,13 +1427,18 @@ async fn main() -> Result<()> {
                     if let Ok(mut controls) = native_controls().lock() {
                         controls.remove(&job_id);
                     }
-                });
+                }));
             }
             _ => {
                 let _ = outgoing_tx.send(json!({"id": id, "ok": false, "error": "Unknown action"}));
             }
         }
     }
+    // The message loop ended: stdin hit EOF (or the reader failed),
+    // so the browser is gone. Signal every running job and wait for
+    // each one to write its final ("Interrupted") state file before
+    // main returns and the runtime aborts the spawned tasks (P1-30).
+    drain_native_jobs(job_handles).await;
     Ok(())
 }
 
@@ -1388,49 +1505,27 @@ mod config_dir_tests {
         );
     }
 
-    /// Slice 7c (Gemini claim 12): the watcher must not rewrite the
-    /// environment when the value did not change — repeated ticks with
-    /// an unchanged ffmpeg.path are no-ops.
+    /// P1-27: the process environment is a startup/read fallback
+    /// only — `set_ffmpeg_env` routes through the engine's RwLock
+    /// override and must never write (or remove) THUNDERLOAD_FFMPEG,
+    /// whatever value it is given. The old guard test asserted the
+    /// opposite (env writes on change), so it is gone with the
+    /// `ffmpeg_env_needs_update` helper it tested.
     #[test]
-    fn ffmpeg_env_guard_only_writes_when_changed() {
-        use super::ffmpeg_env_needs_update;
-        use std::ffi::OsStr;
-        assert!(!ffmpeg_env_needs_update(None, None));
-        assert!(ffmpeg_env_needs_update(None, Some("/usr/bin/ffmpeg")));
-        assert!(!ffmpeg_env_needs_update(
-            Some(OsStr::new("/usr/bin/ffmpeg")),
-            Some("/usr/bin/ffmpeg")
-        ));
-        assert!(ffmpeg_env_needs_update(
-            Some(OsStr::new("/usr/bin/ffmpeg")),
-            Some("/bin/ffmpeg")
-        ));
-        assert!(ffmpeg_env_needs_update(
-            Some(OsStr::new("/usr/bin/ffmpeg")),
-            None
-        ));
-    }
-
-    /// Slice 7c (Gemini claim 12): the guard itself, end to end —
-    /// a repeated "write" of the same value leaves the variable
-    /// untouched, a changed value lands, clearing removes it.
-    #[test]
-    fn ffmpeg_env_set_only_applies_changes() {
+    fn ffmpeg_env_set_never_touches_process_env() {
         use super::set_ffmpeg_env;
         let original = std::env::var_os("THUNDERLOAD_FFMPEG");
         std::env::set_var("THUNDERLOAD_FFMPEG", "/usr/bin/ffmpeg");
-        set_ffmpeg_env(Some("/usr/bin/ffmpeg"));
+        set_ffmpeg_env(Some("/bin/ffmpeg"));
         assert_eq!(
             std::env::var_os("THUNDERLOAD_FFMPEG").as_deref(),
             Some(std::ffi::OsStr::new("/usr/bin/ffmpeg"))
         );
-        set_ffmpeg_env(Some("/bin/ffmpeg"));
+        set_ffmpeg_env(None);
         assert_eq!(
             std::env::var_os("THUNDERLOAD_FFMPEG").as_deref(),
-            Some(std::ffi::OsStr::new("/bin/ffmpeg"))
+            Some(std::ffi::OsStr::new("/usr/bin/ffmpeg"))
         );
-        set_ffmpeg_env(None);
-        assert!(std::env::var_os("THUNDERLOAD_FFMPEG").is_none());
         match original {
             Some(value) => std::env::set_var("THUNDERLOAD_FFMPEG", value),
             None => std::env::remove_var("THUNDERLOAD_FFMPEG"),

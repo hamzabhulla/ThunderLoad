@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { save } from "@tauri-apps/plugin-dialog";
+import { confirm, save } from "@tauri-apps/plugin-dialog";
 
 type Page = "downloads" | "queues" | "scheduler" | "settings";
 type StatusTab = "all" | "active" | "completed" | "failed";
@@ -13,7 +13,7 @@ type Variant = { kind: string; quality: string; width?: number; height?: number;
 type GrabItem = { url: string; kind: string; name: string };
 type GrabResult = { items: GrabItem[]; truncated: boolean };
 type Progress = { downloaded: number; total?: number; percent?: number; phase: string; segments_done?: number; segments_total?: number };
-type Item = { id: string; name: string; url: string; kind: Kind; status: Status; percent: number; downloaded: number; total?: number; detail: string; error?: string; createdAt: number; targetPath?: string; scheduledAt?: number; source?: "native"; representationId?: string; audioRepresentationId?: string; segmentsDone?: number; segmentsTotal?: number; live?: boolean };
+type Item = { id: string; name: string; url: string; kind: Kind; status: Status; percent: number; downloaded: number; total?: number; detail: string; error?: string; createdAt: number; targetPath?: string; scheduledAt?: number; source?: "native"; representationId?: string; audioRepresentationId?: string; segmentsDone?: number; segmentsTotal?: number; live?: boolean; connections?: number };
 type StoredJob = { id: string; name: string; url: string; kind: string; origin: string; state: string; downloaded: number; total?: number; percent?: number; segmentsDone?: number; segmentsTotal?: number; targetPath?: string; checkpointPath?: string; representationId?: string; audioRepresentationId?: string; scheduledAtMs?: number; detail: string; error?: string; createdAtMs: number; updatedAtMs: number; live?: boolean };
 
 const HISTORY_KEY = "thunderload.history.v2";
@@ -254,6 +254,11 @@ export default function App() {
   const [filename, setFilename] = useState("");
   const [scheduleAt, setScheduleAt] = useState("");
   const [videoUrl, setVideoUrl] = useState("");
+  // P0-7: the URL the variants were actually inspected from. The
+  // input above stays editable, so the Download button must not read
+  // the live input — a yt-dlp format needs the inspected page URL,
+  // and an edited input would send yt-dlp a wrong URL.
+  const [inspectedUrl, setInspectedUrl] = useState("");
   const [items, setItems] = useState<Item[]>(readItems);
   const [variants, setVariants] = useState<Variant[]>([]);
   const [inspecting, setInspecting] = useState(false);
@@ -267,7 +272,10 @@ export default function App() {
   const [grabChecked, setGrabChecked] = useState<Record<string, boolean>>({});
   const [grabTruncated, setGrabTruncated] = useState(false);
   const [grabbing, setGrabbing] = useState(false);
+  const [addingUrl, setAddingUrl] = useState(false);
+  const [downloadingGrabbed, setDownloadingGrabbed] = useState(false);
   const [grabNotice, setGrabNotice] = useState("");
+  const [grabScheduleAt, setGrabScheduleAt] = useState("");
   const [connections, setConnections] = useState(() => readSetting(CONNECTIONS_KEY, 8, [1, 2, 4, 8]));
   const [parallel, setParallel] = useState(() => readSetting(PARALLEL_KEY, 2, [1, 2, 3, 4]));
   const [speedLimit, setSpeedLimit] = useState(() => readSetting(SPEED_LIMIT_KEY, 0, [0, 262144, 524288, 1048576, 2097152, 5242880, 10485760]));
@@ -288,6 +296,11 @@ export default function App() {
   const [clipboardWatch, setClipboardWatch] = useState(() => localStorage.getItem(CLIPBOARD_WATCH_KEY) === "1");
   const [grabbedLinks, setGrabbedLinks] = useState<string[]>([]);
   const [linkGrabberOpen, setLinkGrabberOpen] = useState(false);
+  // P2: the LinkGrabber Download button in flight (its URL), and the
+  // dialog's own error line — a failed add must say so in the dialog,
+  // not only in the Add form's notice behind it.
+  const [linkGrabberBusy, setLinkGrabberBusy] = useState<string | null>(null);
+  const [linkGrabberNotice, setLinkGrabberNotice] = useState("");
   const seenClipboardUrls = useRef(new Set<string>());
   const [extensionFileSaving, setExtensionFileSaving] = useState(false);
   const [ffmpegPath, setFfmpegPath] = useState("ffmpeg");
@@ -324,6 +337,27 @@ export default function App() {
   // is not actively downloading shows a blank cell. `rate: null` means
   // only one sample exists so far — the rate is still unknown.
   const speedSamples = useRef(new Map<string, SpeedSample>());
+  // C1/C2: ids with a start_* call in flight — set before the await,
+  // cleared when the target path lands (or the start fails). The
+  // dispatcher skips them so a job can never start twice, and cancel()
+  // routes them through cancel_download even though the frontend has
+  // no target path yet.
+  const startingIds = useRef(new Set<string>());
+  // P1-25: ids with a resume() call in flight — a double-click (or a
+  // keyboard P plus a button tap) must not hand the same checkpoint
+  // over twice.
+  const resumingIds = useRef(new Set<string>());
+  // P2: subtitle URLs with a downloadSubtitle() call in flight.
+  const downloadingSubtitles = useRef(new Set<string>());
+  // P2: pending throttled history write (see the HISTORY_KEY effect).
+  const historyWriteTimer = useRef<number | null>(null);
+  // H4: ids with a cancel()/remove() call in flight — the row ×, the
+  // context-menu Remove and keyboard Delete stay disabled until the
+  // call settles, so a second Remove cannot race the first.
+  const [busyIds, setBusyIds] = useState<string[]>([]);
+  // M9: schedule wake-ups tick every 15 s, not every second — the 1 s
+  // clock below exists only for speed/ETA staleness.
+  const [scheduleTick, setScheduleTick] = useState(() => Date.now());
 
   // Live transfer rate for one job: a number when a fresh rate is
   // known, null when the rate is unknown, undefined when the cell does
@@ -362,6 +396,10 @@ export default function App() {
   }
 
   const active = items.filter((item) => item.status === "Downloading" || item.status === "Pausing" || item.status === "Cancelling").length;
+  // H5: native jobs run in the companion and never consume a desktop
+  // slot — only desktop actives count against the parallel limit, or
+  // browser downloads would starve the desktop queue.
+  const activeDesktop = items.filter((item) => item.source !== "native" && (item.status === "Downloading" || item.status === "Pausing" || item.status === "Cancelling")).length;
   const queued = items.filter((item) => item.status === "Queued").length;
   const done = items.filter((item) => item.status === "Completed").length;
   const attention = items.filter((item) => item.status === "Failed" || item.status === "Interrupted").length;
@@ -391,6 +429,9 @@ export default function App() {
   // The Queues page promises "waiting, running, or needing attention":
   // Failed/Interrupted jobs belong here too, with their Retry action.
   const queueItems = useMemo(() => ordered.filter((item) => tabOf(item) === "active" || tabOf(item) === "failed"), [ordered]);
+  // M9: the schedule input's minimum is derived from the 15 s schedule
+  // tick, not the 1 s clock — it must not recompute every second.
+  const scheduleMin = useMemo(() => new Date(scheduleTick - new Date(scheduleTick).getTimezoneOffset() * 60000).toISOString().slice(0, 16), [scheduleTick]);
   const scheduledItems = useMemo(() => ordered.filter((item) => item.scheduledAt !== undefined).sort((a, b) => (a.scheduledAt || 0) - (b.scheduledAt || 0)), [ordered]);
   const aggregateSpeed = items.reduce((sum, item) => {
     const speed = jobSpeed(item);
@@ -404,23 +445,36 @@ export default function App() {
   const aggregateLabel = downloadingCount > 0 && !hasKnownRate ? "–" : aggregateSpeed === 0 ? "0 B/s" : bytes(aggregateSpeed) + "/s";
   const [title, subtitle] = pageInfo(page);
 
-  useEffect(() => { localStorage.setItem(HISTORY_KEY, JSON.stringify(items)); }, [items]);
+  // P2: history writes are throttled (trailing, 500 ms) and guarded —
+  // every progress event re-renders items, and an unthrottled
+  // JSON.stringify + setItem on each one stalls the UI; a full
+  // localStorage (or a denied write) must never throw out of a render
+  // effect. itemsRef always holds the latest list, so the trailing
+  // write never persists a stale snapshot.
+  useEffect(() => {
+    if (historyWriteTimer.current !== null) return;
+    historyWriteTimer.current = window.setTimeout(() => {
+      historyWriteTimer.current = null;
+      try { localStorage.setItem(HISTORY_KEY, JSON.stringify(itemsRef.current)); } catch { /* history is best-effort */ }
+    }, 500);
+  }, [items]);
   useEffect(() => { localStorage.setItem(CONNECTIONS_KEY, String(connections)); }, [connections]);
   useEffect(() => { localStorage.setItem(PARALLEL_KEY, String(parallel)); }, [parallel]);
   useEffect(() => { localStorage.setItem(CLIPBOARD_WATCH_KEY, clipboardWatch ? "1" : "0"); }, [clipboardWatch]);
-  // Slice 6: clipboard watcher. Opt-in, default off, and it reads the
-  // clipboard ONLY while this window is focused — copying a link in
-  // another app never triggers it. A copied media link (or a
-  // YouTube/social page URL) opens the LinkGrabber dialog; nothing
-  // starts on its own, and a URL already queued or already shown is
-  // never offered again. A denied clipboard permission just skips
-  // that tick — no error, no nag.
+  // H1 (P0-14c): the Tauri clipboard-manager plugin, not the webview's
+  // navigator.clipboard — polling the web clipboard every 2 s with
+  // only a focus guard is what the audit flagged. The plugin read is
+  // an explicit, user-opted-in capability
+  // (clipboard-manager:allow-read-text) and returns "" when the
+  // clipboard holds no text. No npm package is needed: this is the
+  // same invoke the plugin's readText() wraps
+  // ("plugin:clipboard-manager|read_text").
   useEffect(() => {
     if (!clipboardWatch) return;
     const timer = window.setInterval(async () => {
       if (!document.hasFocus()) return;
       let text: string;
-      try { text = await navigator.clipboard.readText(); } catch { return; }
+      try { text = await invoke<string>("plugin:clipboard-manager|read_text"); } catch { return; }
       if (!text) return;
       const found = text.match(/https?:\/\/[^\s"'<>]+/gi) || [];
       const fresh: string[] = [];
@@ -442,9 +496,14 @@ export default function App() {
     localStorage.setItem(SPEED_LIMIT_KEY, String(speedLimit));
     void invoke("set_speed_limit", { bytesPerSecond: speedLimit }).catch((error) => setNotice("Could not apply speed limit: " + String(error)));
   }, [speedLimit]);
+  // M9: the 1 s clock drives speed/ETA staleness only. Scheduled
+  // starts use the separate 15 s schedule tick (see the dispatcher),
+  // so the dispatcher and the schedule input's minimum do not re-run
+  // every second.
   useEffect(() => {
     const timer = window.setInterval(() => setClock(Date.now()), 1000);
-    return () => window.clearInterval(timer);
+    const scheduleTimer = window.setInterval(() => setScheduleTick(Date.now()), 15000);
+    return () => { window.clearInterval(timer); window.clearInterval(scheduleTimer); };
   }, []);
   // Direction A shortcuts: Ctrl/Cmd+N opens Add (never while typing);
   // Escape closes the topmost layer (context menu, dialog, inspector);
@@ -461,18 +520,20 @@ export default function App() {
         setAddOpen(true);
       } else if (event.key === "Escape") {
         if (contextMenu) setContextMenu(null);
+        else if (linkGrabberOpen) setLinkGrabberOpen(false);
         else if (grabberOpen) setGrabberOpen(false);
-        else if (addOpen) setAddOpen(false);
+        else if (addOpen) { setAddOpen(false); setScheduleAt(""); setUrl(""); setFilename(""); }
         else setSelectedId(null);
-      } else if (!addOpen && !grabberOpen && !contextMenu && selectedId && !isTypingTarget(event.target) && !event.ctrlKey && !event.metaKey && !event.altKey) {
+      } else if (!addOpen && !grabberOpen && !linkGrabberOpen && !contextMenu && selectedId && !isTypingTarget(event.target) && !event.ctrlKey && !event.metaKey && !event.altKey) {
         const item = items.find((entry) => entry.id === selectedId);
         if (!item) return;
         if (event.key === "Delete" || event.key === "Backspace") {
           event.preventDefault();
           // Same gate as the row × button and context-menu Remove: a
           // live transfer must not be killed (and its partial file
-          // deleted) from the keyboard.
-          if (canRemove(item)) void remove(selectedId);
+          // deleted) from the keyboard. H4: also blocked while a
+          // cancel/remove is already in flight for this row.
+          if (canRemove(item) && !busyIds.includes(selectedId)) void remove(selectedId);
         } else if (event.key.toLowerCase() === "p") {
           if (item.status === "Downloading") void pause(item);
           else if (item.status === "Paused") void resume(item);
@@ -481,7 +542,7 @@ export default function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [addOpen, grabberOpen, selectedId, items, contextMenu]);
+  }, [addOpen, grabberOpen, linkGrabberOpen, selectedId, items, contextMenu, busyIds]);
 
   // Slice 5: seed the queue from the durable job database on startup,
   // then send the merged desktop list back so jobs the store does not
@@ -495,7 +556,18 @@ export default function App() {
     void invoke<Array<StoredJob>>("get_jobs").then((rows) => {
       const stored = rows.filter((row) => row.origin !== "native").map(storedJobToItem);
       const byId = new Map(itemsRef.current.map((item) => [item.id, item]));
-      for (const item of stored) byId.set(item.id, item);
+      for (const item of stored) {
+        // C1: never overwrite a row the dispatcher/engine already
+        // moved into an active or transitional state — the seed
+        // resolves once at startup and can land after the dispatcher
+        // flipped a local row to Downloading, Pausing or Cancelling;
+        // the stored row must not put it back in the queue (which
+        // would start the same job a second time) or resurrect a
+        // cancel in progress, whatever the stored status is.
+        const local = byId.get(item.id);
+        if (local && (local.status === "Downloading" || local.status === "Pausing" || local.status === "Cancelling")) continue;
+        byId.set(item.id, item);
+      }
       // Drop stale schedules from stored rows too (a started/completed
       // job whose row still carries its old start time), or the next
       // startup would put it back on the Scheduler page.
@@ -551,7 +623,9 @@ export default function App() {
           name: job.name || "Browser download",
           url: job.url || "",
           kind: job.kind === "hls" ? "hls" : job.kind === "dash" ? "dash" : job.kind === "ytdlp" ? "ytdlp" : "direct",
-          status: (["Downloading", "Paused", "Completed", "Failed", "Interrupted", "Cancelled"].includes(job.status || "") ? job.status : "Failed") as Status,
+          // H2: Pausing/Cancelling/Queued are real states, not errors —
+          // the old whitelist mapped them to "Failed".
+          status: (["Downloading", "Pausing", "Paused", "Cancelling", "Queued", "Completed", "Failed", "Interrupted", "Cancelled"].includes(job.status || "") ? job.status : "Failed") as Status,
           percent: Math.max(0, Math.min(100, job.percent || 0)),
           downloaded: job.downloaded || 0,
           total: job.total ?? undefined,
@@ -582,8 +656,23 @@ export default function App() {
           if (id.startsWith("native-") && !external.some((item) => item.id === id && item.status === "Downloading")) speedSamples.current.delete(id);
         }
         setItems((current) => {
-          const merged = new Map(current.filter((item) => item.source !== "native").map((item) => [item.id, item]));
-          for (const item of external) merged.set(item.id, item);
+          const merged = new Map(current.map((item) => [item.id, item]));
+          for (const item of external) {
+            const prev = merged.get(item.id);
+            // H2: the poll must not clobber an optimistic Pausing/
+            // Cancelling row — the companion still reports Downloading
+            // until its control loop acts, and the row would flicker
+            // back to Downloading on every poll.
+            if (prev && (prev.status === "Pausing" || prev.status === "Cancelling") && item.status === "Downloading") {
+              merged.set(item.id, { ...item, status: prev.status, detail: prev.detail });
+            } else {
+              merged.set(item.id, item);
+            }
+          }
+          // Native rows that vanished from the poll are gone.
+          for (const item of current) {
+            if (item.source === "native" && !external.some((entry) => entry.id === item.id)) merged.delete(item.id);
+          }
           return Array.from(merged.values()).sort((a, b) => b.createdAt - a.createdAt);
         });
       } catch (error) {
@@ -627,21 +716,36 @@ export default function App() {
             percent: Math.max(0, Math.min(100, payload.progress.percent ?? item.percent)),
             segmentsDone: payload.progress.segments_done ?? item.segmentsDone,
             segmentsTotal: payload.progress.segments_total ?? item.segmentsTotal,
-            detail: item.kind === "hls"
-              ? "Downloading media segments · " + Math.round(payload.progress.percent ?? 0) + "%"
-              : bytes(payload.progress.downloaded) + (payload.progress.total ? " of " + bytes(payload.progress.total) : " downloaded")
+            // M2: a progress event must not overwrite the detail of a
+            // Pausing/Cancelling row or a terminal row (e.g. a late
+            // event arriving after the user paused) — the status is
+            // never overwritten here, and neither is its detail.
+            detail: ["Pausing", "Cancelling", "Paused", "Completed", "Failed", "Interrupted", "Cancelled"].includes(item.status)
+              ? item.detail
+              : item.kind === "hls"
+                ? "Downloading media segments · " + Math.round(payload.progress.percent ?? 0) + "%"
+                : bytes(payload.progress.downloaded) + (payload.progress.total ? " of " + bytes(payload.progress.total) : " downloaded")
           }));
         }),
         listen<{ jobId: string; path: string }>("download-complete", ({ payload }) => {
           // Terminal state: the rate sample is done, and a schedule
           // that fired long ago must not linger on the Scheduler page.
           speedSamples.current.delete(payload.jobId);
+          // C1/C2: the start settled — the id leaves the in-flight and
+          // busy sets so a later cancel routes by status again.
+          startingIds.current.delete(payload.jobId);
+          setBusyIds((current) => current.filter((id) => id !== payload.jobId));
           setItems((current) => current.map((item) => item.id === payload.jobId
-            ? { ...item, status: "Completed", percent: 100, detail: "Saved · " + payload.path, error: undefined, scheduledAt: undefined }
+            ? { ...item, status: "Completed", percent: 100, targetPath: payload.path || item.targetPath, detail: "Saved · " + payload.path, error: undefined, scheduledAt: undefined }
             : item));
           setNotice("Download completed.");
         }),
         listen<{ jobId: string; targetPath: string }>("download-paused", ({ payload }) => {
+          // M1: a paused job's rate sample is done, like complete/
+          // cancelled/error — without this a paused row kept a stale
+          // sample that skewed the status-bar aggregate.
+          speedSamples.current.delete(payload.jobId);
+          startingIds.current.delete(payload.jobId);
           setItems((current) => current.map((item) => item.id === payload.jobId
             // Slice 6 fix round 2 (nit 3): a live recording has no
             // checkpoint, so "partial file saved" is the wrong words
@@ -651,6 +755,8 @@ export default function App() {
         }),
         listen<{ jobId: string }>("download-cancelled", ({ payload }) => {
           speedSamples.current.delete(payload.jobId);
+          startingIds.current.delete(payload.jobId);
+          setBusyIds((current) => current.filter((id) => id !== payload.jobId));
           setItems((current) => current.map((item) => item.id === payload.jobId
             // Slice 6 fix round 2 (nit 2, defense-in-depth): the live
             // finish arms emit this event too, and a live partial file
@@ -666,6 +772,8 @@ export default function App() {
         }),
 listen<{ jobId: string; error: string; targetPath?: string }>("download-error", ({ payload }) => {
           speedSamples.current.delete(payload.jobId);
+          startingIds.current.delete(payload.jobId);
+          setBusyIds((current) => current.filter((id) => id !== payload.jobId));
           setItems((current) => current.map((item) => item.id === payload.jobId
             ? { ...item, status: "Failed", detail: "Transfer interrupted · partial data kept", targetPath: payload.targetPath || item.targetPath, error: payload.error, scheduledAt: undefined }
             : item));
@@ -679,10 +787,19 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
   }, []);
 
   useEffect(() => {
-    const slots = Math.max(0, parallel - active);
-    const next = items.filter((item) => item.source !== "native" && item.status === "Queued" && (!item.scheduledAt || item.scheduledAt <= clock)).slice(0, slots);
+    // H5: slots count desktop actives only (see activeDesktop) — a
+    // browser download must not eat a desktop queue slot.
+    const slots = Math.max(0, parallel - activeDesktop);
+    // C1: skip ids with a start already in flight. The optimistic flip
+    // below is not enough on its own: the effect can re-run before the
+    // flip commits (StrictMode double effects, a schedule re-run), and
+    // the Set — stable across renders — closes that window. M9: due
+    // times are checked against the 15 s schedule tick, not the 1 s
+    // clock, so this effect does not re-run every second.
+    const next = items.filter((item) => item.source !== "native" && item.status === "Queued" && !startingIds.current.has(item.id) && (!item.scheduledAt || item.scheduledAt <= scheduleTick)).slice(0, slots);
     if (!next.length) return;
     const ids = new Set(next.map((item) => item.id));
+    next.forEach((item) => startingIds.current.add(item.id));
     setItems((current) => current.map((item) => ids.has(item.id) ? { ...item, status: "Downloading", detail: "Starting transfer…" } : item));
     next.forEach(async (item) => {
       try {
@@ -724,7 +841,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           const targetPath = item.live
             ? await invoke<string>("start_hls_live_download", { jobId: item.id, url: item.url, representationId: item.representationId || null, audioRepresentationId: item.audioRepresentationId || null, filename: item.name, targetPath: item.targetPath || null, scheduledAt: null })
             : await invoke<string>("start_hls_download", { jobId: item.id, url: item.url, representationId: item.representationId || null, audioRepresentationId: item.audioRepresentationId || null, filename: item.name, targetPath: item.targetPath || null, connections, scheduledAt: null });
-          setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, targetPath } : entry));
+          setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, targetPath, ...(item.live ? {} : { connections }) } : entry));
         } else if (item.kind === "dash") {
           // Pass the paused/failed job's target back so the backend
           // reuses its on-disk checkpoint instead of reserving a fresh
@@ -735,25 +852,38 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
             audioRepresentationId: item.audioRepresentationId || null, filename: item.name,
             targetPath: item.targetPath || null, connections, scheduledAt: null
           });
-          setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, targetPath } : entry));
+          // M7: remember the connections this job started with, so the
+          // inspector shows the job's own value, not the live setting.
+          setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, targetPath, connections } : entry));
         } else {
           const targetPath = await invoke<string>("start_download", {
             jobId: item.id, url: item.url, filename: item.name, targetPath: item.targetPath || null, connections, scheduledAt: null
           });
-          setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, targetPath } : entry));
+          // M7: remember the connections this job started with, so the
+          // inspector shows the job's own value, not the live setting.
+          setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, targetPath, connections } : entry));
         }
       } catch (error) {
+        // P1-19: the backend aborted a start whose Cancel landed
+        // during the extension probe — it already flipped the row to
+        // Cancelled and emitted download-cancelled, so the row must
+        // not flip to Failed here.
+        if (String(error) === "Download cancelled before it started.") return;
         setItems((current) => current.map((entry) => entry.id === item.id
           ? { ...entry, status: "Failed", detail: "Could not start", error: String(error) }
           : entry));
+      } finally {
+        // C1/C2: the start settled (target landed or failed) — the id
+        // leaves the in-flight set so cancel() routes by status again.
+        startingIds.current.delete(item.id);
       }
     });
-  }, [items, active, parallel, connections, clock]);
+  }, [items, parallel, connections, scheduleTick]);
 
   // Returns true when a job was queued, false when nothing was queued
   // (invalid URL, past schedule, yt-dlp page routed to the grabber,
   // webpage verdict) — downloadGrabbed counts on this.
-  async function add(value: string, saveAs?: string, requestedKind?: Kind, representationId?: string, audioRepresentationId?: string, live?: boolean): Promise<boolean> {
+  async function add(value: string, saveAs?: string, requestedKind?: Kind, representationId?: string, audioRepresentationId?: string, live?: boolean, scheduledFor?: string, clearForm = false): Promise<boolean> {
     const clean = value.trim();
     if (!/^https?:\/\//i.test(clean)) { setNotice("Enter a valid HTTP or HTTPS URL."); return false; }
     let kind: Kind = requestedKind || "direct";
@@ -764,11 +894,23 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
         else if (pathname.endsWith(".mpd")) kind = "dash";
       }
     } catch { setNotice("That URL is not valid."); return false; }
-    const scheduledAt = scheduleAt ? new Date(scheduleAt).getTime() : undefined;
+    const scheduledAt = scheduledFor ? new Date(scheduledFor).getTime() : undefined;
     if (scheduledAt !== undefined && (!Number.isFinite(scheduledAt) || scheduledAt <= Date.now())) {
       setNotice("Choose a future start time, or clear the schedule field.");
       return false;
     }
+    let resolvedRepId = representationId;
+    let resolvedAudioRepId = audioRepresentationId;
+    const openInVideoGrabber = (ytdlp: boolean) => {
+      setVideoUrl(clean);
+      setAddOpen(false);
+      setScheduleAt("");
+      setLinkGrabberOpen(false);
+      setGrabbedLinks((current) => current.filter((entry) => entry !== clean && entry.trim() !== clean));
+      setGrabberOpen(true);
+      if (ytdlp) void inspectYtDlp(clean);
+      else void inspect(clean);
+    };
     // Paste path only (no requestedKind): a YouTube/social page routes
     // to the yt-dlp inspect flow — the grabber opens and the formats are
     // listed for the user to pick. Everything else asks the engine to
@@ -783,10 +925,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     // URL queues exactly as before and start_download still validates it.
     if (!requestedKind) {
       if (isYtDlpPageUrl(clean)) {
-        setVideoUrl(clean);
-        setAddOpen(false);
-        setGrabberOpen(true);
-        void inspectYtDlp(clean);
+        openInVideoGrabber(true);
         return false;
       }
       setNotice("Checking link…");
@@ -794,19 +933,39 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
         // The pasted URL as its own referer: hotlink-protected hosts
         // accept a same-origin referer, and the desktop has no better
         // one (Slice 5). The engine validates it before use.
-        await invoke<Variant[]>("inspect_video_url", { url: clean, referer: clean });
+        const inspected = await invoke<Variant[]>("inspect_video_url", { url: clean, referer: clean });
+        if (kind === "dash" && !resolvedRepId) {
+          const best = inspected.find((variant) => variant.downloadable && variant.representationId);
+          if (best?.representationId) {
+            resolvedRepId = best.representationId;
+            if (!resolvedAudioRepId && best.audioRepresentationId) {
+              resolvedAudioRepId = best.audioRepresentationId;
+            }
+          } else {
+            openInVideoGrabber(false);
+            return false;
+          }
+        }
       } catch (error) {
         if (String(error).includes("is a webpage")) {
           setNotice(YOUTUBE_PAGE_MESSAGE);
           return false;
         }
+        if (kind === "dash" && !resolvedRepId) {
+          openInVideoGrabber(false);
+          return false;
+        }
       }
+    }
+    if (kind === "dash" && !resolvedRepId) {
+      openInVideoGrabber(false);
+      return false;
     }
     const suggested = nameFromUrl(clean);
     const item: Item = {
       id: crypto.randomUUID(), name: (saveAs || "").trim() || (kind === "hls" || kind === "dash" ? "video.mp4" : suggested),
       url: clean, kind, status: "Queued", percent: 0, downloaded: 0,
-      representationId, audioRepresentationId,
+      representationId: resolvedRepId, audioRepresentationId: resolvedAudioRepId,
       // Slice 6: only an HLS row can be live — the queue effect
       // routes it to the live recorder; yt-dlp live and DASH live
       // never take this path (yt-dlp handles its own, DASH live is
@@ -816,41 +975,69 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       createdAt: Date.now(),
       scheduledAt
     };
-    // Slice 7b (Gemini claim 2): a functional update — the render
+    // H5: append, not prepend. The table sorts newest-first for
+    // display (`ordered`), but the dispatcher takes queued jobs in
+    // list order — prepending made the newest job jump the queue and
+    // starved older ones. The functional update stays: the render
     // closure's `items` goes stale when several adds land before a
-    // re-render (the grabber's Download selected fires one add per
-    // item without awaiting), so [item, ...items] kept only the last
-    // item while the notice counted every call. Persistence rides on
-    // the items effect, which writes the real list on every change.
-    setItems((current) => [item, ...current]);
+    // re-render, and a stale closure would keep only the last item.
+    setItems((current) => [...current, item]);
     // Slice 5: record the queued job in the durable store immediately,
     // so it survives a restart even if it never gets a download slot
     // before the app closes.
     void invoke("sync_jobs", { jobs: [itemToSyncJob(item)] }).catch(() => {});
     setNotice(scheduledAt ? "Added to queue. Registering scheduled wake…" : "Added to queue.");
-    if (scheduledAt) {
-      void invoke<string>("schedule_app_wake", { jobId: item.id, localDateTime: scheduleAt })
+    if (scheduledAt && scheduledFor) {
+      void invoke<string>("schedule_app_wake", { jobId: item.id, localDateTime: scheduledFor })
         .then((status) => setNotice(status))
         .catch((error) => setNotice("Queued locally, but a scheduled wake task could not be registered: " + String(error)));
     }
-    setUrl(""); setFilename(""); setScheduleAt("");
+    // M6: the Add-dialog inputs are cleared only when this add came
+    // from the dialog's own submit (clearForm). Retry, grabber,
+    // subtitle and LinkGrabber adds must not wipe what the user typed
+    // in the dialog.
+    if (clearForm) { setUrl(""); setFilename(""); setScheduleAt(""); }
     return true;
   }
   async function pause(item: Item) {
+    // P0-8: the row flips to "Pausing" BEFORE the invoke — the old
+    // code set it after the await, and a pause event landing in
+    // between (or a slow backend) left the row wedged. Terminal rows
+    // never flip. If the invoke fails, the row goes back to the status
+    // it had, instead of stranding on "Pausing".
+    const prevStatus = item.status;
+    const prevDetail = item.detail;
+    setItems((current) => current.map((entry) => entry.id === item.id
+      && !["Completed", "Failed", "Interrupted", "Cancelled"].includes(entry.status)
+      // Slice 6 fix round 2 (nit 3): a live recording has no
+      // checkpoint to save — the pause keeps the partial recording.
+      ? { ...entry, status: "Pausing", detail: item.live ? "Pausing · keeping partial recording…" : "Pausing · saving checkpoint…" }
+      : entry));
     try {
       if (item.source === "native") {
         await invoke("control_native_download", { jobId: item.id.replace(/^native-/, ""), action: "pause" });
       } else {
         await invoke("pause_download", { jobId: item.id });
       }
-      setItems((current) => current.map((entry) => entry.id === item.id
-        // Slice 6 fix round 2 (nit 3): a live recording has no
-        // checkpoint to save — the pause keeps the partial recording.
-        ? { ...entry, status: "Pausing", detail: item.live ? "Pausing · keeping partial recording…" : "Pausing · saving checkpoint…" }
+    } catch (error) {
+      setItems((current) => current.map((entry) => entry.id === item.id && entry.status === "Pausing"
+        ? { ...entry, status: prevStatus, detail: prevDetail }
         : entry));
-    } catch (error) { setNotice(String(error)); }
+      setNotice(String(error));
+    }
   }
+  // P1-25: in-flight guard — a double Resume (double-click, keyboard
+  // P plus a button tap) must not hand the same checkpoint over twice.
   async function resume(item: Item) {
+    if (resumingIds.current.has(item.id)) return;
+    resumingIds.current.add(item.id);
+    try {
+      await resumeInner(item);
+    } finally {
+      resumingIds.current.delete(item.id);
+    }
+  }
+  async function resumeInner(item: Item) {
     // Slice 6 fix (MAJOR): Pause is terminal for a live recording —
     // there is no checkpoint to resume from, and re-queuing the same
     // target would re-record over the kept partial. A live job never
@@ -866,12 +1053,26 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
         // The browser companion has exited. Hand its persistent checkpoint
         // to the desktop engine so the user can still continue the download
         // — direct, HLS and DASH checkpoints all live next to the target.
-        await invoke("dismiss_native_download", { jobId: item.id.replace(/^native-/, "") }).catch(() => {});
+        // Keep the companion's bare job ID (matching the JOB_STORE record
+        // left intact by dismiss_native_download) so the desktop engine
+        // reuses the stored browser session cookies on resume.
+        const bareId = item.id.replace(/^native-/, "");
+        // P1-25: a failed handover must surface — the old
+        // `.catch(() => {})` queued a recovery row for a checkpoint
+        // the desktop never received, and the row then failed again
+        // on start with no explanation.
+        try {
+          await invoke("handover_native_download", { jobId: bareId });
+        } catch (error) {
+          setNotice("Could not move the browser checkpoint to the desktop: " + String(error));
+          return;
+        }
         const recovered: Item = {
-          ...item, id: crypto.randomUUID(), source: undefined, status: "Queued",
+          ...item, id: bareId, source: undefined, status: "Queued",
           detail: "Recovering browser checkpoint in desktop engine", error: undefined
         };
-        setItems((current) => [recovered, ...current.filter((entry) => entry.id !== item.id)]);
+        setItems((current) => [recovered, ...current.filter((entry) => entry.id !== item.id && entry.id !== bareId)]);
+        void invoke("sync_jobs", { jobs: [itemToSyncJob(recovered)] }).catch(() => {});
         setNotice("Browser checkpoint moved to the desktop queue.");
         return;
       }
@@ -904,6 +1105,12 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, scheduledAt: undefined } : entry));
     }
     if (item.source === "native") {
+      // P0-8: the row flips to "Cancelling" BEFORE the invoke — the
+      // old code set it after the await, overwriting the "Cancelled"
+      // the backend event had already delivered. If the invoke fails,
+      // the row goes back to the status it had.
+      const prevStatus = item.status;
+      const prevDetail = item.detail;
       try {
         if (item.status === "Interrupted") {
           // No native process owns this job anymore: delete its orphaned
@@ -925,35 +1132,79 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           // Direct, HLS and DASH browser jobs alike: the companion owns
           // the checkpoint, so cancel goes through its control channel
           // and the companion deletes its own partial files.
-          await invoke("control_native_download", { jobId: item.id.replace(/^native-/, ""), action: "cancel" });
           setItems((current) => current.map((entry) => entry.id === item.id
+            && !["Completed", "Failed", "Interrupted", "Cancelled"].includes(entry.status)
             ? { ...entry, status: "Cancelling", detail: "Cancelling browser download…" }
             : entry));
+          await invoke("control_native_download", { jobId: item.id.replace(/^native-/, ""), action: "cancel" });
         }
-      } catch (error) { setNotice(String(error)); }
+      } catch (error) {
+        setItems((current) => current.map((entry) => entry.id === item.id && entry.status === "Cancelling"
+          ? { ...entry, status: prevStatus, detail: prevDetail }
+          : entry));
+        setNotice(String(error));
+      }
       return;
     }
-    if (!item.targetPath) {
-      // Queued jobs never started and have nothing on disk: local flip only.
-      setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, status: "Cancelled", detail: "Cancelled" } : entry));
-      // Slice 5: the durable row must flip too, or the job would come
-      // back as Queued on the next startup.
-      void invoke("cancel_queued_job", { jobId: item.id }).catch(() => {});
-      return;
-    }
+    // C2: route by state, not by targetPath. A job that started — or
+    // is starting, its target not yet landed in the frontend — cancels
+    // through the backend, which owns the live task and the checkpoint.
+    // Only a job that never started cancels locally. H4: the row is
+    // marked busy until the call settles so ×/Delete cannot race it.
+    // P0-8: the row flips to "Cancelling" BEFORE the invoke below —
+    // setting it after the await overwrote the "Cancelled" the backend
+    // event had already delivered, wedging the row on "Cancelling".
+    // If the invoke fails, the row goes back to the status it had.
+    const prevStatus = item.status;
+    const prevDetail = item.detail;
+    setBusyIds((current) => current.includes(item.id) ? current : [...current, item.id]);
     try {
-      await invoke("cancel_download", { jobId: item.id, targetPath: item.targetPath });
+      if (!startingIds.current.has(item.id) && !item.targetPath && item.status === "Queued") {
+        // Never started: the durable row must flip too, or the job
+        // would come back as Queued on the next startup. Awaited, not
+        // fire-and-forget — cancel_queued_job REFUSES once start_job
+        // has run, and the row must not flip locally when it does.
+        await invoke("cancel_queued_job", { jobId: item.id });
+        setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, status: "Cancelled", detail: "Cancelled" } : entry));
+        return;
+      }
       setItems((current) => current.map((entry) => entry.id === item.id
+        && !["Completed", "Failed", "Interrupted", "Cancelled"].includes(entry.status)
         // Slice 6 fix (MAJOR): Cancel is never offered for live jobs,
         // so this is only reachable if a caller bypasses the button
         // gates — the backend keeps a live target either way, so the
         // detail must not claim the partial was deleted.
         ? { ...entry, status: "Cancelling", detail: item.live ? "Cancelling…" : "Cancelling and deleting partial file…" }
         : entry));
-    } catch (error) { setNotice(String(error)); }
+      await invoke("cancel_download", { jobId: item.id, targetPath: item.targetPath || "" });
+    } catch (error) {
+      setItems((current) => current.map((entry) => entry.id === item.id && entry.status === "Cancelling"
+        ? { ...entry, status: prevStatus, detail: prevDetail }
+        : entry));
+      setNotice(String(error));
+    }
+    finally { setBusyIds((current) => current.filter((id) => id !== item.id)); }
   }
   async function remove(id: string) {
     const item = items.find((entry) => entry.id === id);
+    if (!item) return;
+    // H3: removing a row with a saved checkpoint deletes the partial
+    // file (via cancel_download below) — destructive and irreversible,
+    // so Paused/Failed/Interrupted/Queued rows with a target ask
+    // first. Completed rows have no checkpoint to lose, and a live
+    // recording's file is never deleted, so neither asks.
+    if (item.targetPath && !item.live && ["Paused", "Failed", "Interrupted", "Queued"].includes(item.status)) {
+      let ok: boolean;
+      try {
+        ok = await confirm("Remove \"" + item.name + "\"?\n\nThis deletes the saved partial file — the download cannot be resumed afterwards.");
+      } catch {
+        ok = window.confirm("Remove \"" + item.name + "\"? This deletes the saved partial file and the download cannot be resumed.");
+      }
+      if (!ok) return;
+    }
+    // H4: mark the row busy until remove settles, so a second × /
+    // Delete / context-menu Remove cannot race this one.
+    setBusyIds((current) => current.includes(id) ? current : [...current, id]);
     if (item?.scheduledAt) {
       await invoke("cancel_app_wake", { jobId: item.id }).catch(() => {});
     }
@@ -966,6 +1217,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     if (item?.source === "native" && !item.live
         && ["Downloading", "Pausing", "Paused", "Failed"].includes(item.status)) {
       await cancel(item);
+      setBusyIds((current) => current.filter((entry) => entry !== id));
       return;
     }
     if (item?.source === "native") {
@@ -994,7 +1246,11 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     // The job is gone: its rate sample must not linger and skew the
     // status-bar aggregate.
     speedSamples.current.delete(id);
-    setItems((current) => current.filter((entry) => entry.id !== id || entry.status === "Downloading" || entry.status === "Pausing"));
+    // H4: the filter keeps a Cancelling row, not just Downloading/
+    // Pausing — removing the row while the backend is still cancelling
+    // would leave the cancel event with no row to land on.
+    setItems((current) => current.filter((entry) => entry.id !== id || entry.status === "Downloading" || entry.status === "Pausing" || entry.status === "Cancelling"));
+    setBusyIds((current) => current.filter((entry) => entry !== id));
   }
   function retry(item: Item) {
     // Slice 6 fix (MAJOR): a live recording has no checkpoint — a
@@ -1030,7 +1286,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
   // A missing tool is data, not an error — the notice names the tool and
   // points at Settings, where the direct download button lives.
   async function inspectYtDlp(pageUrl: string) {
-    setInspecting(true); setVariants([]); setVideoTitle("");
+    setInspecting(true); setVariants([]); setVideoTitle(""); setInspectedUrl("");
     setVideoNotice("Getting formats…");
     try {
       const result = await invoke<{ title?: string; variants: Variant[]; toolsMissing?: string }>("inspect_ytdlp_url", { url: pageUrl });
@@ -1040,6 +1296,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       }
       setVariants(result.variants);
       setVideoTitle(result.title || "");
+      setInspectedUrl(pageUrl);
       setVideoNotice(result.variants.length ? result.variants.length + " format option(s) found." : "No downloadable formats found.");
     } catch (error) { setVideoNotice(String(error)); }
     finally { setInspecting(false); }
@@ -1076,14 +1333,15 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     } catch (error) { setYtdlpUpdateStatus(String(error)); }
     finally { setYtdlpCheckingUpdate(false); }
   }
-  async function inspect() {
-    const clean = videoUrl.trim();
+  async function inspect(overrideUrl?: string) {
+    const clean = (overrideUrl ?? videoUrl).trim();
     if (!/^https?:\/\//i.test(clean)) { setVideoNotice("Paste a valid HTTP or HTTPS media URL."); return; }
     if (isYtDlpPageUrl(clean)) { await inspectYtDlp(clean); return; }
-    setInspecting(true); setVariants([]); setVideoNotice("Inspecting media URL…");
+    setInspecting(true); setVariants([]); setInspectedUrl(""); setVideoNotice("Inspecting media URL…");
     try {
       const result = await invoke<Variant[]>("inspect_video_url", { url: clean, referer: clean });
       setVariants(result);
+      setInspectedUrl(clean);
       setVideoNotice(result.length ? result.length + " stream option(s) found." : "No downloadable streams found.");
     } catch (error) { setVideoNotice(String(error)); }
     finally { setInspecting(false); }
@@ -1118,21 +1376,38 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
   // backend; a direct subtitle file (vtt/ttml/srt) is just a direct
   // download and queues like any other file.
   async function downloadSubtitle(subtitle: SubtitleVariant) {
+    // P2: in-flight guard — a double-click must not save the same
+    // track twice.
+    if (downloadingSubtitles.current.has(subtitle.url)) return;
+    downloadingSubtitles.current.add(subtitle.url);
+    try {
     if (subtitle.format === "m3u8") {
       try {
         const path = await invoke<string>("download_subtitles", { playlistUrl: subtitle.url, filename: (subtitle.name || subtitle.language || "subtitles") + ".vtt" });
         setVideoNotice("Saved · " + path);
       } catch (error) { setVideoNotice(String(error)); }
     } else {
-      void add(subtitle.url);
+      // M5: a direct subtitle file queues as a direct download with an
+      // explicit kind and a filename from the track name/language, so
+      // the saved file is named after the track instead of the URL.
+      const base = subtitle.name || subtitle.language || "subtitles";
+      const ext = subtitle.url.match(/\.(vtt|srt|ttml|ass|ssa)(\?|#|$)/i)?.[1]?.toLowerCase() || "vtt";
+      const filename = base.toLowerCase().endsWith("." + ext) ? base : base + "." + ext;
+      await add(subtitle.url, filename, "direct");
+    }
+    } finally {
+      downloadingSubtitles.current.delete(subtitle.url);
     }
   }
   async function downloadGrabbed() {
+    if (downloadingGrabbed) return;
     const chosen = grabbed.filter((item) => grabChecked[item.url]);
     if (!chosen.length) return;
+    setDownloadingGrabbed(true);
     setGrabNotice("Queueing " + chosen.length + " item(s)…");
     let queued = 0;
     let failed = 0;
+    try {
     // Sequential on purpose: each item goes through the same path a
     // one-off add would take — DASH inspects first and takes the best
     // quality, HLS and direct files queue directly — so every item
@@ -1150,7 +1425,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           // Slice 7b (Gemini claim 2): await the add and count what
           // actually queued — the old fire-and-forget call counted
           // every item while only the last survived the stale closure.
-          if (await add(item.url, item.name, "dash", best.representationId, best.audioRepresentationId)) queued += 1; else failed += 1;
+          if (await add(item.url, item.name, "dash", best.representationId, best.audioRepresentationId, undefined, grabScheduleAt || undefined)) queued += 1; else failed += 1;
         } else if (item.kind === "hls") {
           // Inspect first, like DASH: a live playlist must queue
           // through the live recorder, not the VOD path (which
@@ -1162,14 +1437,21 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
             const variants = result.filter((variant) => variant.downloadable && variant.url);
             variants.sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bandwidth || 0) - (a.bandwidth || 0));
             const best = variants[0];
-            if (best?.isLive) ok = await add(item.url, item.name, "hls", best.url, best.audioRepresentationId, true);
-            else ok = await add(item.url, item.name, "hls");
-          } catch { ok = await add(item.url, item.name, "hls"); }
+            // M4: VOD passes the chosen variant's media URL + audio
+            // rendition like the live branch does — without them the
+            // download falls back to the first variant.
+            if (best?.isLive) ok = await add(item.url, item.name, "hls", best.url, best.audioRepresentationId, true, grabScheduleAt || undefined);
+            else if (best) ok = await add(item.url, item.name, "hls", best.url, best.audioRepresentationId, undefined, grabScheduleAt || undefined);
+            else ok = await add(item.url, item.name, "hls", undefined, undefined, undefined, grabScheduleAt || undefined);
+          } catch { ok = await add(item.url, item.name, "hls", undefined, undefined, undefined, grabScheduleAt || undefined); }
           if (ok) queued += 1; else failed += 1;
         } else {
-          if (await add(item.url, item.name, "direct")) queued += 1; else failed += 1;
+          if (await add(item.url, item.name, "direct", undefined, undefined, undefined, grabScheduleAt || undefined)) queued += 1; else failed += 1;
         }
       } catch { failed += 1; }
+    }
+    } finally {
+      setDownloadingGrabbed(false);
     }
     setGrabNotice(failed
       ? "Queued " + queued + " of " + chosen.length + " grabbed items (" + failed + " could not be started)."
@@ -1246,7 +1528,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       {item.status === "Paused" && !item.live && <button className="quiet-button transfer-control" onClick={(event) => { event.stopPropagation(); void resume(item); }}>Resume</button>}
       {(item.status === "Failed" || item.status === "Interrupted") && <button className="quiet-button transfer-control" onClick={(event) => { event.stopPropagation(); void retry(item); }}>{item.targetPath && !item.live ? "Resume" : "Retry"}</button>}
       {canCancel(item) && <button className="quiet-button transfer-control" onClick={(event) => { event.stopPropagation(); void cancel(item); }}>Cancel</button>}
-      {canRemove(item) && <button className="remove-button" title="Remove" aria-label="Remove" onClick={(event) => { event.stopPropagation(); void remove(item.id); }}>×</button>}
+      {canRemove(item) && <button className="remove-button" title="Remove" aria-label="Remove" disabled={busyIds.includes(item.id)} onClick={(event) => { event.stopPropagation(); void remove(item.id); }}>×</button>}
     </>;
   }
   // Direction A table: six data columns by default (Name · Progress ·
@@ -1269,7 +1551,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           <td className="col-num">{item.total ? bytes(item.total) : "–"}</td>
           <td className={"col-num" + (speed === "–" ? " muted" : "")}>{speed}</td>
           <td className={"col-num" + (eta === "–" ? " muted" : "")}>{eta}</td>
-          {showKindColumn && <td className="col-kind">{item.kind === "hls" ? "HLS" : item.kind === "dash" ? "DASH" : "Direct"}</td>}
+          {showKindColumn && <td className="col-kind">{item.kind === "hls" ? "HLS" : item.kind === "dash" ? "DASH" : item.kind === "ytdlp" ? "yt-dlp" : "Direct"}</td>}
           <td className="col-status"><Status value={item.status} /><span className="row-actions">{actionButtons(item)}</span></td>
         </tr>;
       })}</tbody>
@@ -1287,7 +1569,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
         {item.status === "Paused" && !item.live && <button role="menuitem" onClick={() => { setContextMenu(null); void resume(item); }}>Resume</button>}
         {(item.status === "Failed" || item.status === "Interrupted") && <button role="menuitem" onClick={() => { setContextMenu(null); void retry(item); }}>{item.targetPath && !item.live ? "Resume" : "Retry"}</button>}
         {canCancel(item) && <button role="menuitem" onClick={() => { setContextMenu(null); void cancel(item); }}>Cancel</button>}
-        {canRemove(item) && <><hr /><button role="menuitem" onClick={() => { setContextMenu(null); void remove(item.id); }}>Remove</button></>}
+        {canRemove(item) && <><hr /><button role="menuitem" disabled={busyIds.includes(item.id)} onClick={() => { setContextMenu(null); void remove(item.id); }}>Remove</button></>}
       </div>
     </div>;
   }
@@ -1315,27 +1597,27 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           <div><dt>Saved to</dt><dd className="kv-wrap" title={item.targetPath || ""}>{item.targetPath || "Not started yet"}</dd></div>
           <div><dt>Created</dt><dd>{new Date(item.createdAt).toLocaleString()}</dd></div>
           {item.scheduledAt && <div><dt>Scheduled for</dt><dd>{new Date(item.scheduledAt).toLocaleString()}</dd></div>}
-          <div><dt>Resume capability</dt><dd>{item.live ? "No — live recording, Pause is terminal" : item.targetPath ? "Yes — checkpoint saved" : "No"}</dd></div>
+          <div><dt>Resume capability</dt><dd>{item.live ? "No — live recording, Pause is terminal" : item.targetPath && ["Paused", "Failed", "Interrupted", "Queued"].includes(item.status) ? "Yes — checkpoint saved" : item.targetPath ? "Partial data on disk — a checkpoint is saved when the transfer pauses" : "No"}</dd></div>
           {item.error && <div><dt>Error</dt><dd className="error-text">{item.error}</dd></div>}
         </dl>
         <p className="inspector-detail">{item.detail}</p>
         <div className="inspector-actions">{actionButtons(item)}</div>
       </div>}
       {inspectorTab === "files" && <div className="inspector-body">
-        <div className="file-row"><span className="file-type">{item.kind === "hls" ? "▶" : "↓"}</span><div><strong title={item.name}>{item.name}</strong><small>{item.total ? bytes(item.total) : bytes(item.downloaded) + " downloaded so far"}</small></div></div>
+        <div className="file-row"><span className="file-type">{item.kind === "hls" ? "▶" : item.kind === "dash" ? "◫" : item.kind === "ytdlp" ? "▷" : "↓"}</span><div><strong title={item.name}>{item.name}</strong><small>{item.total ? bytes(item.total) : bytes(item.downloaded) + " downloaded so far"}</small></div></div>
         <dl className="kv">
           <div><dt>Location</dt><dd className="kv-wrap" title={item.targetPath || ""}>{item.targetPath || "Not started yet"}</dd></div>
-          <div><dt>Transfer kind</dt><dd>{item.kind === "hls" ? "HLS playlist" : item.kind === "dash" ? "DASH manifest" : "Direct file"}</dd></div>
+          <div><dt>Transfer kind</dt><dd>{item.kind === "hls" ? "HLS playlist" : item.kind === "dash" ? "DASH manifest" : item.kind === "ytdlp" ? "yt-dlp" : "Direct file"}</dd></div>
         </dl>
         <p className="footnote">Partial data is kept next to the target while a transfer is incomplete. Pause saves a checkpoint; Resume continues from it.</p>
       </div>}
       {inspectorTab === "segments" && <div className="inspector-body">
         <dl className="kv">
-          <div><dt>Connections</dt><dd>{connections} per file</dd></div>
+          <div><dt>Connections</dt><dd>{item.connections !== undefined ? item.connections + " per file" : connections + " per file (current setting — this job started before its connections were recorded)"}</dd></div>
           <div><dt>Segments</dt><dd>{item.segmentsDone !== undefined && item.segmentsTotal !== undefined ? item.segmentsDone + " of " + item.segmentsTotal + " done" : "This transfer does not report per-segment progress."}</dd></div>
           <div><dt>Downloaded</dt><dd>{bytes(item.downloaded)}{item.total ? " of " + bytes(item.total) : ""}</dd></div>
         </dl>
-        <p className="footnote">Connections come from Settings → Connections per file. Segment counts show while a segmented transfer runs; a transfer that does not report segments says so above.</p>
+        <p className="footnote">Connections are the ones this job started with. New jobs use Settings → Connections per file. Segment counts show while a segmented transfer runs; a transfer that does not report segments says so above.</p>
       </div>}
       {inspectorTab === "activity" && <div className="inspector-body">
         <ul className="activity-list">
@@ -1352,18 +1634,19 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
   // primary "+ Add" button (Motrix "+" pattern). Behaviour unchanged.
   function addDialog() {
     if (!addOpen) return null;
-    return <div className="dialog-overlay" role="dialog" aria-label="Add a download" onClick={() => setAddOpen(false)}>
+    const closeAdd = () => { setAddOpen(false); setScheduleAt(""); };
+    return <div className="dialog-overlay" role="dialog" aria-label="Add a download" onClick={closeAdd}>
       <div className="dialog" onClick={(event) => event.stopPropagation()}>
-        <div className="dialog-head"><div><h2>Add a download</h2><p>Direct file links and supported HLS playlists.</p></div><button className="remove-button" title="Close" aria-label="Close" onClick={() => setAddOpen(false)}>×</button></div>
-        <form onSubmit={(event) => { event.preventDefault(); add(url, filename); }}>
+        <div className="dialog-head"><div><h2>Add a download</h2><p>Direct file links and supported HLS playlists.</p></div><button className="remove-button" title="Close" aria-label="Close" onClick={closeAdd}>×</button></div>
+        <form onSubmit={(event) => { event.preventDefault(); if (addingUrl) return; setAddingUrl(true); void add(url, filename, undefined, undefined, undefined, undefined, scheduleAt || undefined, true).finally(() => setAddingUrl(false)); }}>
           <label htmlFor="download-url">Download URL</label>
           <input id="download-url" className="field" value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://example.com/archive.zip" autoFocus />
-          <div className="add-actions"><div className="filename-field"><label htmlFor="download-name">Save as <small>OPTIONAL</small></label><input id="download-name" className="field" value={filename} onChange={(event) => setFilename(event.target.value)} placeholder="Use original filename" /></div><button type="submit" className="primary-button">Add to queue ↗</button></div>
-          <div className="schedule-row"><label htmlFor="schedule-at">Start later <small>OPTIONAL</small></label><input id="schedule-at" type="datetime-local" className="field schedule-field" min={new Date(clock - new Date(clock).getTimezoneOffset() * 60000).toISOString().slice(0, 16)} value={scheduleAt} onChange={(event) => setScheduleAt(event.target.value)} /></div>
+          <div className="add-actions"><div className="filename-field"><label htmlFor="download-name">Save as <small>OPTIONAL</small></label><input id="download-name" className="field" value={filename} onChange={(event) => setFilename(event.target.value)} placeholder="Use original filename" /></div><button type="submit" className="primary-button" disabled={addingUrl}>{addingUrl ? "Adding…" : "Add to queue ↗"}</button></div>
+          <div className="schedule-row"><label htmlFor="schedule-at">Start later <small>OPTIONAL</small></label><input id="schedule-at" type="datetime-local" className="field schedule-field" min={scheduleMin} value={scheduleAt} onChange={(event) => setScheduleAt(event.target.value)} /></div>
         </form>
         <div className="notice">{notice}</div>
-        {url.trim() && <button className="text-link" onClick={() => { setVideoUrl(url.trim()); setAddOpen(false); setGrabberOpen(true); }}>Inspect media qualities instead →</button>}
-        <div className="dialog-foot"><span className="connection-tag">{connections} CONNECTIONS</span><button className="quiet-button" onClick={() => setAddOpen(false)}>Done</button></div>
+        {url.trim() && <button className="text-link" onClick={() => { const clean = url.trim(); setVariants([]); setVideoNotice(""); setInspectedUrl(""); setVideoUrl(clean); closeAdd(); setGrabberOpen(true); void inspect(clean); }}>Inspect media qualities instead →</button>}
+        <div className="dialog-foot"><span className="connection-tag">{connections} CONNECTIONS</span><button className="quiet-button" onClick={closeAdd}>Done</button></div>
       </div>
     </div>;
   }
@@ -1382,12 +1665,28 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           : <div className="variants">
             {grabbedLinks.map((url) => <div className="variant" key={url}>
               <div><strong title={url}>{url.length > 64 ? url.slice(0, 64) + "…" : url}</strong></div>
-              <button className="secondary-button" onClick={() => {
-                void add(url);
-                setGrabbedLinks((current) => current.filter((entry) => entry !== url));
-              }}>Download</button>
+              <button className="secondary-button" disabled={linkGrabberBusy === url} onClick={async () => {
+                // P2: double-click guard — one add per link at a time —
+                // and a failed add says so here in the dialog.
+                if (linkGrabberBusy !== null) return;
+                setLinkGrabberBusy(url);
+                setLinkGrabberNotice("");
+                try {
+                  const queued = await add(url);
+                  if (queued) {
+                    setGrabbedLinks((current) => current.filter((entry) => entry !== url));
+                  } else {
+                    setLinkGrabberNotice("That link could not be queued.");
+                  }
+                } catch (error) {
+                  setLinkGrabberNotice(String(error));
+                } finally {
+                  setLinkGrabberBusy(null);
+                }
+              }}>{linkGrabberBusy === url ? "Queueing…" : "Download"}</button>
             </div>)}
           </div>}
+        {linkGrabberNotice && <div className="notice">{linkGrabberNotice}</div>}
         <div className="dialog-foot"><span className="connection-tag">{grabbedLinks.length} LINK{grabbedLinks.length === 1 ? "" : "S"}</span><button className="quiet-button" onClick={() => setLinkGrabberOpen(false)}>Done</button></div>
       </div>
     </div>;
@@ -1398,9 +1697,13 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
   // Video page, unchanged.
   function grabberDialog() {
     if (!grabberOpen) return null;
-    return <div className="dialog-overlay" role="dialog" aria-label="Video grabber" onClick={() => setGrabberOpen(false)}>
+    const closeGrabber = () => { setGrabberOpen(false); setGrabScheduleAt(""); };
+    // P2: subtitles come from ALL inspected variants, deduplicated by
+    // URL — the old code only showed variants[0]'s tracks.
+    const allSubtitles = Array.from(new Map(variants.flatMap((variant) => variant.subtitles ?? []).map((subtitle) => [subtitle.url, subtitle])).values());
+    return <div className="dialog-overlay" role="dialog" aria-label="Video grabber" onClick={closeGrabber}>
       <div className="dialog dialog-wide" onClick={(event) => event.stopPropagation()}>
-        <div className="dialog-head"><div><h2>Video grabber</h2><p>Inspect one media URL, or grab every media file from one page.</p></div><button className="remove-button" title="Close" aria-label="Close" onClick={() => setGrabberOpen(false)}>×</button></div>
+        <div className="dialog-head"><div><h2>Video grabber</h2><p>Inspect one media URL, or grab every media file from one page.</p></div><button className="remove-button" title="Close" aria-label="Close" onClick={closeGrabber}>×</button></div>
         <div className="video-panel">
           <div className="panel-heading"><div><h2>Inspect a media URL</h2><p>Quality choices appear only when the source exposes them.</p></div></div>
           <form onSubmit={(event) => { event.preventDefault(); void inspect(); }}>
@@ -1412,10 +1715,10 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           {variants.length > 0 && <div className="variants"><div className="variants-heading"><h3>Available streams</h3><span>{variants.length} OPTIONS</span></div>
             {variants.map((variant, index) => <div className="variant" key={variant.url + index}>
               <div><strong>{variant.isLive ? "Live · " : ""}{variant.quality}</strong><small>{variant.kind.toUpperCase()}{variant.width && variant.height ? " · " + variant.width + " × " + variant.height : ""}{variant.bandwidth ? " · " + Math.round(variant.bandwidth / 1000) + " kbps" : ""}{variant.fps ? " · " + Math.round(variant.fps) + " fps" : ""}</small>{variant.note && <p>{variant.note}</p>}</div>
-              <button className="secondary-button" disabled={!variant.downloadable} onClick={() => add(variant.kind === "dash" || variant.kind === "hls" ? videoUrl : variant.url, variant.kind === "ytdlp" ? (videoTitle ? videoTitle + ".mp4" : "video.mp4") : "video.mp4", variant.kind === "hls" ? "hls" : variant.kind === "dash" ? "dash" : variant.kind === "ytdlp" ? "ytdlp" : "direct", variant.kind === "hls" ? variant.url : variant.representationId, variant.audioRepresentationId, variant.isLive)}>{variant.downloadable ? "Download" : "Unavailable"}</button>
+              <button className="secondary-button" disabled={!variant.downloadable} onClick={() => add(variant.kind === "dash" || variant.kind === "hls" || variant.kind === "ytdlp" ? (inspectedUrl || videoUrl) : variant.url, variant.kind === "ytdlp" ? (videoTitle ? videoTitle + ".mp4" : "video.mp4") : "video.mp4", variant.kind === "hls" ? "hls" : variant.kind === "dash" ? "dash" : variant.kind === "ytdlp" ? "ytdlp" : "direct", variant.kind === "hls" ? variant.url : variant.representationId, variant.audioRepresentationId, variant.isLive)}>{variant.downloadable ? "Download" : "Unavailable"}</button>
             </div>)}
-            {variants[0]?.subtitles && variants[0].subtitles.length > 0 && <div className="variants"><div className="variants-heading"><h3>Subtitles</h3><span>{variants[0].subtitles.length} TRACKS</span></div>
-              {variants[0].subtitles.map((subtitle) => <div className="variant" key={subtitle.url}>
+            {allSubtitles.length > 0 && <div className="variants"><div className="variants-heading"><h3>Subtitles</h3><span>{allSubtitles.length} TRACKS</span></div>
+              {allSubtitles.map((subtitle) => <div className="variant" key={subtitle.url}>
                 <div><strong>{subtitle.name || subtitle.language}</strong><small>{subtitle.language} · {subtitle.format.toUpperCase()}</small></div>
                 <button className="secondary-button" onClick={() => void downloadSubtitle(subtitle)}>Download</button>
               </div>)}
@@ -1435,8 +1738,9 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
             <div className="grab-actions">
               <button className="quiet-button" onClick={() => setGrabChecked(Object.fromEntries(grabbed.map((item) => [item.url, true])))}>Select all</button>
               <button className="quiet-button" onClick={() => setGrabChecked({})}>Select none</button>
-              <button className="primary-button" onClick={() => void downloadGrabbed()} disabled={!grabbed.some((item) => grabChecked[item.url])}>Download selected ({grabbed.filter((item) => grabChecked[item.url]).length})</button>
+              <button className="primary-button" onClick={() => void downloadGrabbed()} disabled={downloadingGrabbed || !grabbed.some((item) => grabChecked[item.url])}>{downloadingGrabbed ? "Queueing…" : "Download selected (" + grabbed.filter((item) => grabChecked[item.url]).length + ")"}</button>
             </div>
+            <div className="schedule-row"><label htmlFor="grab-schedule-at">Start later <small>OPTIONAL</small></label><input id="grab-schedule-at" type="datetime-local" className="field schedule-field" min={scheduleMin} value={grabScheduleAt} onChange={(event) => setGrabScheduleAt(event.target.value)} /></div>
             {grabTruncated && <div className="notice">Showing the first 100 items — download in batches, or narrow the page.</div>}
             {grabbed.map((item) => <div className="variant" key={item.url}>
               <label className="grab-item"><input type="checkbox" checked={!!grabChecked[item.url]} onChange={(event) => setGrabChecked((current) => ({ ...current, [item.url]: event.target.checked }))} /><span><strong>{item.name}</strong><small>{item.kind.toUpperCase()} · {hostOf(item.url)}</small></span></label>
@@ -1605,9 +1909,9 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
             <div className="setting-row">
               <div><strong>Download it yourself instead</strong><small>Or download the file yourself from the official release page and drop it in the tools folder — ThunderLoad picks it up automatically.</small></div>
               <div style={{ display: "flex", gap: "8px" }}>
-                <button className="secondary-button" onClick={() => void invoke("open_ytdlp_release_page", { tool: "ytdlp" })}>yt-dlp release page</button>
-                <button className="secondary-button" onClick={() => void invoke("open_ytdlp_release_page", { tool: "deno" })}>Deno release page</button>
-                <button className="secondary-button" onClick={() => void invoke("open_tools_folder")}>Open tools folder</button>
+                <button className="secondary-button" onClick={() => void invoke("open_ytdlp_release_page", { tool: "ytdlp" }).catch((error) => setYtdlpUpdateStatus("Could not open the yt-dlp release page: " + String(error)))}>yt-dlp release page</button>
+                <button className="secondary-button" onClick={() => void invoke("open_ytdlp_release_page", { tool: "deno" }).catch((error) => setYtdlpUpdateStatus("Could not open the Deno release page: " + String(error)))}>Deno release page</button>
+                <button className="secondary-button" onClick={() => void invoke("open_tools_folder").catch((error) => setYtdlpUpdateStatus("Could not open the tools folder: " + String(error)))}>Open tools folder</button>
               </div>
             </div>
             <p className="footnote">Tools folder: {ytdlpTools ? ytdlpTools.toolsDir : "…"}</p>

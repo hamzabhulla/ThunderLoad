@@ -20,9 +20,15 @@ jobs:
         shell: pwsh
         run: |
           node --check thunderload/extension/background.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           node --check thunderload/extension/content.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --check thunderload/extension/hook.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           node --check thunderload/extension/popup.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           node thunderload/scripts/validate-extension.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Package browser extensions
         # Must run before ANY cargo command touches the desktop crate: the
         # Tauri build script (tauri-build) validates the bundled resource
@@ -63,7 +69,6 @@ jobs:
           Copy-Item "thunderload/native-host/register-native-host.ps1" $NativeDir
           Copy-Item "thunderload/native-host/unregister-native-host.ps1" $NativeDir
           Compress-Archive -Path (Join-Path $NativeDir "*") -DestinationPath (Join-Path $Out "ThunderLoad-NativeHost-Setup.zip") -Force
-          & "thunderload/scripts/package-extensions.ps1"
           Copy-Item "thunderload/dist/extensions/ThunderLoad-Chromium.zip" $Out
           Copy-Item "thunderload/dist/extensions/ThunderLoad-Firefox.zip" $Out
           Copy-Item "thunderload/dist/extensions/ThunderLoad-Firefox.xpi" $Out

@@ -432,11 +432,11 @@ fn dash_segment_template_mpd(segment_count: usize) -> String {
 async fn bench_direct(connections: usize, runs: usize) -> anyhow::Result<BenchResult> {
     let routes = HashMap::from([(
         "/file.bin".to_string(),
-        vec![b'A'; DIRECT_SIZE],
+        distinct_payload(DIRECT_SIZE),
     )]);
     let server = BenchServer::new(routes);
     let url = format!("{}/file.bin", server.base);
-    let expected = vec![b'A'; DIRECT_SIZE];
+    let expected = distinct_payload(DIRECT_SIZE);
     let mut times = Vec::with_capacity(runs);
     for _ in 0..runs {
         let dir = fresh_dir("direct");
@@ -477,11 +477,11 @@ async fn bench_direct(connections: usize, runs: usize) -> anyhow::Result<BenchRe
 async fn bench_sequential(runs: usize) -> anyhow::Result<BenchResult> {
     let routes = HashMap::from([(
         "/file.bin".to_string(),
-        vec![b'A'; DIRECT_SIZE],
+        distinct_payload(DIRECT_SIZE),
     )]);
     let server = BenchServer::new(routes);
     let url = format!("{}/file.bin", server.base);
-    let expected = vec![b'A'; DIRECT_SIZE];
+    let expected = distinct_payload(DIRECT_SIZE);
     let mut times = Vec::with_capacity(runs);
     for _ in 0..runs {
         let dir = fresh_dir("sequential");
@@ -489,9 +489,11 @@ async fn bench_sequential(runs: usize) -> anyhow::Result<BenchResult> {
         // Cleans up on success AND on failure (M1).
         let _guard = TempDirGuard(dir.clone());
         let target = dir.join("file.bin");
+        let (control_tx, control_rx) = new_control();
         let (progress_tx, _progress_rx) = new_progress();
         let start = Instant::now();
-        let out = download_url(&url, &target, 1, None, progress_tx, new_limiter()).await?;
+        let out = download_url(&url, &target, 1, None, progress_tx, new_limiter(), control_rx).await?;
+        drop(control_tx);
         let elapsed = start.elapsed();
         anyhow::ensure!(
             out == target,
@@ -620,11 +622,11 @@ async fn bench_dash(runs: usize) -> anyhow::Result<BenchResult> {
 async fn bench_resume(runs: usize) -> anyhow::Result<BenchResult> {
     let routes = HashMap::from([(
         "/file.bin".to_string(),
-        vec![b'A'; RESUME_SIZE],
+        distinct_payload(RESUME_SIZE),
     )]);
     let server = BenchServer::with_trickle(routes, RESUME_TRICKLE);
     let url = format!("{}/file.bin", server.base);
-    let expected = vec![b'A'; RESUME_SIZE];
+    let expected = distinct_payload(RESUME_SIZE);
     let mut times = Vec::with_capacity(runs);
     let mut remaining_per_run = Vec::with_capacity(runs);
     for _ in 0..runs {
@@ -859,8 +861,21 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
+/// Payload whose byte at offset `i` is `i % 251`: no two 64 KiB
+/// regions are identical, so a segment written to the wrong offset
+/// (or duplicated) fails the byte-for-byte check instead of passing
+/// silently the way a uniform `b'A'` payload would (P3).
+fn distinct_payload(size: usize) -> Vec<u8> {
+    (0..size).map(|index| (index % 251) as u8).collect()
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
+    // Localhost exemption (P1-3): the engine's SSRF validator and
+    // validating resolver block loopback by default; this binary runs
+    // its fixtures on 127.0.0.1, so it opts in via the env-gated
+    // allowlist instead of the old `cfg(test)` exemption.
+    std::env::set_var("THUNDERLOAD_ALLOW_LOCALHOST", "1");
     let args = parse_args()?;
     if args.list {
         for name in ALL_BENCHES {

@@ -25,6 +25,7 @@ jobs:
           $checks = @(
             "thunderload/extension/background.js",
             "thunderload/extension/content.js",
+            "thunderload/extension/hook.js",
             "thunderload/extension/popup.js"
           )
           foreach ($file in $checks) {
@@ -94,6 +95,7 @@ jobs:
         run: |
           node --check thunderload/extension/background.js
           node --check thunderload/extension/content.js
+          node --check thunderload/extension/hook.js
           node --check thunderload/extension/popup.js
           node thunderload/scripts/validate-extension.mjs
       - name: Package browser extensions
@@ -153,6 +155,7 @@ jobs:
         run: |
           node --check thunderload/extension/background.js
           node --check thunderload/extension/content.js
+          node --check thunderload/extension/hook.js
           node --check thunderload/extension/popup.js
           node thunderload/scripts/validate-extension.mjs
       - name: Package browser extensions

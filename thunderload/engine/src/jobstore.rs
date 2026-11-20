@@ -307,9 +307,29 @@ impl JobStore {
         };
         let bytes = serde_json::to_vec_pretty(&file)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        let temporary = self.path.with_extension("json.tmp");
-        fs::write(&temporary, &bytes)?;
-        OpenOptions::new().write(true).open(&temporary)?.sync_all()?;
+        let tmp_name = format!("jobs.{}.{}.tmp", std::process::id(), uuid::Uuid::new_v4());
+        let temporary = match self.path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.join(tmp_name),
+            _ => PathBuf::from(tmp_name),
+        };
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let write_result = (|| -> io::Result<()> {
+            use std::io::Write;
+            let mut tmp_file = options.open(&temporary)?;
+            tmp_file.write_all(&bytes)?;
+            tmp_file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
         match fs::rename(&temporary, &self.path) {
             Ok(()) => {
                 #[cfg(unix)]
@@ -334,22 +354,32 @@ impl JobStore {
     /// upsert would rewrite the file. Returns true when a row was
     /// inserted or changed.
     pub fn upsert(&mut self, mut record: JobRecord) -> io::Result<bool> {
-        if let Some(existing) = self.jobs.iter_mut().find(|job| job.id == record.id) {
-            record.created_at_ms = existing.created_at_ms;
-            record.updated_at_ms = existing.updated_at_ms;
-            if *existing == record {
+        if let Some(index) = self.jobs.iter().position(|job| job.id == record.id) {
+            record.created_at_ms = self.jobs[index].created_at_ms;
+            record.updated_at_ms = self.jobs[index].updated_at_ms;
+            if self.jobs[index] == record {
                 return Ok(false);
             }
             record.updated_at_ms = now_ms();
-            *existing = record;
+            // Snapshot-and-restore: a failed save must not leave the
+            // in-memory row diverged from disk.
+            let snapshot = self.jobs[index].clone();
+            self.jobs[index] = record;
+            if let Err(error) = self.save() {
+                self.jobs[index] = snapshot;
+                return Err(error);
+            }
         } else {
             if record.created_at_ms == 0 {
                 record.created_at_ms = now_ms();
             }
             record.updated_at_ms = now_ms();
             self.jobs.insert(0, record);
+            if let Err(error) = self.save() {
+                self.jobs.remove(0);
+                return Err(error);
+            }
         }
-        self.save()?;
         Ok(true)
     }
 
@@ -385,40 +415,57 @@ impl JobStore {
         detail: Option<&str>,
         error: Option<&str>,
     ) -> io::Result<bool> {
-        let Some(job) = self.jobs.iter_mut().find(|job| job.id == id) else {
+        let Some(index) = self.jobs.iter().position(|job| job.id == id) else {
             return Ok(false);
         };
+        let job = &self.jobs[index];
         let changed = job.state != state
             || detail.is_some_and(|detail| detail != job.detail)
             || error != job.error.as_deref();
         if !changed {
             return Ok(false);
         }
-        job.state = state;
-        if let Some(detail) = detail {
-            job.detail = detail.to_string();
-        }
-        job.error = error.map(str::to_string);
-        job.updated_at_ms = now_ms();
-        if state == JobState::Completed {
-            if let Some(total) = job.total {
-                job.downloaded = total;
+        // Snapshot-and-restore: a failed save must not leave the
+        // in-memory row diverged from disk.
+        let snapshot = self.jobs[index].clone();
+        {
+            let job = &mut self.jobs[index];
+            job.state = state;
+            if let Some(detail) = detail {
+                job.detail = detail.to_string();
             }
-            job.percent = Some(100.0);
+            job.error = error.map(str::to_string);
+            job.updated_at_ms = now_ms();
+            if state == JobState::Completed {
+                if let Some(total) = job.total {
+                    job.downloaded = total;
+                }
+                job.percent = Some(100.0);
+                job.session = None;
+            }
+            if state == JobState::Cancelled {
+                // Cancel deletes the files; the row stays (so the user still
+                // sees the cancelled job until they clear it) but must not
+                // point at a target that no longer exists — and a job that
+                // can never resume must not keep its bearer credential or
+                // its start time, or a later reader would put it back on
+                // the Scheduler page.
+                job.target_path = None;
+                job.checkpoint_path = None;
+                job.session = None;
+                job.scheduled_at_ms = None;
+            }
+            if state == JobState::Failed {
+                // A failed job can never resume from this row's session
+                // either: the bearer credential must not sit in the
+                // store once the job is terminal.
+                job.session = None;
+            }
         }
-        if state == JobState::Cancelled {
-            // Cancel deletes the files; the row stays (so the user still
-            // sees the cancelled job until they clear it) but must not
-            // point at a target that no longer exists — and a job that
-            // can never resume must not keep its bearer credential or
-            // its start time, or a later reader would put it back on
-            // the Scheduler page.
-            job.target_path = None;
-            job.checkpoint_path = None;
-            job.session = None;
-            job.scheduled_at_ms = None;
+        if let Err(error) = self.save() {
+            self.jobs[index] = snapshot;
+            return Err(error);
         }
-        self.save()?;
         Ok(true)
     }
 
@@ -438,24 +485,35 @@ impl JobStore {
         segments_done: Option<u64>,
         segments_total: Option<u64>,
     ) -> io::Result<bool> {
-        let Some(job) = self.jobs.iter_mut().find(|job| job.id == id) else {
+        let Some(index) = self.jobs.iter().position(|job| job.id == id) else {
             return Ok(false);
         };
-        job.downloaded = downloaded;
-        job.total = total;
-        job.percent = percent;
-        if let (Some(done), Some(total_segments)) = (segments_done, segments_total) {
-            job.segments_done = Some(done);
-            job.segments_total = Some(total_segments);
+        // Snapshot-and-restore: a failed save must not leave the
+        // in-memory row diverged from disk.
+        let snapshot = self.jobs[index].clone();
+        {
+            let job = &mut self.jobs[index];
+            job.downloaded = downloaded;
+            job.total = total;
+            // NaN (or infinite) percent breaks PartialEq on the row and
+            // can never be displayed — ingest it as "unknown".
+            job.percent = percent.filter(|value| value.is_finite());
+            if let (Some(done), Some(total_segments)) = (segments_done, segments_total) {
+                job.segments_done = Some(done);
+                job.segments_total = Some(total_segments);
+            }
+            job.updated_at_ms = now_ms();
         }
-        job.updated_at_ms = now_ms();
         let due = match self.last_progress_save.get(id) {
             None => true,
             Some(last) => last.elapsed() >= self.progress_throttle,
         };
         if due {
+            if let Err(error) = self.save() {
+                self.jobs[index] = snapshot;
+                return Err(error);
+            }
             self.last_progress_save.insert(id.to_string(), Instant::now());
-            self.save()?;
         }
         Ok(true)
     }
@@ -555,7 +613,16 @@ impl JobStore {
             }
             let name = entry.file_name().to_string_lossy().to_string();
             if let Some(target) = name.strip_suffix(".thunderload.part.meta.json") {
-                if !target.is_empty() {
+                // A target of "." / ".." (from
+                // "..thunderload.part.meta.json") or one containing a
+                // separator would escape the download dir when joined
+                // below — never import it as a job.
+                if !target.is_empty()
+                    && target != "."
+                    && target != ".."
+                    && !target.contains('/')
+                    && !target.contains('\\')
+                {
                     metas.push((entry.path(), target.to_string()));
                 }
             }
@@ -954,7 +1021,16 @@ mod tests {
         let dir = test_dir("no-tmp");
         let (mut store, _path) = store_in(&dir);
         store.upsert(sample_record("x")).unwrap();
-        assert!(!dir.join("jobs.json.tmp").exists());
+        // The tmp name carries pid + uuid now (jobs.<pid>.<uuid>.tmp),
+        // so assert no jobs.*.tmp file at all — not just the old fixed
+        // `jobs.json.tmp` name.
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with("jobs.") && name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "tmp files left behind: {leftovers:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1064,6 +1140,16 @@ mod tests {
         // ... nor its start time, or a later reader would put it back
         // on the Scheduler page.
         assert_eq!(row.scheduled_at_ms, None);
+        // Failed clears the session too: a terminal job must not keep
+        // its bearer credential in the store.
+        let mut failed = sample_record("f");
+        failed.session = Some(sample_session());
+        store.upsert(failed).unwrap();
+        assert!(store
+            .update_state("f", JobState::Failed, None, Some("boom"))
+            .unwrap());
+        assert_eq!(store.get("f").unwrap().session, None);
+        assert!(store.remove("f").unwrap());
         assert!(store.remove("u").unwrap());
         assert!(!store.remove("u").unwrap());
         let (reloaded, _) = JobStore::load(&path, Duration::from_secs(0));

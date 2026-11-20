@@ -5,7 +5,7 @@
   "identifier": "com.thunderload.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
-    "devUrl": "http://localhost:1420",
+    "devUrl": "http://127.0.0.1:1420",
     "beforeBuildCommand": "npm run build",
     "frontendDist": "../dist"
   },
@@ -21,7 +21,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline'; font-src 'self'"
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline'; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
     }
   },
   "bundle": {
@@ -33,11 +33,9 @@
       "icons/icon.icns"
     ],
     "resources": {
-      "../../target/release/thunderload-host.exe": "native-host/thunderload-host.exe",
-      "../../native-host/register-native-host.ps1": "native-host/register-native-host.ps1",
-      "../../native-host/unregister-native-host.ps1": "native-host/unregister-native-host.ps1",
       "../../dist/extensions/ThunderLoad-Chromium.zip": "extensions/ThunderLoad-Chromium.zip",
-      "../../dist/extensions/ThunderLoad-Firefox.xpi": "extensions/ThunderLoad-Firefox.xpi"
+      "../../dist/extensions/ThunderLoad-Firefox.xpi": "extensions/ThunderLoad-Firefox.xpi",
+      "../../target/release/thunderload-host.exe": "native-host/thunderload-host.exe"
     },
     "windows": {
       "webviewInstallMode": {
@@ -45,7 +43,8 @@
       },
       "nsis": {
         "installMode": "currentUser",
-        "displayLanguageSelector": false
+        "displayLanguageSelector": false,
+        "installerHooks": "installer-hooks.nsh"
       }
     }
   }
