@@ -22,6 +22,12 @@ button{cursor:pointer}.secondary{min-height:30px;padding:0 10px;border:1px solid
 .other-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#dbe6f1;font-size:11px}
 .empty{padding:21px 12px;border:1px dashed #1e293b;border-radius:7px;color:#8b9eb2;text-align:center;font-size:10px;line-height:1.5}
 .footer{margin-top:14px;padding-top:12px;border-top:1px solid #1e293b}
+/* The footer holds only the intercept toggle, which ships hidden
+   until popup.js loads the stored value — without this, the empty
+   footer (margin + padding + border) flashes as a ~27px strip on
+   every open. :has is safe here: Chrome 105+ / Firefox 121+,
+   manifests require Chrome 116 / Firefox 128. */
+.footer:has(> .toggle-row[hidden]){display:none}
 .toggle-row{display:flex;align-items:center;justify-content:space-between;gap:12px;color:#dbe6f1;font-size:11px;font-weight:600;cursor:pointer}
 .switch{position:relative;display:inline-block;width:36px;height:20px;flex:none}
 .switch input{position:absolute;opacity:0;width:100%;height:100%;margin:0;cursor:pointer}
