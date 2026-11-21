@@ -1365,8 +1365,17 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     }
   }
   async function checkYtDlpUpdate() {
+    // This button APPLIES an update, it does not just check: yt-dlp -U
+    // downloads and installs the latest release, so ask first.
+    let ok: boolean;
+    try {
+      ok = await confirm("Update yt-dlp?\n\nThis downloads and installs the latest yt-dlp release — it does not just check for one. The new version replaces the installed binary.");
+    } catch {
+      ok = window.confirm("Update yt-dlp? This downloads and installs the latest yt-dlp release — it does not just check for one. The new version replaces the installed binary.");
+    }
+    if (!ok) return;
     setYtdlpCheckingUpdate(true);
-    setYtdlpUpdateStatus("Checking for yt-dlp updates…");
+    setYtdlpUpdateStatus("Updating yt-dlp…");
     try {
       setYtdlpUpdateStatus(await invoke<string>("check_ytdlp_update"));
       await loadYtDlpTools();
@@ -1943,8 +1952,8 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
             {ytdlpToolProgress?.tool === "Deno" && <div className="notice native-host-notice">Deno download ho raha hai{ytdlpToolProgress.percent !== undefined ? " — " + Math.round(ytdlpToolProgress.percent) + "%" : "…"}</div>}
             {ytdlpUpdateStatus && <div className="notice native-host-notice">{ytdlpUpdateStatus}</div>}
             <div className="setting-row">
-              <div><strong>Check for yt-dlp updates</strong><small>YouTube changes often — an extractor error usually means yt-dlp needs an update.</small></div>
-              <button className="secondary-button" onClick={() => void checkYtDlpUpdate()} disabled={ytdlpCheckingUpdate}>{ytdlpCheckingUpdate ? "Checking…" : "Check for updates"}</button>
+              <div><strong>Update yt-dlp</strong><small>YouTube changes often — an extractor error usually means yt-dlp needs an update. This downloads and installs the latest release.</small></div>
+              <button className="secondary-button" onClick={() => void checkYtDlpUpdate()} disabled={ytdlpCheckingUpdate}>{ytdlpCheckingUpdate ? "Updating…" : "Update yt-dlp"}</button>
             </div>
             <div className="setting-row">
               <div><strong>Download it yourself instead</strong><small>Or download the file yourself from the official release page and drop it in the tools folder — ThunderLoad picks it up automatically.</small></div>
