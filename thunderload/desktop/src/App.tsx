@@ -12,7 +12,11 @@ type SubtitleVariant = { language: string; name?: string; url: string; format: s
 type Variant = { kind: string; quality: string; width?: number; height?: number; bandwidth?: number; url: string; downloadable: boolean; note?: string; representationId?: string; audioRepresentationId?: string; audioOnly?: boolean; isLive?: boolean; fps?: number; subtitles?: SubtitleVariant[] };
 type GrabItem = { url: string; kind: string; name: string };
 type GrabResult = { items: GrabItem[]; truncated: boolean };
-type Progress = { downloaded: number; total?: number; percent?: number; phase: string; segments_done?: number; segments_total?: number };
+// P1-10: no `phase` field — the backend emits one, but it only
+// duplicates the row status and the download-complete /
+// download-paused events this handler already uses, so nothing
+// reads it. (It was declared and never read.)
+type Progress = { downloaded: number; total?: number; percent?: number; segments_done?: number; segments_total?: number };
 type Item = { id: string; name: string; url: string; kind: Kind; status: Status; percent: number; downloaded: number; total?: number; detail: string; error?: string; createdAt: number; targetPath?: string; scheduledAt?: number; source?: "native"; representationId?: string; audioRepresentationId?: string; segmentsDone?: number; segmentsTotal?: number; live?: boolean; connections?: number };
 type StoredJob = { id: string; name: string; url: string; kind: string; origin: string; state: string; downloaded: number; total?: number; percent?: number; segmentsDone?: number; segmentsTotal?: number; targetPath?: string; checkpointPath?: string; representationId?: string; audioRepresentationId?: string; scheduledAtMs?: number; detail: string; error?: string; createdAtMs: number; updatedAtMs: number; live?: boolean };
 
@@ -509,6 +513,10 @@ export default function App() {
       }
       if (fresh.length) {
         setGrabbedLinks((current) => [...current, ...fresh.filter((url) => !current.includes(url))]);
+        // P1-11: a notice from the last visit ("That link could not
+        // be queued") must not still be showing when the dialog
+        // reopens — nothing about it was cleared on close.
+        setLinkGrabberNotice("");
         setLinkGrabberOpen(true);
       }
     }, 2000);
@@ -745,22 +753,35 @@ export default function App() {
           // same way. Segment counts ride the same event and are kept
           // when the transfer reports them.
           recordSpeedSample(speedSamples.current, payload.jobId, payload.progress.downloaded, Date.now());
-          setItems((current) => current.map((item) => item.id !== payload.jobId ? item : {
-            ...item,
-            downloaded: payload.progress.downloaded,
-            total: payload.progress.total,
-            percent: Math.max(0, Math.min(100, payload.progress.percent ?? item.percent)),
-            segmentsDone: payload.progress.segments_done ?? item.segmentsDone,
-            segmentsTotal: payload.progress.segments_total ?? item.segmentsTotal,
-            // M2: a progress event must not overwrite the detail of a
-            // Pausing/Cancelling row or a terminal row (e.g. a late
-            // event arriving after the user paused) — the status is
-            // never overwritten here, and neither is its detail.
-            detail: ["Pausing", "Cancelling", "Paused", "Completed", "Failed", "Interrupted", "Cancelled"].includes(item.status)
-              ? item.detail
-              : item.kind === "hls"
-                ? "Downloading media segments · " + Math.round(payload.progress.percent ?? 0) + "%"
-                : bytes(payload.progress.downloaded) + (payload.progress.total ? " of " + bytes(payload.progress.total) : " downloaded")
+          setItems((current) => current.map((item) => {
+            if (item.id !== payload.jobId) return item;
+            // P1-10: a tick may omit total, and may carry a non-finite
+            // percent (NaN from a 0/0 division upstream) — keep the
+            // row's total and percent in those cases, and store the
+            // percent rounded, so the table and inspector never render
+            // 37.4829…% or NaN%.
+            const total = payload.progress.total ?? item.total;
+            const incoming = payload.progress.percent;
+            const percent = typeof incoming === "number" && Number.isFinite(incoming)
+              ? Math.round(Math.max(0, Math.min(100, incoming)))
+              : item.percent;
+            return {
+              ...item,
+              downloaded: payload.progress.downloaded,
+              total,
+              percent,
+              segmentsDone: payload.progress.segments_done ?? item.segmentsDone,
+              segmentsTotal: payload.progress.segments_total ?? item.segmentsTotal,
+              // M2: a progress event must not overwrite the detail of a
+              // Pausing/Cancelling row or a terminal row (e.g. a late
+              // event arriving after the user paused) — the status is
+              // never overwritten here, and neither is its detail.
+              detail: ["Pausing", "Cancelling", "Paused", "Completed", "Failed", "Interrupted", "Cancelled"].includes(item.status)
+                ? item.detail
+                : item.kind === "hls"
+                  ? "Downloading media segments · " + percent + "%"
+                  : bytes(payload.progress.downloaded) + (total ? " of " + bytes(total) : " downloaded")
+            };
           }));
         }),
         listen<{ jobId: string; path: string }>("download-complete", ({ payload }) => {
@@ -920,9 +941,11 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     });
   }, [items, parallel, connections, scheduleTick, seeded]);
 
-  // Returns true when a job was queued, false when nothing was queued
-  // (invalid URL, past schedule, yt-dlp page routed to the grabber,
-  // webpage verdict) — downloadGrabbed counts on this.
+  // Returns true when a job was queued OR the request was handed to
+  // the Video Grabber for the user to pick a format, false when
+  // nothing was queued or opened (invalid URL, past schedule,
+  // webpage verdict, live DASH) — downloadGrabbed and the
+  // LinkGrabber count on this.
   async function add(value: string, saveAs?: string, requestedKind?: Kind, representationId?: string, audioRepresentationId?: string, live?: boolean, scheduledFor?: string, clearForm = false): Promise<boolean> {
     const clean = value.trim();
     if (!/^https?:\/\//i.test(clean)) { setNotice("Enter a valid HTTP or HTTPS URL."); return false; }
@@ -941,11 +964,18 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     }
     let resolvedRepId = representationId;
     let resolvedAudioRepId = audioRepresentationId;
+    // P1-9: the paste path derives live from the inspected variants
+    // below (a live playlist has no URL-suffix tell); callers that
+    // pass live already classified it.
+    let resolvedLive = live;
     const openInVideoGrabber = (ytdlp: boolean) => {
       setVideoUrl(clean);
       setAddOpen(false);
       setScheduleAt("");
       setLinkGrabberOpen(false);
+      // P1-11: the LinkGrabber notice must not outlive the dialog it
+      // was shown in — it resurfaces stale on the next reopen.
+      setLinkGrabberNotice("");
       setGrabbedLinks((current) => current.filter((entry) => entry !== clean && entry.trim() !== clean));
       setGrabberOpen(true);
       if (ytdlp) void inspectYtDlp(clean);
@@ -966,7 +996,10 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     if (!requestedKind) {
       if (isYtDlpPageUrl(clean)) {
         openInVideoGrabber(true);
-        return false;
+        // P1-11: the grabber opened — the request was handled, not
+        // failed. Returning false here made the LinkGrabber show
+        // "That link could not be queued" for a YouTube URL.
+        return true;
       }
       setNotice("Checking link…");
       try {
@@ -974,6 +1007,28 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
         // accept a same-origin referer, and the desktop has no better
         // one (Slice 5). The engine validates it before use.
         const inspected = await invoke<Variant[]>("inspect_video_url", { url: clean, referer: clean });
+        // P1-9: kind + live come from the inspected variants, not the
+        // URL suffix. An extensionless HLS/DASH URL has no suffix to
+        // read (it used to queue as "direct" and download raw
+        // playlist text), and a live playlist looks identical to a
+        // VOD one until its media playlist is read (no ENDLIST) — it
+        // used to queue as VOD and fail at start, because the engine
+        // rejects live playlists on the VOD path. inspect_video_url
+        // classifies by suffix first, then by Content-Type, so its
+        // kind is the engine's own verdict; isLive rides on the
+        // variants (HLS without ENDLIST, dynamic DASH).
+        const inspectedKind = inspected[0]?.kind;
+        if (inspectedKind === "hls" || inspectedKind === "dash" || inspectedKind === "direct") kind = inspectedKind;
+        const inspectedLive = inspected.some((variant) => variant.isLive === true);
+        if (kind === "dash" && inspectedLive) {
+          // The engine has no live DASH recorder (dynamic MPDs are
+          // refused at start), and a dash row never carries the live
+          // flag — refuse honestly instead of queueing a VOD job
+          // that fails at start.
+          setNotice("This is a live DASH stream, which ThunderLoad can't record yet.");
+          return false;
+        }
+        if (kind === "hls" && inspectedLive) resolvedLive = true;
         if (kind === "dash" && !resolvedRepId) {
           const best = inspected.find((variant) => variant.downloadable && variant.representationId);
           if (best?.representationId) {
@@ -983,7 +1038,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
             }
           } else {
             openInVideoGrabber(false);
-            return false;
+            return true;
           }
         }
       } catch (error) {
@@ -993,13 +1048,13 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
         }
         if (kind === "dash" && !resolvedRepId) {
           openInVideoGrabber(false);
-          return false;
+          return true;
         }
       }
     }
     if (kind === "dash" && !resolvedRepId) {
       openInVideoGrabber(false);
-      return false;
+      return true;
     }
     const suggested = nameFromUrl(clean);
     const item: Item = {
@@ -1010,7 +1065,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       // routes it to the live recorder; yt-dlp live and DASH live
       // never take this path (yt-dlp handles its own, DASH live is
       // refused by the engine).
-      live: live === true && kind === "hls" ? true : undefined,
+      live: resolvedLive === true && kind === "hls" ? true : undefined,
       detail: scheduledAt ? "Scheduled for " + new Date(scheduledAt).toLocaleString() : "Waiting in queue",
       createdAt: Date.now(),
       scheduledAt
