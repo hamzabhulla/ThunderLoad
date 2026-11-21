@@ -619,15 +619,24 @@ export default function App() {
   // silently when it went missing (browser reset, registry cleaner,
   // moved install). When no ID was ever saved, show a prominent
   // non-blocking banner instead — never a modal, never a silent no-op.
+  // P0-4: Chrome and Opera share one Windows registry key and one
+  // manifest behind it whose allowed_origins merges both IDs, so
+  // re-registering either browser merges the other's ID instead of
+  // flipping the key. Check Chrome first so the shared manifest is
+  // seeded from Chrome deterministically, whatever order the IDs were
+  // saved in; Opera's check then sees the merged manifest and stays a
+  // no-op, and a second launch registers nothing at all.
   const nativeCheckedRef = useRef(false);
   useEffect(() => {
     if (nativeCheckedRef.current) return;
     nativeCheckedRef.current = true;
     const entries = Object.entries(readNativeIds());
     if (!entries.length) { setNativeBanner("missing-id"); return; }
+    const chromeKeyRank = (browser: string) => (browser === "chrome" ? 0 : browser === "opera" ? 1 : 2);
+    const ordered = [...entries].sort((a, b) => chromeKeyRank(a[0]) - chromeKeyRank(b[0]));
     void (async () => {
       let failed = false;
-      for (const [browser, extensionId] of entries) {
+      for (const [browser, extensionId] of ordered) {
         try {
           const registered = await invoke<boolean>("check_native_host", { browser, extensionId });
           if (registered) continue;

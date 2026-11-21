@@ -28,4 +28,4 @@ Native messaging is optional for single-file subtitle tracks and for the last-re
 
 On Windows, install the desktop app, then open **Settings → Browser connection**. Select Chrome, Edge, Brave or Firefox, enter the exact extension ID, and choose **Connect browser**. Restart that browser and grant Native messaging when the extension asks. Chromium IDs must be 32 characters in the range a–p. The Firefox add-on ID in this package is `thunderload@example.com`.
 
-The desktop app copies the native host into the user's local application data directory, writes a per-browser manifest, and registers a per-user Windows registry entry. The manifest allowlists only the supplied extension ID.
+The desktop app copies the native host into the user's local application data directory, writes a per-browser manifest, and registers a per-user Windows registry entry. The manifest allowlists only the supplied extension ID — except Chrome and Opera, which share one Windows registry key (Opera reads Chrome's native-messaging key) and therefore one manifest behind it, allowlisting both browsers' extension IDs so registering one never unregisters the other.
