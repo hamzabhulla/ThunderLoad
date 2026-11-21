@@ -458,6 +458,28 @@ export default function App() {
       try { localStorage.setItem(HISTORY_KEY, JSON.stringify(itemsRef.current)); } catch { /* history is best-effort */ }
     }, 500);
   }, [items]);
+  // P0-1: the 500 ms trailing write above can lose the last state
+  // when the app closes or the window hides before the timer fires —
+  // the next startup would then re-seed stale statuses. Flush the
+  // pending write synchronously on beforeunload and when the page
+  // becomes hidden, so the history on disk is never older than the
+  // last committed list.
+  useEffect(() => {
+    const flushHistory = () => {
+      if (historyWriteTimer.current !== null) {
+        window.clearTimeout(historyWriteTimer.current);
+        historyWriteTimer.current = null;
+      }
+      try { localStorage.setItem(HISTORY_KEY, JSON.stringify(itemsRef.current)); } catch { /* history is best-effort */ }
+    };
+    const onVisibilityChange = () => { if (document.visibilityState === "hidden") flushHistory(); };
+    window.addEventListener("beforeunload", flushHistory);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      window.removeEventListener("beforeunload", flushHistory);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, []);
   useEffect(() => { localStorage.setItem(CONNECTIONS_KEY, String(connections)); }, [connections]);
   useEffect(() => { localStorage.setItem(PARALLEL_KEY, String(parallel)); }, [parallel]);
   useEffect(() => { localStorage.setItem(CLIPBOARD_WATCH_KEY, clipboardWatch ? "1" : "0"); }, [clipboardWatch]);
@@ -549,6 +571,13 @@ export default function App() {
   // know yet (pre-Slice-5 history, queued jobs that never started)
   // enter the database. Stored rows win by id; local history fills the
   // rest. Browser-started rows keep coming through the native poll.
+  // P0-1: the dispatcher must not auto-start anything until this
+  // initial merge has run — a stale local row re-queued from history
+  // would otherwise start before the authoritative jobs.json state
+  // lands, and that start would durably overwrite the stored row
+  // via start_job. Seeded also flips true when get_jobs fails,
+  // so a dead backend cannot wedge the queue forever.
+  const [seeded, setSeeded] = useState(false);
   const seededRef = useRef(false);
   useEffect(() => {
     if (seededRef.current) return;
@@ -556,6 +585,13 @@ export default function App() {
     void invoke<Array<StoredJob>>("get_jobs").then((rows) => {
       const stored = rows.filter((row) => row.origin !== "native").map(storedJobToItem);
       const byId = new Map(itemsRef.current.map((item) => [item.id, item]));
+      // P0-1: ids whose stored row the C1 skip below dropped. The
+      // local row wins in memory, but the stored row is authoritative
+      // — skipped ids stay out of the sync_jobs payload below as
+      // belt-and-braces (the backend already skips ids it knows, so
+      // the echo could not overwrite them; this guards a future
+      // sync_jobs change).
+      const skipped = new Set<string>();
       for (const item of stored) {
         // C1: never overwrite a row the dispatcher/engine already
         // moved into an active or transitional state — the seed
@@ -565,7 +601,7 @@ export default function App() {
         // would start the same job a second time) or resurrect a
         // cancel in progress, whatever the stored status is.
         const local = byId.get(item.id);
-        if (local && (local.status === "Downloading" || local.status === "Pausing" || local.status === "Cancelling")) continue;
+        if (local && (local.status === "Downloading" || local.status === "Pausing" || local.status === "Cancelling")) { skipped.add(item.id); continue; }
         byId.set(item.id, item);
       }
       // Drop stale schedules from stored rows too (a started/completed
@@ -573,9 +609,9 @@ export default function App() {
       // startup would put it back on the Scheduler page.
       const merged = Array.from(byId.values()).sort((a, b) => b.createdAt - a.createdAt).map(forgetStaleSchedule);
       setItems(merged);
-      const desktop = merged.filter((item) => item.source !== "native");
+      const desktop = merged.filter((item) => item.source !== "native" && !skipped.has(item.id));
       if (desktop.length) void invoke("sync_jobs", { jobs: desktop.map(itemToSyncJob) }).catch(() => {});
-    }).catch(() => {});
+    }).catch(() => {}).finally(() => setSeeded(true));
   }, []);
 
   // Fix 4: on startup, check the native-host registration for every
@@ -787,6 +823,10 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
   }, []);
 
   useEffect(() => {
+    // P0-1: never auto-start before the initial get_jobs merge — a
+    // stale local row must not start (and get echoed back as
+    // Downloading) before the authoritative jobs.json state lands.
+    if (!seeded) return;
     // H5: slots count desktop actives only (see activeDesktop) — a
     // browser download must not eat a desktop queue slot.
     const slots = Math.max(0, parallel - activeDesktop);
@@ -878,7 +918,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
         startingIds.current.delete(item.id);
       }
     });
-  }, [items, parallel, connections, scheduleTick]);
+  }, [items, parallel, connections, scheduleTick, seeded]);
 
   // Returns true when a job was queued, false when nothing was queued
   // (invalid URL, past schedule, yt-dlp page routed to the grabber,
