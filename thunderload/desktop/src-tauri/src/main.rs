@@ -1261,18 +1261,49 @@ fn native_browser_family(browser: &str) -> Option<NativeBrowserFamily> {
     }
 }
 
+fn is_braced_guid(extension_id: &str) -> bool {
+    // A Firefox add-on ID may be a GUID in braces:
+    // {xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx} (38 chars).
+    let bytes = extension_id.as_bytes();
+    if bytes.len() != 38 || bytes[0] != b'{' || bytes[37] != b'}' {
+        return false;
+    }
+    const HYPHENS: [usize; 4] = [9, 14, 19, 24];
+    bytes[1..37].iter().enumerate().all(|(index, &byte)| {
+        let position = index + 1;
+        if HYPHENS.contains(&position) {
+            byte == b'-'
+        } else {
+            byte.is_ascii_hexdigit()
+        }
+    })
+}
+
+fn is_valid_firefox_addon_id(extension_id: &str) -> bool {
+    // P0-5 (Gemini cross-check): a Chromium extension ID (exactly
+    // 32 chars a–p) is never a Firefox add-on ID — it would register
+    // a manifest Firefox can never match. Reject it explicitly, the
+    // same rule as register-native-host.ps1.
+    if extension_id.len() == 32 && extension_id.chars().all(|ch| ('a'..='p').contains(&ch)) {
+        return false;
+    }
+    // Otherwise a braced GUID, or an email-like ID of at most 128
+    // chars (letters, digits and @ . _ + -).
+    is_braced_guid(extension_id)
+        || (!extension_id.is_empty()
+            && extension_id.len() <= 128
+            && extension_id
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || "@._+-".contains(ch)))
+}
+
 fn validate_native_extension_id(
     family: NativeBrowserFamily,
     extension_id: &str,
 ) -> Result<(), String> {
     match family {
         NativeBrowserFamily::Firefox => {
-            if extension_id.is_empty()
-                || extension_id.len() > 128
-                || !extension_id
-                    .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || "@._+-".contains(ch))
-            {
+            if !is_valid_firefox_addon_id(extension_id) {
                 Err("Enter the exact Firefox add-on ID.".into())
             } else {
                 Ok(())
@@ -2861,6 +2892,43 @@ mod native_host_tests {
         .is_ok());
         assert!(validate_native_extension_id(NativeBrowserFamily::Firefox, "").is_err());
         assert!(validate_native_extension_id(NativeBrowserFamily::Firefox, "bad id!").is_err());
+        // P0-5 (Gemini cross-check): a Chromium ID must never pass
+        // as a Firefox ID, and a braced GUID is a valid Firefox ID.
+        assert!(validate_native_extension_id(
+            NativeBrowserFamily::Firefox,
+            "abcdefghijklmnopabcdefghijklmnop"
+        )
+        .is_err());
+        assert!(validate_native_extension_id(
+            NativeBrowserFamily::Firefox,
+            "{12345678-1234-4abc-8def-1234567890ab}"
+        )
+        .is_ok());
+        // Malformed GUIDs stay rejected: wrong length, non-hex digit.
+        assert!(validate_native_extension_id(
+            NativeBrowserFamily::Firefox,
+            "{12345678-1234-1234-1234-12345678901}"
+        )
+        .is_err());
+        assert!(validate_native_extension_id(
+            NativeBrowserFamily::Firefox,
+            "{zzzzzzzz-1234-1234-1234-123456789012}"
+        )
+        .is_err());
+        // Length cap still applies (129 chars rejected, 128 accepted).
+        assert!(
+            validate_native_extension_id(NativeBrowserFamily::Firefox, &"a".repeat(129)).is_err()
+        );
+        assert!(
+            validate_native_extension_id(NativeBrowserFamily::Firefox, &"a".repeat(128)).is_ok()
+        );
+        // The Chromium arm is unchanged and stays strict: a braced
+        // GUID is not a Chromium ID.
+        assert!(validate_native_extension_id(
+            NativeBrowserFamily::Chromium,
+            "{12345678-1234-4abc-8def-1234567890ab}"
+        )
+        .is_err());
     }
 
     #[test]
