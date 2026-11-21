@@ -52,13 +52,26 @@ function New-ForwardSlashZip {
   if (Test-Path $DestinationPath) { Remove-Item $DestinationPath -Force }
   $zip = [System.IO.Compression.ZipFile]::Open($DestinationPath, [System.IO.Compression.ZipArchiveMode]::Create)
   try {
+    # Fixed 1980-01-01 timestamps (same as package-extensions.mjs) so
+    # repeated runs produce identical bytes, and the explicit icons/
+    # directory entry the Node packager writes first. Keep the two
+    # packagers in sync: same allowlist, same entry order, same
+    # timestamps, same directory entry (see package-extensions.mjs).
+    # Local-kind midnight: .NET stores ZIP times in local time, so a
+    # UTC DateTimeOffset would shift the time-of-day on non-UTC
+    # runners; local midnight stores as 00:00:00 like the .mjs DOS
+    # timestamp (DOS_TIME 0 / DOS_DATE 0x0021).
+    $FixedTime = [System.DateTime]::new(1980, 1, 1, 0, 0, 0, [System.DateTimeKind]::Local)
+    $dirEntry = $zip.CreateEntry("icons/", [System.IO.Compression.CompressionLevel]::NoCompression)
+    $dirEntry.LastWriteTime = $FixedTime
     $files = Get-ChildItem -Path $SourceDir -Recurse -File | Sort-Object FullName
     foreach ($file in $files) {
       # Forward slashes only: GetRelativePath returns the OS
       # separator (backslash on Windows), which must never reach
       # the archive — ZIP entry names are slash-separated.
       $relative = [System.IO.Path]::GetRelativePath($SourceDir, $file.FullName).Replace([System.IO.Path]::DirectorySeparatorChar, "/")
-      [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $file.FullName, $relative, [System.IO.Compression.CompressionLevel]::Optimal) | Out-Null
+      $entry = [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $file.FullName, $relative, [System.IO.Compression.CompressionLevel]::Optimal)
+      $entry.LastWriteTime = $FixedTime
     }
   } finally { $zip.Dispose() }
   # Verify what was written: no entry may contain a backslash.

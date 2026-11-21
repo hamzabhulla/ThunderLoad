@@ -24,13 +24,7 @@ npm run build --prefix desktop
 npm run tauri --prefix desktop -- build
 ```
 
-Package the browser extensions **first**, before any `cargo` or `tauri` step that touches the desktop crate: `tauri.conf.json` bundles `dist/extensions/ThunderLoad-Chromium.zip` and `dist/extensions/ThunderLoad-Firefox.xpi` as resources, and the Tauri build script rejects the build when they are missing. (On Windows, `.\scripts\package-extensions.ps1` does the same thing.)
-
-On Linux and macOS, copy the host binary first, or the build rejects the missing resource:
-
-```sh
-cp target/release/thunderload-host target/release/thunderload-host.exe
-```
+Package the browser extensions **first**, before any `cargo` or `tauri` step that touches the desktop crate: `tauri.conf.json` bundles `dist/extensions/ThunderLoad-Chromium.zip` and `dist/extensions/ThunderLoad-Firefox.xpi` as resources, and the Tauri build script rejects the build when they are missing. (On Windows, `.\scripts\package-extensions.ps1` does the same thing; it needs PowerShell 7+ — it uses .NET APIs Windows PowerShell 5.1 does not have.) The native-host binary is bundled from a per-platform config (`tauri.windows.conf.json`, `tauri.linux.conf.json`, `tauri.macos.conf.json`), each pointing at the file name `cargo build` produces on that platform, so no manual rename of the binary is needed.
 
 Outputs: NSIS setup under `target/release/bundle/nsis/` (Windows), `.deb` / `.AppImage` under `target/release/bundle/deb/` and `target/release/bundle/appimage/` (Linux), `.dmg` under `target/release/bundle/dmg/` (macOS). GitHub Actions builds all three on pushes to main and on pull requests.
 
