@@ -1,3 +1,14 @@
 [workspace]
 resolver = "2"
 members = ["engine", "native-host", "desktop/src-tauri"]
+
+# Single source of truth for the release version and the package
+# metadata the members share: bump the version here and every member
+# follows (version.workspace = true). The desktop package.json,
+# tauri.conf.json, extension manifests and UI version strings track
+# this version by hand — see thunderload/README.md.
+[workspace.package]
+version = "0.3.5"
+license = "MIT"
+repository = "https://github.com/hamzabhulla/ThunderLoad"
+description = "ThunderLoad desktop download manager with browser extension"

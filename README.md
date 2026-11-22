@@ -46,7 +46,7 @@ cargo run --release -p thunderload-engine --bin bench
 Browser downloads need one manual setup per browser — after that, ThunderLoad re-registers the connection automatically on later startups if it ever goes missing:
 
 1. Install the desktop app and the browser extension (in the app: Settings → Browser extension files).
-2. Copy the extension ID: open `chrome://extensions` (`edge://extensions`, `brave://extensions`), turn Developer mode on — the ID is shown under the ThunderLoad extension. Firefox uses the fixed ID `thunderload@example.com`.
+2. Copy the extension ID: open `chrome://extensions` (`edge://extensions`, `brave://extensions`, `opera://extensions`, `vivaldi://extensions`), turn Developer mode on — the ID is shown under the ThunderLoad extension. Firefox uses the fixed ID `thunderload@example.com`.
 3. In the app, open Settings → Browser connection, paste the ID and click Connect browser, then restart the browser and allow Native messaging when prompted.
 4. Done — direct file downloads never need this setup.
 
@@ -55,7 +55,7 @@ Browser downloads need one manual setup per browser — after that, ThunderLoad 
 ## Features
 
 **Downloads that survive interruptions**
-- Multi-connection checkpoint resume: up to 8 parallel connections against one preallocated file, per-segment completion persisted in a metadata sidecar. Pause, resume, and restart recovery all re-fetch only the unfinished bytes.
+- Multi-connection checkpoint resume: up to 16 parallel connections against one preallocated file, per-segment completion persisted in a metadata sidecar. Pause, resume, and restart recovery all re-fetch only the unfinished bytes.
 - Dynamic segmentation: fresh downloads split into near-equal chunks (≥256 KiB, ≤1024 chunks) and connections pull work-stealing style, so a fast connection takes the larger share. A connection silent for 30 s has its chunk re-assigned (max 3 re-assignments, then the download errors with its checkpoint preserved).
 - A durable job database (`jobs.json`, atomic writes): the queue survives restarts and crashes. Interrupted jobs come back resumable, paused jobs stay paused, orphaned checkpoints on disk are imported as Interrupted jobs.
 - Scheduled starts with a one-time OS wake task — Task Scheduler on Windows, systemd user timer on Linux, launchd agent on macOS.
