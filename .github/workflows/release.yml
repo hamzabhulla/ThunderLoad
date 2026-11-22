@@ -1,3 +1,14 @@
+# One release per tag (v*): the Linux and macOS jobs build their platform
+# bundles and upload them as workflow artifacts; windows-release waits for
+# both, merges their files into release-assets/, and publishes the single
+# GitHub release. The Windows job stays the publisher so the SHA256SUMS
+# step and the publish step remain exactly as proven by v0.3.5 — only the
+# two download steps, the needs: line, and the two Copy-Item lines below are new in it.
+# NOTE: the workflow name below is stale (it is no longer Windows-only)
+# but is kept unchanged on purpose: renaming it changes the status-check
+# context ("<workflow name> / <job name>"), which would break branch
+# protection if it requires the old context. Rename it together with a
+# branch-protection check, not in this change.
 name: ThunderLoad Windows release
 on:
   push:
@@ -6,6 +17,7 @@ permissions:
   contents: write
 jobs:
   windows-release:
+    needs: [linux-release, macos-release]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -52,6 +64,16 @@ jobs:
       - name: Build Windows NSIS installer
         working-directory: thunderload/desktop
         run: npm run tauri -- build
+      - name: Download Linux release packages
+        uses: actions/download-artifact@v4
+        with:
+          name: thunderload-release-linux
+          path: release-assets-linux
+      - name: Download macOS release packages
+        uses: actions/download-artifact@v4
+        with:
+          name: thunderload-release-macos
+          path: release-assets-macos
       - name: Prepare release packages
         shell: pwsh
         run: |
@@ -72,6 +94,11 @@ jobs:
           Copy-Item "thunderload/dist/extensions/ThunderLoad-Chromium.zip" $Out
           Copy-Item "thunderload/dist/extensions/ThunderLoad-Firefox.zip" $Out
           Copy-Item "thunderload/dist/extensions/ThunderLoad-Firefox.xpi" $Out
+          # Linux/macOS files staged by the linux-release / macos-release
+          # jobs and downloaded above. The checksum loop below hashes
+          # every file in $Out, so the new files are checksummed too.
+          Copy-Item "release-assets-linux/*" $Out
+          Copy-Item "release-assets-macos/*" $Out
           $Checksums = Join-Path $Out "SHA256SUMS.txt"
           Get-ChildItem $Out -File | ForEach-Object {
             $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -84,3 +111,168 @@ jobs:
           generate_release_notes: true
           draft: false
           prerelease: ${{ contains(github.ref_name, '-rc') }}
+
+  linux-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: thunderload -> target
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install Tauri Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - name: Validate extension
+        run: |
+          node --check thunderload/extension/background.js
+          node --check thunderload/extension/content.js
+          node --check thunderload/extension/hook.js
+          node --check thunderload/extension/popup.js
+          node thunderload/scripts/validate-extension.mjs
+      - name: Package browser extensions
+        # Same packages as the Windows PowerShell step, via the
+        # cross-platform Node packager (same contents and layout).
+        run: node thunderload/scripts/package-extensions.mjs
+      - name: Build native host required by Tauri resources
+        working-directory: thunderload
+        run: |
+          cargo build --release -p thunderload-host
+          # The Tauri resource entry is named thunderload-host.exe (the
+          # Windows binary name); on Linux the built binary has no
+          # extension, so copy it to the expected resource name. The
+          # desktop copies it back out as `thunderload-host` at
+          # registration time.
+          cp target/release/thunderload-host target/release/thunderload-host.exe
+      - name: Check Rust workspace
+        working-directory: thunderload
+        run: cargo check --workspace
+      - name: Test Rust workspace
+        working-directory: thunderload
+        run: cargo test --workspace
+      - name: Install desktop dependencies
+        working-directory: thunderload/desktop
+        run: npm install
+      - name: Build desktop frontend
+        working-directory: thunderload/desktop
+        run: npm run build
+      - name: Build Linux packages
+        working-directory: thunderload/desktop
+        run: npm run tauri -- build
+      - name: Prepare Linux release packages
+        # The extension zips are built above (the Tauri build embeds them
+        # as resources) but are NOT staged here: the Windows job already
+        # publishes the identical ThunderLoad-Chromium.zip /
+        # ThunderLoad-Firefox.zip / ThunderLoad-Firefox.xpi, and staging
+        # them again would collide on the same release-asset names.
+        # Bundle formats come from tauri.conf.json "targets"
+        # (nsis/deb/appimage/dmg): on Linux that is .deb + .AppImage.
+        # Runner-arch assumption in the asset names: ubuntu-latest is
+        # x86_64, so the bundles are amd64.
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets-linux
+          Deb=""
+          for f in thunderload/target/release/bundle/deb/*.deb; do
+            [ -e "$f" ] && { Deb="$f"; break; }
+          done
+          [ -n "$Deb" ] || { echo "No .deb package was produced." >&2; exit 1; }
+          cp "$Deb" release-assets-linux/ThunderLoad-Setup-linux-amd64.deb
+          AppImage=""
+          for f in thunderload/target/release/bundle/appimage/*.AppImage; do
+            [ -e "$f" ] && { AppImage="$f"; break; }
+          done
+          [ -n "$AppImage" ] || { echo "No .AppImage was produced." >&2; exit 1; }
+          cp "$AppImage" release-assets-linux/ThunderLoad-Setup-linux-amd64.AppImage
+          # No Linux installer/registration script exists in the repo
+          # (only the Windows register/unregister .ps1 scripts), so the
+          # native host ships as a tarball: tar preserves the executable
+          # bit, which a bare binary downloaded from a release would
+          # lose. The desktop app registers the bundled host itself at
+          # runtime. This tarball step is the one packaging step with no
+          # counterpart in ci.yml (CI uploads the bare binary as a
+          # workflow artifact, where the exec bit does not matter).
+          [ -x thunderload/target/release/thunderload-host ] || { echo "Native host binary missing." >&2; exit 1; }
+          tar -czf release-assets-linux/ThunderLoad-NativeHost-linux-amd64.tar.gz -C thunderload/target/release thunderload-host
+      - name: Upload Linux release packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: thunderload-release-linux
+          path: release-assets-linux
+          if-no-files-found: error
+          retention-days: 14
+
+  macos-release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: thunderload -> target
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Validate extension
+        run: |
+          node --check thunderload/extension/background.js
+          node --check thunderload/extension/content.js
+          node --check thunderload/extension/hook.js
+          node --check thunderload/extension/popup.js
+          node thunderload/scripts/validate-extension.mjs
+      - name: Package browser extensions
+        run: node thunderload/scripts/package-extensions.mjs
+      - name: Build native host required by Tauri resources
+        working-directory: thunderload
+        run: |
+          cargo build --release -p thunderload-host
+          # Same resource-name copy as the Linux job: the Tauri resource
+          # entry is named thunderload-host.exe, the macOS binary has no
+          # extension.
+          cp target/release/thunderload-host target/release/thunderload-host.exe
+      - name: Check Rust workspace
+        working-directory: thunderload
+        run: cargo check --workspace
+      - name: Test Rust workspace
+        working-directory: thunderload
+        run: cargo test --workspace
+      - name: Install desktop dependencies
+        working-directory: thunderload/desktop
+        run: npm install
+      - name: Build desktop frontend
+        working-directory: thunderload/desktop
+        run: npm run build
+      - name: Build macOS package
+        working-directory: thunderload/desktop
+        run: npm run tauri -- build
+      - name: Prepare macOS release packages
+        # Same reasoning as the Linux job: the extension zips are built
+        # (embedded as Tauri resources) but not re-staged — the Windows
+        # job publishes them. Bundle format comes from tauri.conf.json
+        # "targets": on macOS that is .dmg. Runner-arch assumption in the
+        # asset names: macos-latest is Apple Silicon (arm64).
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets-macos
+          Dmg=""
+          for f in thunderload/target/release/bundle/dmg/*.dmg; do
+            [ -e "$f" ] && { Dmg="$f"; break; }
+          done
+          [ -n "$Dmg" ] || { echo "No .dmg package was produced." >&2; exit 1; }
+          cp "$Dmg" release-assets-macos/ThunderLoad-Setup-macos-arm64.dmg
+          # No macOS installer/registration script exists in the repo
+          # (only the Windows register/unregister .ps1 scripts) — see the
+          # Linux job's comment. Same tarball reasoning applies.
+          [ -x thunderload/target/release/thunderload-host ] || { echo "Native host binary missing." >&2; exit 1; }
+          tar -czf release-assets-macos/ThunderLoad-NativeHost-macos-arm64.tar.gz -C thunderload/target/release thunderload-host
+      - name: Upload macOS release packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: thunderload-release-macos
+          path: release-assets-macos
+          if-no-files-found: error
+          retention-days: 14
