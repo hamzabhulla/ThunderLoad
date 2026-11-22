@@ -120,7 +120,7 @@ Stated plainly, because a README that hides them is worse than useless:
 - **Store listings not submitted.** Chrome Web Store, Edge Add-ons, and AMO review are all pending.
 - **FFmpeg is required** for HLS/DASH audio muxing and is not bundled — set its path in Settings.
 - **No live DASH or DRM content.** Live/dynamic DASH MPDs, SAMPLE-AES and other non-AES-128 HLS encryption, encrypted live HLS, and DRM are not supported, by design. Live HLS recording and AES-128 HLS VOD are supported (see Features).
-- **Release packaging is Windows-only for now.** Tagged releases build the Windows NSIS installer and extension packages; Linux/macOS release packaging is a follow-up.
+- **Release packaging now covers Windows, Linux, and macOS.** Tagged releases build the Windows NSIS installer, Linux and macOS bundles, and extension packages — but no tagged release has run the new Linux/macOS jobs yet, so those assets are unproven until the first tag.
 
 ## License
 
