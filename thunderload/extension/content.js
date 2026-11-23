@@ -177,7 +177,7 @@
     style.textContent = [
       '.wrap{position:fixed;display:none;pointer-events:none;z-index:2147483647}',
       'button.tl-btn{pointer-events:auto;display:inline-flex;align-items:center;justify-content:center;gap:6px;height:32px;padding:0 12px;border:1px solid #1e293b;border-radius:999px;background:#0b1220;color:#e8f1fc;font:600 12px/1 system-ui,-apple-system,"Segoe UI",sans-serif;letter-spacing:.1px;box-shadow:0 4px 14px rgba(0,0,0,.35);cursor:pointer;transition:background .14s ease,border-color .14s ease}',
-      'button.tl-btn:hover,button.tl-btn:focus-visible{background:#111c2e;border-color:#16a34a;outline:none}',
+      'button.tl-btn:hover,button.tl-btn:focus-visible{background:#111c2e;border-color:#30d158;outline:none}',
       'button.tl-btn svg{width:14px;height:14px;flex:none}',
       'button.tl-btn:disabled{opacity:.55;cursor:wait}',
       '.message{display:none;position:absolute;top:38px;right:0;max-width:210px;padding:6px 8px;border:1px solid rgba(205,220,238,.2);border-radius:5px;background:rgba(17,25,35,.94);color:#e4edf8;font:10px/1.35 system-ui,-apple-system,"Segoe UI",sans-serif;white-space:normal;box-shadow:0 2px 10px rgba(0,0,0,.2)}',
@@ -187,8 +187,8 @@
       '.p-head,.p-progress,.p-connect{flex:none}',
       '.p-scroll{overflow-y:auto;min-height:0}',
       '.p-q{pointer-events:none;flex:none;padding:2px 6px;border:1px solid #1e293b;border-radius:4px;background:#0b1220;color:#aebdce;font:600 10px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}',
-      '.p-connect{pointer-events:auto;display:block;width:100%;min-height:30px;margin-top:10px;padding:0 12px;border:1px solid #16a34a;border-radius:8px;background:transparent;color:#4ade80;font:600 12px/1.2 system-ui,-apple-system,"Segoe UI",sans-serif;cursor:pointer}',
-      '.p-connect:hover{background:rgba(22,163,74,.15)}',
+      '.p-connect{pointer-events:auto;display:block;width:100%;min-height:30px;margin-top:10px;padding:0 12px;border:1px solid #30d158;border-radius:8px;background:transparent;color:#7ee2a0;font:600 12px/1.2 system-ui,-apple-system,"Segoe UI",sans-serif;cursor:pointer}',
+      '.p-connect:hover{background:rgba(48,209,88,.15)}',
       '.p-connect:disabled{opacity:.5;cursor:wait}',
       '.p-note{display:none;margin-top:8px;color:#aebdce;font:10px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}',
       '.p-note.show{display:block}',
@@ -202,25 +202,25 @@
       '.p-subtitles{display:grid;gap:6px;margin-top:10px}',
       '.p-sub-head{color:#aebdce;font:600 11px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}',
       '.p-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;border:1px solid #1e293b;border-radius:6px;background:#111c2e}',
-      '.p-row.best{border-color:#16a34a}',
-      '.p-best{flex:none;padding:1px 5px;border:1px solid #16a34a;border-radius:4px;color:#4ade80;font:600 9px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}',
+      '.p-row.best{border-color:#30d158}',
+      '.p-best{flex:none;padding:1px 5px;border:1px solid #30d158;border-radius:4px;color:#7ee2a0;font:600 9px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}',
       '.p-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#e4edf8;font:500 11px/1.3 system-ui,-apple-system,"Segoe UI",sans-serif}',
-      '.p-dl{pointer-events:auto;flex:none;min-height:24px;padding:0 9px;border:1px solid #16a34a;border-radius:5px;background:transparent;color:#4ade80;font:600 10px/1 system-ui,-apple-system,"Segoe UI",sans-serif;cursor:pointer}',
-      '.p-dl:hover{background:rgba(22,163,74,.15)}',
+      '.p-dl{pointer-events:auto;flex:none;min-height:24px;padding:0 9px;border:1px solid #30d158;border-radius:5px;background:transparent;color:#7ee2a0;font:600 10px/1 system-ui,-apple-system,"Segoe UI",sans-serif;cursor:pointer}',
+      '.p-dl:hover{background:rgba(48,209,88,.15)}',
       '.p-dl:disabled{opacity:.5;cursor:wait}',
       '.p-progress{margin-bottom:10px;padding:10px;border:1px solid #1e293b;border-radius:6px;background:#111c2e}',
       '.p-progress-title{color:#e4edf8;font:600 11px/1.3 system-ui,-apple-system,"Segoe UI",sans-serif;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
       '.p-progress-bar{height:6px;margin-top:8px;border-radius:3px;background:#1e293b;overflow:hidden}',
-      '.p-progress-fill{height:100%;background:#16a34a}',
+      '.p-progress-fill{height:100%;background:#30d158}',
       '.p-progress-text{margin-top:6px;color:#aebdce;font:10px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}',
       '.p-empty{padding:8px;color:#8b9eb2;font:10px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}',
       '.p-other{margin-top:10px;border-top:1px solid #1e293b;padding-top:8px}',
       '.p-other summary{list-style:none;color:#aebdce;font:600 11px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif;cursor:pointer}',
       '.p-other summary::-webkit-details-marker{display:none}',
-      '.p-other summary::before{content:"▸ ";color:#4ade80}',
+      '.p-other summary::before{content:"▸ ";color:#7ee2a0}',
       '.p-other[open] summary::before{content:"▾ "}',
       '.p-other-list{display:grid;gap:6px;margin-top:8px}',
-      '.p-link{pointer-events:auto;display:block;width:100%;margin-top:8px;padding:0;border:0;background:transparent;color:#4ade80;font:500 11px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif;cursor:pointer;text-align:left;text-decoration:underline}',
+      '.p-link{pointer-events:auto;display:block;width:100%;margin-top:8px;padding:0;border:0;background:transparent;color:#7ee2a0;font:500 11px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif;cursor:pointer;text-align:left;text-decoration:underline}',
       '@media(prefers-reduced-motion:reduce){button.tl-btn{transition:none}}'
     ].join("\n");
     const wrap = document.createElement("div");
@@ -230,7 +230,7 @@
     button.className = "tl-btn";
     button.title = "Download this video with ThunderLoad";
     button.setAttribute("aria-label", "Download this video with ThunderLoad");
-    button.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2 3 14h7l-1 7 10-12h-7l1-7z" fill="#22c55e"/></svg><span>Download this video</span>';
+    button.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2 3 14h7l-1 7 10-12h-7l1-7z" fill="#3ce165"/></svg><span>Download this video</span>';
     status = document.createElement("div");
     status.className = "message";
     const panel = document.createElement("div");
@@ -515,7 +515,7 @@
     const title = document.createElement("span");
     title.className = "p-title";
     const bolt = document.createElement("span");
-    bolt.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2 3 14h7l-1 7 10-12h-7l1-7z" fill="#22c55e"/></svg>';
+    bolt.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2 3 14h7l-1 7 10-12h-7l1-7z" fill="#3ce165"/></svg>';
     const text = document.createElement("span");
     text.className = "p-title-text";
     text.textContent = titleText || pageTitle();

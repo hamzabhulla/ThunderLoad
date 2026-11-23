@@ -106,12 +106,6 @@ jobs:
         working-directory: thunderload
         run: |
           cargo build --release -p thunderload-host
-          # The Tauri resource entry is named thunderload-host.exe (the
-          # Windows binary name); on Linux the built binary has no
-          # extension, so copy it to the expected resource name. The
-          # desktop copies it back out as `thunderload-host` at
-          # registration time.
-          cp target/release/thunderload-host target/release/thunderload-host.exe
       - name: Check Rust workspace
         working-directory: thunderload
         run: cargo check --workspace
@@ -164,10 +158,6 @@ jobs:
         working-directory: thunderload
         run: |
           cargo build --release -p thunderload-host
-          # Same resource-name copy as the Linux job: the Tauri resource
-          # entry is named thunderload-host.exe, the macOS binary has no
-          # extension.
-          cp target/release/thunderload-host target/release/thunderload-host.exe
       - name: Check Rust workspace
         working-directory: thunderload
         run: cargo check --workspace

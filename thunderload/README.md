@@ -51,17 +51,13 @@ npm run build --prefix desktop
 npm run tauri --prefix desktop -- build
 ```
 
-On Linux and macOS, copy the host binary to the resource name the Tauri config expects before building, otherwise the build script rejects the missing resource (the desktop copies it back out under its native name at registration time):
-
-```sh
-cp target/release/thunderload-host target/release/thunderload-host.exe
-```
+The native-host binary is bundled from a per-platform config (`desktop/src-tauri/tauri.windows.conf.json`, `tauri.linux.conf.json`, `tauri.macos.conf.json`), each pointing at the file name `cargo build` produces on that platform — no manual rename of the binary is needed (the desktop copies it back out under its native name at registration time).
 
 Outputs: NSIS setup `target/release/bundle/nsis/` (Windows), `.deb` / `.AppImage` under `target/release/bundle/deb/` and `target/release/bundle/appimage/` (Linux), `.dmg` under `target/release/bundle/dmg/` (macOS). GitHub Actions builds all three on their runners. The installers are unsigned until a trusted code-signing certificate is configured.
 
 ## Browser packages
 
-Run `scripts/package-extensions.ps1` in PowerShell, or `node scripts/package-extensions.mjs` on any platform. Outputs go to `dist/extensions/`:
+Run `scripts/package-extensions.ps1` in PowerShell 7+ (Windows PowerShell 5.1 cannot run it: the script uses `[System.IO.Path]::GetRelativePath`, a .NET Core-only API with no .NET Framework equivalent), or `node scripts/package-extensions.mjs` on any platform. Both packagers write the same packages — same allowlisted files, same entry order, same fixed 1980-01-01 timestamps, same `icons/` directory entry — so either one can be used for a build. Outputs go to `dist/extensions/`:
 - `ThunderLoad-Chromium.zip`
 - `ThunderLoad-Firefox.zip`
 - `ThunderLoad-Firefox.xpi` (byte-identical copy of the Firefox ZIP)
@@ -92,4 +88,4 @@ Engine throughput is measured by a built-in bench binary against localhost fixtu
 - Validate scheduled-wake tasks on clean machines: Windows Task Scheduler wake tasks on Windows 10/11 VMs (sleep/wake, missed start time, logged-out state, task cancellation, duplicate-instance races), systemd user timers on a Linux desktop, launchd agents on macOS.
 - Code signing, update strategy, uninstall cleanup, Linux/macOS VM testing and accessibility QA.
 - Current-version Firefox/Chromium testing, AMO/Chrome/Edge store review; separate Safari wrapper if Safari is advertised.
-- The release workflow (`.github/workflows/release.yml`) still publishes Windows only; Linux/macOS release packaging is a follow-up.
+- The release workflow (`.github/workflows/release.yml`) now builds Windows, Linux, and macOS; no tagged release has run the new Linux/macOS jobs yet, so those assets are unproven until the first tag.
