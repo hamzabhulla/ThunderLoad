@@ -1253,8 +1253,10 @@ fn native_browser_family(browser: &str) -> Option<NativeBrowserFamily> {
         // Slice 7c (Gemini claim 11): Opera is a Chromium browser —
         // the extension ZIP is Chromium-compatible and the install
         // script already registers its native-messaging key — so it
-        // maps to the Chromium family with its own manifest dir /
-        // registry path below, instead of being rejected here.
+        // maps to the Chromium family. On Windows it shares Chrome's
+        // registry key and manifest (see `windows_native_registry_path`
+        // and `register_native_host`); on Linux/macOS it keeps its own
+        // manifest dir below.
         "chrome" | "chromium" | "edge" | "brave" | "opera" => Some(NativeBrowserFamily::Chromium),
         "firefox" => Some(NativeBrowserFamily::Firefox),
         _ => None,
@@ -1333,7 +1335,7 @@ fn native_host_manifest(
 ) -> Value {
     let mut manifest = match family {
         NativeBrowserFamily::Chromium => {
-            json!({"name":"com.thunderload.host","description":"ThunderLoad local download engine","type":"stdio","allowed_origins":[format!("chrome-extension://{extension_id}/")]})
+            native_host_manifest_chromium(&[chrome_extension_origin(extension_id)], host_path)
         }
         NativeBrowserFamily::Firefox => {
             json!({"name":"com.thunderload.host","description":"ThunderLoad local download engine","type":"stdio","allowed_extensions":[extension_id]})
@@ -1342,6 +1344,89 @@ fn native_host_manifest(
     // Native messaging manifests must contain the absolute executable path.
     manifest["path"] = json!(host_path.to_string_lossy().to_string());
     manifest
+}
+
+/// One Chrome-extension origin string for a validated extension ID.
+fn chrome_extension_origin(extension_id: &str) -> String {
+    format!("chrome-extension://{extension_id}/")
+}
+
+/// Chromium native-messaging manifest allowlisting several extension
+/// IDs. Chrome and Opera share one Windows registry key (see
+/// `windows_native_registry_path`), so they share the manifest behind
+/// it and the manifest must allowlist both of their IDs — a manifest
+/// with a single origin is what made the last registration win.
+fn native_host_manifest_chromium(origins: &[String], host_path: &Path) -> Value {
+    json!({"name":"com.thunderload.host","description":"ThunderLoad local download engine","type":"stdio","allowed_origins":origins,"path":host_path.to_string_lossy().to_string()})
+}
+
+/// Whether this browser registers through the shared Chrome Windows
+/// registry key (and therefore the shared manifest behind it).
+/// Windows-only in production; the tests below exercise the merge.
+#[cfg(any(target_os = "windows", test))]
+fn is_chrome_key_browser(browser: &str) -> bool {
+    matches!(browser, "chrome" | "opera")
+}
+
+/// Path of the one manifest behind the shared Chrome registry key, in
+/// the Windows install dir. It keeps Chrome's name: it is the file the
+/// Chrome key has always pointed at for Chrome.
+#[cfg(target_os = "windows")]
+fn chrome_key_manifest_path(install_dir: &Path) -> PathBuf {
+    install_dir.join("chrome-native-host.json")
+}
+
+/// `allowed_origins` already recorded in a manifest file on disk, if
+/// the file exists and parses; anything else reads as "no origins yet".
+/// Never fails: a corrupt or missing file simply contributes nothing.
+/// Windows-only in production; the tests below exercise the merge.
+#[cfg(any(target_os = "windows", test))]
+fn manifest_allowed_origins(manifest_path: &Path) -> Vec<String> {
+    let text = match std::fs::read_to_string(manifest_path) {
+        Ok(text) => text,
+        Err(_) => return Vec::new(),
+    };
+    let manifest: Value = match serde_json::from_str(&text) {
+        Ok(manifest) => manifest,
+        Err(_) => return Vec::new(),
+    };
+    manifest["allowed_origins"]
+        .as_array()
+        .map(|origins| {
+            origins
+                .iter()
+                .filter_map(|origin| origin.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Merged `allowed_origins` for the shared Chrome-key manifest: the
+/// origin being registered now, plus every origin already recorded in
+/// the shared manifest and in the pre-fix per-browser Opera manifest
+/// (the only place a pre-fix Opera registration recorded its ID).
+/// Sorted and de-duplicated, so registering the same IDs again writes
+/// byte-identical content — the startup re-register is a no-op in
+/// effect, and a run that only knows one browser's ID never drops the
+/// other's. One wart, accepted: when a user changes one browser's
+/// extension ID, the old ID's origin stays allowlisted (the manifest
+/// alone cannot tell which browser an origin belongs to). A stale
+/// origin is harmless — Chrome only connects an extension that is
+/// actually installed under that ID — and it disappears if the
+/// manifest is ever re-created from scratch.
+/// Windows-only in production; the tests below exercise the merge.
+#[cfg(any(target_os = "windows", test))]
+fn merged_chrome_key_origins(
+    shared_manifest_path: &Path,
+    legacy_opera_manifest_path: &Path,
+    extension_id: &str,
+) -> Vec<String> {
+    let mut origins = vec![chrome_extension_origin(extension_id)];
+    origins.extend(manifest_allowed_origins(shared_manifest_path));
+    origins.extend(manifest_allowed_origins(legacy_opera_manifest_path));
+    origins.sort();
+    origins.dedup();
+    origins
 }
 
 /// Where a browser looks for native-messaging manifests (Linux).
@@ -1389,9 +1474,10 @@ fn windows_native_registry_path(browser: &str) -> Option<&'static str> {
         // H9: Opera is Chromium-based and reads Chrome's native-messaging
         // key — there is no working "Opera Software" key. Registering
         // Opera under its own key wrote a value no Opera build ever
-        // reads. It shares Chrome's key (and therefore Chrome's manifest
-        // slot: whichever of Chrome/Opera registers last wins the key,
-        // so a machine with both must re-register the other after).
+        // reads. It shares Chrome's key — and therefore the one manifest
+        // behind it (see `register_native_host`): the shared manifest
+        // allowlists BOTH browsers' extension IDs, so registering one
+        // no longer overwrites the other's registration.
         "opera" => Some(r"HKCU\Software\Google\Chrome\NativeMessagingHosts\com.thunderload.host"),
         "firefox" => Some(r"HKCU\Software\Mozilla\NativeMessagingHosts\com.thunderload.host"),
         _ => None,
@@ -1574,8 +1660,30 @@ async fn register_native_host(
             .map(PathBuf::from).ok_or_else(|| "LOCALAPPDATA is not available.".to_string())?;
         let install_dir = local_app_data.join("ThunderLoad").join("native-host");
         let host_path = install_native_host_binary(&source, &install_dir, &browser)?;
-        let manifest = native_host_manifest(family, extension_id, &host_path);
-        let manifest_path = install_dir.join(format!("{browser}-native-host.json"));
+        // P0-4 (Gemini cross-check): Chrome and Opera share one Windows
+        // registry key, so they must share the one manifest behind it.
+        // Before this fix each wrote its own single-origin manifest and
+        // pointed the same key at it, so the last registration won and
+        // the startup re-register flipped the key on every launch. The
+        // shared manifest merges both browsers' extension IDs; the
+        // pre-fix per-browser Opera manifest is folded in (its origins
+        // move into the shared file) and then removed, since nothing
+        // points at it any more. Other browsers keep their own manifest.
+        let legacy_opera_manifest = install_dir.join("opera-native-host.json");
+        let (manifest, manifest_path) = if is_chrome_key_browser(&browser) {
+            let shared_path = chrome_key_manifest_path(&install_dir);
+            let origins =
+                merged_chrome_key_origins(&shared_path, &legacy_opera_manifest, extension_id);
+            (
+                native_host_manifest_chromium(&origins, &host_path),
+                shared_path,
+            )
+        } else {
+            (
+                native_host_manifest(family, extension_id, &host_path),
+                install_dir.join(format!("{browser}-native-host.json")),
+            )
+        };
         let bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?;
         std::fs::write(&manifest_path, bytes).map_err(|error| format!("Could not write native host manifest: {error}"))?;
         let status = hidden_command("reg").args([
@@ -1583,6 +1691,14 @@ async fn register_native_host(
             manifest_path.to_string_lossy().as_ref(), "/f"
         ]).status().map_err(|error| format!("Could not register native host in Windows: {error}"))?;
         if !status.success() { return Err("Windows refused to register the ThunderLoad native host.".into()); }
+        if is_chrome_key_browser(&browser) {
+            // Only once the shared manifest is written AND the key
+            // points at it: the pre-fix Opera manifest is dead from
+            // here on, and leaving it would look like a live
+            // registration to anyone (or any old build) reading the
+            // install dir.
+            let _ = std::fs::remove_file(&legacy_opera_manifest);
+        }
         Ok(format!("{browser} native host registered. Restart the browser and grant Native messaging permission in the extension popup."))
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1655,10 +1771,21 @@ async fn check_native_host(browser: String, extension_id: String) -> Result<bool
         let local_app_data = std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
             .ok_or_else(|| "LOCALAPPDATA is not available.".to_string())?;
-        let manifest_path = local_app_data
-            .join("ThunderLoad")
-            .join("native-host")
-            .join(format!("{browser}-native-host.json"));
+        // P0-4: Chrome and Opera share one registry key and one manifest
+        // behind it, so both check the shared file — checking a
+        // per-browser file here is what made the startup loop
+        // re-register (and flip the key) on every launch.
+        let manifest_path = if is_chrome_key_browser(&browser) {
+            local_app_data
+                .join("ThunderLoad")
+                .join("native-host")
+                .join("chrome-native-host.json")
+        } else {
+            local_app_data
+                .join("ThunderLoad")
+                .join("native-host")
+                .join(format!("{browser}-native-host.json"))
+        };
         if !native_host_manifest_matches(&manifest_path, family, extension_id) {
             return Ok(false);
         }
@@ -2824,10 +2951,11 @@ mod scheduler_tests {
 #[cfg(test)]
 mod native_host_tests {
     use super::{
-        describe_host_install_error, install_native_host_binary, native_browser_family,
+        describe_host_install_error, install_native_host_binary, is_chrome_key_browser,
+        manifest_allowed_origins, merged_chrome_key_origins, native_browser_family,
         native_host_binary_name, native_host_content_hash, native_host_locked_message,
-        native_host_manifest, native_host_manifest_matches, validate_native_extension_id,
-        NativeBrowserFamily,
+        native_host_manifest, native_host_manifest_chromium, native_host_manifest_matches,
+        validate_native_extension_id, NativeBrowserFamily,
     };
     use std::path::Path;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -2994,6 +3122,95 @@ mod native_host_tests {
             NativeBrowserFamily::Chromium,
             "abcdefghijklmnopabcdefghijklmnop"
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chrome_key_browsers_share_the_chrome_key() {
+        assert!(is_chrome_key_browser("chrome"));
+        assert!(is_chrome_key_browser("opera"));
+        assert!(!is_chrome_key_browser("edge"));
+        assert!(!is_chrome_key_browser("brave"));
+        assert!(!is_chrome_key_browser("chromium"));
+        assert!(!is_chrome_key_browser("firefox"));
+    }
+
+    #[test]
+    fn chrome_key_merge_keeps_both_browsers_origins() {
+        // P0-4: Chrome and Opera share one Windows registry key, so the
+        // manifest behind it must allowlist both extension IDs — and
+        // re-registering one browser must never drop the other's.
+        let dir = std::env::temp_dir().join("thunderload-chrome-key-merge-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Pre-fix state: Chrome registered its own manifest, Opera its own.
+        let shared = dir.join("chrome-native-host.json");
+        let legacy_opera = dir.join("opera-native-host.json");
+        std::fs::write(
+            &shared,
+            serde_json::to_vec_pretty(&native_host_manifest_chromium(
+                &["chrome-extension://abcdefghijklmnopabcdefghijklmnop/".to_string()],
+                Path::new("C:\\host\\thunderload-host.exe"),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            &legacy_opera,
+            serde_json::to_vec_pretty(&native_host_manifest_chromium(
+                &["chrome-extension://ponmlkjihgfedcbaponmlkjihgfedcba/".to_string()],
+                Path::new("C:\\host\\thunderload-host.exe"),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        // Re-registering Chrome must keep Opera's origin, not drop it.
+        let merged =
+            merged_chrome_key_origins(&shared, &legacy_opera, "abcdefghijklmnopabcdefghijklmnop");
+        assert_eq!(
+            merged,
+            vec![
+                "chrome-extension://abcdefghijklmnopabcdefghijklmnop/".to_string(),
+                "chrome-extension://ponmlkjihgfedcbaponmlkjihgfedcba/".to_string(),
+            ]
+        );
+        // Registering Opera (whose ID lived only in the legacy file)
+        // must keep Chrome's origin too.
+        let merged =
+            merged_chrome_key_origins(&shared, &legacy_opera, "ponmlkjihgfedcbaponmlkjihgfedcba");
+        assert_eq!(merged.len(), 2);
+        // A manifest built from the merged origins authorises both IDs.
+        let host = dir.join("thunderload-host");
+        std::fs::write(&host, b"fake-host").unwrap();
+        let manifest_path = dir.join("merged-native-host.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&native_host_manifest_chromium(&merged, &host)).unwrap(),
+        )
+        .unwrap();
+        assert!(native_host_manifest_matches(
+            &manifest_path,
+            NativeBrowserFamily::Chromium,
+            "abcdefghijklmnopabcdefghijklmnop"
+        ));
+        assert!(native_host_manifest_matches(
+            &manifest_path,
+            NativeBrowserFamily::Chromium,
+            "ponmlkjihgfedcbaponmlkjihgfedcba"
+        ));
+        // Merging the merged manifest again is stable — the startup
+        // re-register writes the same origins, so it is a no-op.
+        let merged_again = merged_chrome_key_origins(
+            &manifest_path,
+            &legacy_opera,
+            "abcdefghijklmnopabcdefghijklmnop",
+        );
+        assert_eq!(merged_again, merged);
+        // A missing or corrupt manifest contributes no origins.
+        assert!(manifest_allowed_origins(&dir.join("does-not-exist.json")).is_empty());
+        let corrupt = dir.join("corrupt.json");
+        std::fs::write(&corrupt, b"{not json").unwrap();
+        assert!(manifest_allowed_origins(&corrupt).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

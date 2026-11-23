@@ -66,15 +66,53 @@ function Register-FirefoxHost([string]$ExtensionId) {
   Set-Item -Path $RegistryPath -Value $ManifestPath
   Write-Host "Firefox native host registered."
 }
-Register-ChromiumHost "chrome" $ChromeExtensionId "HKCU:\Software\Google\Chrome\NativeMessagingHosts\com.thunderload.host"
+# Chrome and Opera share ONE Windows registry key — Opera is
+# Chromium-based and reads Chrome's native-messaging key; there is no
+# working "Opera Software" key, so registering Opera under its own key
+# wrote a value no Opera build ever reads. Sharing the key means
+# sharing the one manifest behind it: before this fix Chrome and Opera
+# each wrote their own single-origin manifest and pointed the same key
+# at it in turn, so whichever registered last won and the desktop app's
+# startup re-register flipped the key on every launch. The shared
+# manifest below allowlists BOTH extension IDs (plus any origins a
+# previous run already recorded, so a run passed only one ID never
+# drops the other browser), and re-registering the same IDs writes
+# byte-identical content — the startup re-register is a no-op in effect.
+function Register-ChromeKeyHost([string]$ChromeId, [string]$OperaId) {
+  $Origins = @()
+  foreach ($Id in @($ChromeId, $OperaId)) {
+    if ([string]::IsNullOrWhiteSpace($Id)) { continue }
+    if ($Id -notmatch '^[a-p]{32}$') { throw "Chrome/Opera ID must be the exact 32-character store/unpacked extension ID." }
+    $Origins += "chrome-extension://$Id/"
+  }
+  if ($Origins.Count -eq 0) { return }
+  $ManifestPath = Join-Path $InstallDir "chrome-native-host.json"
+  # Keep origins a previous run recorded: the script may be run for one
+  # browser only, and that must not unregister the other. A missing or
+  # unparsable file simply contributes nothing.
+  foreach ($ExistingPath in @($ManifestPath, (Join-Path $InstallDir "opera-native-host.json"))) {
+    if (Test-Path -LiteralPath $ExistingPath) {
+      try {
+        $Existing = Get-Content -LiteralPath $ExistingPath -Raw | ConvertFrom-Json
+        foreach ($Origin in @($Existing.allowed_origins)) { if ($Origin) { $Origins += $Origin } }
+      } catch { }
+    }
+  }
+  $Origins = @($Origins | Sort-Object -Unique)
+  Write-Manifest @{ name="com.thunderload.host"; description="ThunderLoad local download engine"; path=$HostExe; type="stdio"; allowed_origins=$Origins } $ManifestPath
+  $RegistryPath = "HKCU:\Software\Google\Chrome\NativeMessagingHosts\com.thunderload.host"
+  New-Item -Path $RegistryPath -Force | Out-Null
+  Set-Item -Path $RegistryPath -Value $ManifestPath
+  Write-Host "Chrome/Opera native host registered."
+  # The pre-fix per-browser Opera manifest is merged into the shared
+  # file above and nothing points at it any more; remove it so it
+  # cannot be mistaken for a live registration.
+  $LegacyOperaManifest = Join-Path $InstallDir "opera-native-host.json"
+  if (Test-Path -LiteralPath $LegacyOperaManifest) { Remove-Item -LiteralPath $LegacyOperaManifest -Force }
+}
+Register-ChromeKeyHost $ChromeExtensionId $OperaExtensionId
 Register-ChromiumHost "edge" $EdgeExtensionId "HKCU:\Software\Microsoft\Edge\NativeMessagingHosts\com.thunderload.host"
 Register-ChromiumHost "brave" $BraveExtensionId "HKCU:\Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.thunderload.host"
-# Opera is Chromium-based and reads Chrome's native-messaging key —
-# there is no working "Opera Software" key, so registering Opera under
-# its own key wrote a value no Opera build ever reads. Opera shares
-# Chrome's key (and therefore Chrome's manifest slot: whichever of
-# Chrome/Opera registers last wins the key).
-Register-ChromiumHost "opera" $OperaExtensionId "HKCU:\Software\Google\Chrome\NativeMessagingHosts\com.thunderload.host"
 Register-ChromiumHost "vivaldi" $VivaldiExtensionId "HKCU:\Software\Vivaldi\NativeMessagingHosts\com.thunderload.host"
 if (-not [string]::IsNullOrWhiteSpace($FirefoxExtensionId)) { Register-FirefoxHost $FirefoxExtensionId }
 # Clean up a stale registration an older installer may have written
