@@ -59,14 +59,21 @@
 .col-status{position:relative;white-space:nowrap}
 .row-actions{display:none;position:absolute;right:8px;top:50%;transform:translateY(-50%);gap:5px;padding:4px 2px 4px 10px;border-radius:6px;background:#1a222d}
 .dl-row:hover .row-actions,.dl-row:focus-within .row-actions,.dl-row.selected .row-actions{display:flex}
+/* The actions pill sits on the row itself: it matches the hover row
+   (#1a222d) by default, but a selected row is #16241b, so the pill
+   needs the selected background or it reads as a mismatched block. */
+.dl-row.selected .row-actions{background:#16241b}
 
 .status{display:inline-flex;align-items:center;gap:5px;flex:0 0 auto;color:#9aa8b7;font-size:9px}.status i{width:5px;height:5px;border-radius:50%;background:#8493a3}.status-downloading{color:#7fd6a0}.status-downloading i{background:#30d158}.status-completed{color:#7fd6a0}.status-completed i{background:#30d158}.status-failed,.status-interrupted{color:#e39a91}.status-failed i,.status-interrupted i{background:#d77b71}.status-queued{color:#b1b8c2}.status-queued i{background:#a0a8b4}.status-paused{color:#b1b8c2}.status-paused i{background:#a0a8b4}.status-pausing,.status-cancelling{color:#b1b8c2}.status-pausing i,.status-cancelling i{background:#a0a8b4}.status-cancelled{color:#8290a1}.status-cancelled i{background:#647386}
 .progress{height:3px;margin-top:8px;overflow:hidden;border-radius:3px;background:#2b3744}.progress span{display:block;height:100%;border-radius:3px;background:#30d158;transition:width .2s}
 .remove-button{width:25px;height:25px;border:0;border-radius:5px;background:transparent;color:#8795a5;font-size:17px}.remove-button:hover{background:#2a333e;color:#e9eff6}.quiet-button:disabled{opacity:.4}.error-text{display:block;margin-top:6px;color:#e29a91;font-size:9px}.footnote{margin:15px 0 0;color:#788799;font-size:9px;line-height:1.5}
 .file-type{width:32px;height:32px;flex:0 0 32px;display:grid;place-items:center;border:1px solid #2c4a37;border-radius:7px;background:#16241b;color:#7fd6a0;font-size:15px}
 
-/* Direction A: right inspector (Motrix pattern). */
-.inspector{flex:0 0 320px;position:sticky;top:0;height:100vh;overflow-y:auto;border-left:1px solid #262e39;background:#11161d}
+/* Direction A: right inspector (Motrix pattern). Its height is the
+   viewport minus the 56px topbar above it and the 36px statusbar
+   below it: a bare 100vh starts below the topbar and overflows the
+   page by 92px, pushing the inspector's own bottom out of reach. */
+.inspector{flex:0 0 320px;position:sticky;top:0;height:calc(100vh - 56px - 36px);overflow-y:auto;border-left:1px solid #262e39;background:#11161d}
 .inspector-head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;padding:16px 16px 12px}
 .inspector-head>div{min-width:0}.inspector-head strong{display:block;overflow:hidden;color:#f1f4f8;font-size:12px;text-overflow:ellipsis;white-space:nowrap}.inspector-head .status{margin-top:7px}
 .inspector-tabs{display:flex;gap:2px;padding:0 12px;border-bottom:1px solid #262e39}
@@ -130,41 +137,3 @@
 .ffmpeg-row .field{height:34px;font-size:10px}
 .ffmpeg-row .secondary-button{height:34px;white-space:nowrap}
 @media(max-width:1100px){.ffmpeg-row{grid-template-columns:1fr}.ffmpeg-row>button{justify-self:start}}
-
-/* Compact window layout: retain the workspace instead of forcing horizontal scrolling. */
-@media(max-width:900px){
-  .app-shell{grid-template-columns:66px minmax(0,1fr)}
-  .sidebar{padding:18px 8px 12px;align-items:stretch}
-  .brand{justify-content:center;padding:2px 0 28px}
-  .brand-mark{flex:0 0 36px}
-  .brand>div:last-child,.nav-caption,.version{display:none}
-  .nav-item{justify-content:center;gap:0;padding:0;font-size:0}
-  .nav-item>span{width:auto;font-size:18px}
-  .nav-item em{position:absolute;margin-left:29px;margin-top:-22px;font-size:8px}
-  .engine-line{display:flex;justify-content:center;padding:12px 0;font-size:0}
-  .engine-line i{margin:0}
-  .topbar{padding:0 18px}
-  .page{padding:24px 18px}
-  .page-heading h1{font-size:23px}
-  .summary{grid-template-columns:repeat(2,minmax(0,1fr));row-gap:12px}
-  .summary>div:nth-child(3){border-left:0}
-  .panel{padding:16px}
-  .native-host-grid,.ffmpeg-row{grid-template-columns:1fr}
-  .native-host-grid>button,.ffmpeg-row>button{grid-column:auto;justify-self:start}
-  .content-row{flex-direction:column}
-  .inspector{flex:1 1 auto;width:100%;height:auto;position:static;border-left:0;border-top:1px solid #262e39}
-  .list-toolbar{flex-wrap:wrap}
-  .search-field{width:100%}
-}
-@media(max-width:780px){
-  .topbar{height:50px;font-size:8px}
-  .page{padding:20px 14px}
-  .page-heading{align-items:flex-start;gap:12px}
-  .page-heading h1{font-size:21px}
-  .page-heading p{font-size:10px;line-height:1.45}
-  .page-heading>.primary-button{flex:0 0 auto}
-  .panel{padding:14px}
-  .panel-heading{align-items:flex-start}
-  .schedule-row{grid-template-columns:1fr;gap:6px}
-  .statusbar{flex-wrap:wrap;height:auto;padding:8px 14px;gap:6px}
-}

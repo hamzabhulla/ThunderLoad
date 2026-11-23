@@ -6,10 +6,12 @@
 //   dist/extensions/ThunderLoad-Firefox.xpi   (byte-identical copy of the Firefox zip)
 // No .crx is produced on purpose: Chrome refuses to install a .crx from
 // outside the Web Store, so the developer-mode path is ZIP + Load unpacked.
+// Keep the two packagers in sync: same allowlist, same entry order, same
+// fixed 1980-01-01 timestamps, same icons/ directory entry, same
+// no-backslash verification after writing (see package-extensions.ps1).
 // Run: node scripts/package-extensions.mjs
-import { mkdir, mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { deflateRawSync } from "node:zlib";
-import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -132,21 +134,46 @@ async function collectAllowlisted(manifestFile) {
   return entries;
 }
 
-async function main() {
-  const stage = await mkdtemp(join(tmpdir(), "thunderload-"));
-  try {
-    await mkdir(outDir, { recursive: true });
-    const chromium = await collectAllowlisted("manifest.json");
-    const firefox = await collectAllowlisted("manifest.firefox.json");
-    await writeFile(join(outDir, "ThunderLoad-Chromium.zip"), buildZip(chromium));
-    const firefoxZip = buildZip(firefox);
-    await writeFile(join(outDir, "ThunderLoad-Firefox.zip"), firefoxZip);
-    // The .xpi is the Firefox package under its installable name.
-    await writeFile(join(outDir, "ThunderLoad-Firefox.xpi"), firefoxZip);
-    console.log("Extension packages written to " + outDir);
-  } finally {
-    await rm(stage, { recursive: true, force: true });
+// Verify what was written: no entry may contain a backslash, matching the
+// check New-ForwardSlashZip runs in package-extensions.ps1. Reads the
+// central directory (entry names live there) instead of trusting the
+// names this script wrote.
+async function verifyNoBackslashes(filePath) {
+  const buffer = await readFile(filePath);
+  // End of central directory: 22 bytes, no archive comment is written.
+  const eocd = buffer.length - 22;
+  if (buffer.readUInt32LE(eocd) !== 0x06054b50) {
+    throw new Error(`Cannot verify ${filePath}: end-of-central-directory record not found`);
   }
+  const count = buffer.readUInt16LE(eocd + 10);
+  let offset = buffer.readUInt32LE(eocd + 16);
+  for (let i = 0; i < count; i++) {
+    if (buffer.readUInt32LE(offset) !== 0x02014b50) {
+      throw new Error(`Cannot verify ${filePath}: central directory entry ${i} is malformed`);
+    }
+    const nameLength = buffer.readUInt16LE(offset + 28);
+    const extraLength = buffer.readUInt16LE(offset + 30);
+    const commentLength = buffer.readUInt16LE(offset + 32);
+    const name = buffer.toString("utf8", offset + 46, offset + 46 + nameLength);
+    if (name.includes("\\")) {
+      throw new Error(`Archive contains a backslash entry name: ${name}`);
+    }
+    offset += 46 + nameLength + extraLength + commentLength;
+  }
+}
+
+async function main() {
+  await mkdir(outDir, { recursive: true });
+  const chromium = await collectAllowlisted("manifest.json");
+  const firefox = await collectAllowlisted("manifest.firefox.json");
+  await writeFile(join(outDir, "ThunderLoad-Chromium.zip"), buildZip(chromium));
+  const firefoxZip = buildZip(firefox);
+  await writeFile(join(outDir, "ThunderLoad-Firefox.zip"), firefoxZip);
+  // The .xpi is the Firefox package under its installable name.
+  await writeFile(join(outDir, "ThunderLoad-Firefox.xpi"), firefoxZip);
+  await verifyNoBackslashes(join(outDir, "ThunderLoad-Chromium.zip"));
+  await verifyNoBackslashes(join(outDir, "ThunderLoad-Firefox.zip"));
+  console.log("Extension packages written to " + outDir);
 }
 
 main().catch((error) => {
