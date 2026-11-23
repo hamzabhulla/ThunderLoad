@@ -1,5 +1,7 @@
 # ThunderLoad 0.3.5 — Cross-platform desktop + browser extension
 
+The release version's single source is `Cargo.toml` `[workspace.package]` — the desktop `package.json`, `tauri.conf.json`, extension manifests and UI version strings track it (those JSON files cannot carry a comment saying so).
+
 **Status: release candidate / not production-ready yet.** This repository contains packaging pipelines, but the tagged builds must pass CI on Windows, Linux and macOS and be tested on real machines/browsers before general release. Store approval is decided by each browser vendor.
 
 ## Current source features
@@ -64,7 +66,7 @@ Run `scripts/package-extensions.ps1` in PowerShell 7+ (Windows PowerShell 5.1 ca
 
 No `.crx` is produced: Chrome refuses to install a `.crx` from outside the Web Store, so the developer-mode path is ZIP + Load unpacked.
 
-Developer-mode install (no store listing needed): in desktop ThunderLoad, open **Settings → Browser extension files** and download the package for your browser. Chromium (Chrome/Edge/Brave/Opera): extract the ZIP, open `chrome://extensions` (`edge://extensions`, `brave://extensions`, `opera://extensions`), turn Developer mode on, click **Load unpacked** and select the extracted folder. Firefox: open `about:addons`, click the gear icon, choose **Install Add-on From File** and select the `.xpi`.
+Developer-mode install (no store listing needed): in desktop ThunderLoad, open **Settings → Browser extension files** and download the package for your browser. Chromium (Chrome/Edge/Brave/Opera/Vivaldi): extract the ZIP, open `chrome://extensions` (`edge://extensions`, `brave://extensions`, `opera://extensions`, `vivaldi://extensions`), turn Developer mode on, click **Load unpacked** and select the extracted folder. Firefox: open `about:addons`, click the gear icon, choose **Install Add-on From File** and select the `.xpi`.
 
 Firefox release/beta requires Mozilla signing. Chrome Web Store and Edge Add-ons each have their own listing and review process.
 
@@ -72,7 +74,7 @@ Firefox release/beta requires Mozilla signing. Chrome Web Store and Edge Add-ons
 
 Direct file links are intercepted and handed to the desktop engine; the browser downloads API is only the last-resort fallback when the engine is unreachable (or from the link context menu), and the path for single-file subtitle tracks, which do not need a companion connection. HLS and DASH inspection/download use the local native host. DASH qualities with separate audio/video tracks require FFmpeg; the desktop Settings path is persisted locally and read by the native companion on every platform.
 
-Install desktop ThunderLoad (Windows NSIS setup, Linux `.deb`/AppImage, or macOS `.dmg`), install the browser extension, then open **Settings → Browser connection**. Choose Chrome, Chromium, Edge, Brave or Firefox, paste the exact extension ID and select **Connect browser**. Restart the browser and grant Native messaging in the extension popup when prompted. On Linux the browser manifest is written to the browser's `NativeMessagingHosts` directory under `~/.config` (Firefox: `~/.mozilla/native-messaging-hosts`); on macOS under `~/Library/Application Support`.
+Install desktop ThunderLoad (Windows NSIS setup, Linux `.deb`/AppImage, or macOS `.dmg`), install the browser extension, then open **Settings → Browser connection**. Choose Chrome, Edge, Brave, Opera, Vivaldi or Firefox, paste the exact extension ID and select **Connect browser**. Restart the browser and grant Native messaging in the extension popup when prompted. On Linux the browser manifest is written to the browser's `NativeMessagingHosts` directory under `~/.config` (Firefox: `~/.mozilla/native-messaging-hosts`); on macOS under `~/Library/Application Support`.
 
 The extension ID is required because the browser native-messaging allowlist must be restricted to the exact installed extension. Firefox's packaged ID is `thunderload@example.com`. Chromium IDs are shown on the browser's extensions developer page and contain 32 characters from `a` through `p`.
 

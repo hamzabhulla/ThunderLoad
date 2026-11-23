@@ -1253,11 +1253,17 @@ fn native_browser_family(browser: &str) -> Option<NativeBrowserFamily> {
         // Slice 7c (Gemini claim 11): Opera is a Chromium browser —
         // the extension ZIP is Chromium-compatible and the install
         // script already registers its native-messaging key — so it
-        // maps to the Chromium family. On Windows it shares Chrome's
-        // registry key and manifest (see `windows_native_registry_path`
-        // and `register_native_host`); on Linux/macOS it keeps its own
-        // manifest dir below.
-        "chrome" | "chromium" | "edge" | "brave" | "opera" => Some(NativeBrowserFamily::Chromium),
+        // maps to the Chromium family, instead of being rejected here.
+        // P1-15: Vivaldi likewise — the Chromium ZIP runs in Vivaldi
+        // and register-native-host.ps1 already registers its own
+        // Vivaldi key, so the desktop app registers it too instead of
+        // offering it nowhere. Opera, on Windows, shares Chrome's
+      // registry key and manifest (see `windows_native_registry_path`
+      // and `register_native_host`); on Linux/macOS it keeps its own
+      // manifest dir below.
+        "chrome" | "chromium" | "edge" | "brave" | "opera" | "vivaldi" => {
+            Some(NativeBrowserFamily::Chromium)
+        }
         "firefox" => Some(NativeBrowserFamily::Firefox),
         _ => None,
     }
@@ -1438,6 +1444,7 @@ fn native_manifest_dir(browser: &str, home: &Path) -> Option<PathBuf> {
         "edge" => home.join(".config/microsoft-edge/NativeMessagingHosts"),
         "brave" => home.join(".config/BraveSoftware/Brave-Browser/NativeMessagingHosts"),
         "opera" => home.join(".config/opera/NativeMessagingHosts"),
+        "vivaldi" => home.join(".config/vivaldi/NativeMessagingHosts"),
         "firefox" => home.join(".mozilla/native-messaging-hosts"),
         _ => return None,
     };
@@ -1454,6 +1461,7 @@ fn native_manifest_dir(browser: &str, home: &Path) -> Option<PathBuf> {
         "edge" => support.join("Microsoft Edge/NativeMessagingHosts"),
         "brave" => support.join("BraveSoftware/Brave-Browser/NativeMessagingHosts"),
         "opera" => support.join("com.operasoftware.Opera/NativeMessagingHosts"),
+        "vivaldi" => support.join("Vivaldi/NativeMessagingHosts"),
         "firefox" => support.join("Mozilla/NativeMessagingHosts"),
         _ => return None,
     };
@@ -1479,6 +1487,10 @@ fn windows_native_registry_path(browser: &str) -> Option<&'static str> {
         // allowlists BOTH browsers' extension IDs, so registering one
         // no longer overwrites the other's registration.
         "opera" => Some(r"HKCU\Software\Google\Chrome\NativeMessagingHosts\com.thunderload.host"),
+        // P1-15: Vivaldi has its own key (same one the install script
+        // registers and the uninstaller removes), so unlike Opera it
+        // never collides with Chrome's slot.
+        "vivaldi" => Some(r"HKCU\Software\Vivaldi\NativeMessagingHosts\com.thunderload.host"),
         "firefox" => Some(r"HKCU\Software\Mozilla\NativeMessagingHosts\com.thunderload.host"),
         _ => None,
     }
@@ -1560,6 +1572,7 @@ fn native_browser_display_name(browser: &str) -> &str {
         "edge" => "Microsoft Edge",
         "brave" => "Brave",
         "opera" => "Opera",
+        "vivaldi" => "Vivaldi",
         "firefox" => "Firefox",
         _ => browser,
     }
@@ -1647,10 +1660,10 @@ async fn register_native_host(
     #[cfg(target_os = "windows")]
     {
         let family = native_browser_family(&browser)
-            .ok_or_else(|| "Choose Chrome, Edge, Brave or Firefox.".to_string())?;
+            .ok_or_else(|| "Choose Chrome, Edge, Brave, Opera, Vivaldi or Firefox.".to_string())?;
         validate_native_extension_id(family, extension_id)?;
         let registry_path = windows_native_registry_path(&browser)
-            .ok_or_else(|| "Choose Chrome, Edge, Brave or Firefox.".to_string())?;
+            .ok_or_else(|| "Choose Chrome, Edge, Brave, Opera, Vivaldi or Firefox.".to_string())?;
         let resource_dir = app.path().resource_dir().map_err(|error| error.to_string())?;
         let source = resource_dir.join("native-host").join("thunderload-host.exe");
         if !source.is_file() {
@@ -1704,11 +1717,11 @@ async fn register_native_host(
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let family = native_browser_family(&browser)
-            .ok_or_else(|| "Choose Chrome, Chromium, Edge, Brave or Firefox.".to_string())?;
+            .ok_or_else(|| "Choose Chrome, Edge, Brave, Opera, Vivaldi or Firefox.".to_string())?;
         validate_native_extension_id(family, extension_id)?;
         let home = home_dir()?;
         let manifest_dir = native_manifest_dir(&browser, &home)
-            .ok_or_else(|| "Choose Chrome, Chromium, Edge, Brave or Firefox.".to_string())?;
+            .ok_or_else(|| "Choose Chrome, Edge, Brave, Opera, Vivaldi or Firefox.".to_string())?;
         // The bundled resource keeps the Windows file name
         // (thunderload-host.exe): on Linux/macOS the build copies the
         // platform binary to that resource name, and registration installs
@@ -1764,10 +1777,10 @@ async fn check_native_host(browser: String, extension_id: String) -> Result<bool
     #[cfg(target_os = "windows")]
     {
         let family = native_browser_family(&browser)
-            .ok_or_else(|| "Choose Chrome, Edge, Brave or Firefox.".to_string())?;
+            .ok_or_else(|| "Choose Chrome, Edge, Brave, Opera, Vivaldi or Firefox.".to_string())?;
         validate_native_extension_id(family, extension_id)?;
         let registry_path = windows_native_registry_path(&browser)
-            .ok_or_else(|| "Choose Chrome, Edge, Brave or Firefox.".to_string())?;
+            .ok_or_else(|| "Choose Chrome, Edge, Brave, Opera, Vivaldi or Firefox.".to_string())?;
         let local_app_data = std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
             .ok_or_else(|| "LOCALAPPDATA is not available.".to_string())?;
@@ -1800,11 +1813,11 @@ async fn check_native_host(browser: String, extension_id: String) -> Result<bool
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let family = native_browser_family(&browser)
-            .ok_or_else(|| "Choose Chrome, Chromium, Edge, Brave or Firefox.".to_string())?;
+            .ok_or_else(|| "Choose Chrome, Edge, Brave, Opera, Vivaldi or Firefox.".to_string())?;
         validate_native_extension_id(family, extension_id)?;
         let home = home_dir()?;
         let manifest_dir = native_manifest_dir(&browser, &home)
-            .ok_or_else(|| "Choose Chrome, Chromium, Edge, Brave or Firefox.".to_string())?;
+            .ok_or_else(|| "Choose Chrome, Edge, Brave, Opera, Vivaldi or Firefox.".to_string())?;
         Ok(native_host_manifest_matches(
             &manifest_dir.join("com.thunderload.host.json"),
             family,
@@ -1831,8 +1844,10 @@ async fn save_extension_file(
     let browser = browser.trim().to_ascii_lowercase();
     let resource = match browser.as_str() {
         "firefox" => "extensions/ThunderLoad-Firefox.xpi",
-        "chromium" | "chrome" | "edge" | "brave" | "opera" => "extensions/ThunderLoad-Chromium.zip",
-        _ => return Err("Choose Chrome, Edge, Brave, Opera or Firefox.".into()),
+        "chromium" | "chrome" | "edge" | "brave" | "opera" | "vivaldi" => {
+            "extensions/ThunderLoad-Chromium.zip"
+        }
+        _ => return Err("Choose Chrome, Edge, Brave, Opera, Vivaldi or Firefox.".into()),
     };
     let source = app.path().resource_dir().map_err(|error| error.to_string())?.join(resource);
     if !source.is_file() {
@@ -2991,6 +3006,12 @@ mod native_host_tests {
             native_browser_family("opera"),
             Some(NativeBrowserFamily::Chromium)
         );
+        // P1-15: Vivaldi is Chromium too — same ZIP, same manifest
+        // format, its own registry key / manifest dir below.
+        assert_eq!(
+            native_browser_family("vivaldi"),
+            Some(NativeBrowserFamily::Chromium)
+        );
         assert_eq!(native_browser_family(""), None);
     }
 
@@ -3377,6 +3398,10 @@ mod native_host_tests {
             PathBuf::from("/home/u/.config/opera/NativeMessagingHosts")
         );
         assert_eq!(
+            native_manifest_dir("vivaldi", home).unwrap(),
+            PathBuf::from("/home/u/.config/vivaldi/NativeMessagingHosts")
+        );
+        assert_eq!(
             native_manifest_dir("firefox", home).unwrap(),
             PathBuf::from("/home/u/.mozilla/native-messaging-hosts")
         );
@@ -3401,6 +3426,10 @@ mod native_host_tests {
         assert_eq!(
             native_manifest_dir("opera", home).unwrap(),
             PathBuf::from("/Users/u/Library/Application Support/com.operasoftware.Opera/NativeMessagingHosts")
+        );
+        assert_eq!(
+            native_manifest_dir("vivaldi", home).unwrap(),
+            PathBuf::from("/Users/u/Library/Application Support/Vivaldi/NativeMessagingHosts")
         );
         assert_eq!(native_manifest_dir("safari", home), None);
     }

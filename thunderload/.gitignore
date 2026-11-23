@@ -6,3 +6,7 @@ target/
 .DS_Store
 *.part
 .thunderload-*/
+# Local-only lockfiles, never committed: a careless `git add -A`
+# must not sweep in a regenerated lockfile.
+Cargo.lock
+desktop/package-lock.json
