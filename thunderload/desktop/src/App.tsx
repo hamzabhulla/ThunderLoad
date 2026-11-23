@@ -12,7 +12,11 @@ type SubtitleVariant = { language: string; name?: string; url: string; format: s
 type Variant = { kind: string; quality: string; width?: number; height?: number; bandwidth?: number; url: string; downloadable: boolean; note?: string; representationId?: string; audioRepresentationId?: string; audioOnly?: boolean; isLive?: boolean; fps?: number; subtitles?: SubtitleVariant[] };
 type GrabItem = { url: string; kind: string; name: string };
 type GrabResult = { items: GrabItem[]; truncated: boolean };
-type Progress = { downloaded: number; total?: number; percent?: number; phase: string; segments_done?: number; segments_total?: number };
+// P1-10: no `phase` field — the backend emits one, but it only
+// duplicates the row status and the download-complete /
+// download-paused events this handler already uses, so nothing
+// reads it. (It was declared and never read.)
+type Progress = { downloaded: number; total?: number; percent?: number; segments_done?: number; segments_total?: number };
 type Item = { id: string; name: string; url: string; kind: Kind; status: Status; percent: number; downloaded: number; total?: number; detail: string; error?: string; createdAt: number; targetPath?: string; scheduledAt?: number; source?: "native"; representationId?: string; audioRepresentationId?: string; segmentsDone?: number; segmentsTotal?: number; live?: boolean; connections?: number };
 type StoredJob = { id: string; name: string; url: string; kind: string; origin: string; state: string; downloaded: number; total?: number; percent?: number; segmentsDone?: number; segmentsTotal?: number; targetPath?: string; checkpointPath?: string; representationId?: string; audioRepresentationId?: string; scheduledAtMs?: number; detail: string; error?: string; createdAtMs: number; updatedAtMs: number; live?: boolean };
 
@@ -25,6 +29,7 @@ const PARALLEL_KEY = "thunderload.parallel.v1";
 const SPEED_LIMIT_KEY = "thunderload.speed-limit.v1";
 const NATIVE_IDS_KEY = "thunderload.native-extension-ids.v1";
 const CLIPBOARD_WATCH_KEY = "thunderload.clipboard-watch.v1";
+const NATIVE_BANNER_DISMISSED_KEY = "thunderload.native-banner-dismissed.v1";
 
 // Extension IDs the user entered once in Settings → Browser connection,
 // one per browser. The startup check re-registers from these, so the
@@ -109,7 +114,12 @@ function readItems(): Item[] {
           ? item.targetPath
             ? { ...item, status: "Queued", detail: "Recovering saved partial download…" }
             : { ...item, status: "Interrupted", detail: "App closed before a resumable checkpoint was created" }
-          : item));
+          : item))
+      // P1 slice 1 audit follow-up: rows saved before the P1 #10 fix
+      // carried a NaN percent in memory, which JSON stores as null —
+      // without this guard the table renders "null%". A null or
+      // non-finite stored percent comes back as 0.
+      .map((item) => ({ ...item, percent: Number.isFinite(item.percent) ? Math.max(0, Math.min(100, item.percent)) : 0 }));
   } catch { return []; }
 }
 function readSetting(key: string, fallback: number, allowed: number[]): number {
@@ -155,8 +165,13 @@ function storedJobToItem(row: StoredJob): Item {
       detail = "App closed before a resumable checkpoint was created";
     }
   }
-  const percent = row.percent !== undefined
-    ? Math.max(0, Math.min(100, row.percent))
+  // Same guard as readItems (P1 slice 1 audit follow-up): a NaN
+  // percent saved before the P1 #10 fix round-trips through JSON as
+  // null — treat a null/non-finite stored percent as unknown and fall
+  // back to the downloaded/total ratio, or 0.
+  const storedPercent = row.percent;
+  const percent = typeof storedPercent === "number" && Number.isFinite(storedPercent)
+    ? Math.max(0, Math.min(100, storedPercent))
     : row.total ? Math.max(0, Math.min(100, Math.round(row.downloaded / row.total * 100))) : 0;
   return {
     id: row.id, name: row.name || nameFromUrl(row.url), url: row.url, kind, status, percent,
@@ -274,6 +289,11 @@ export default function App() {
   const [grabbing, setGrabbing] = useState(false);
   const [addingUrl, setAddingUrl] = useState(false);
   const [downloadingGrabbed, setDownloadingGrabbed] = useState(false);
+  // P1-21: the Video Grabber variant Download button in flight
+  // (variant key) — the button shows its own busy state and the
+  // add() result lands in the modal's videoNotice, not only in the
+  // global notice behind the dialog.
+  const [grabberVariantBusy, setGrabberVariantBusy] = useState<string | null>(null);
   const [grabNotice, setGrabNotice] = useState("");
   const [grabScheduleAt, setGrabScheduleAt] = useState("");
   const [connections, setConnections] = useState(() => readSetting(CONNECTIONS_KEY, 8, [1, 2, 4, 8, 16]));
@@ -286,9 +306,17 @@ export default function App() {
   const [nativeSettingUp, setNativeSettingUp] = useState(false);
   // Non-blocking startup prompt: "missing-id" when no extension ID was
   // ever saved, "register-failed" when a saved ID could not be
-  // re-registered. Dismissal lasts for this app session only.
+  // re-registered. Dismissal is persisted per kind (see
+  // dismissedBannerKind below), so it survives a restart.
   const [nativeBanner, setNativeBanner] = useState<"missing-id" | "register-failed" | null>(null);
-  const [nativeBannerDismissed, setNativeBannerDismissed] = useState(false);
+  // P1-23: a dismissed banner stays dismissed across restarts — the
+  // dismissed kind is persisted in localStorage, like the other UI
+  // prefs in this file. Stored per kind, so dismissing "missing-id"
+  // never silences a later "register-failed" (or vice versa); a
+  // successful registration clears it (see registerNativeHost).
+  const [dismissedBannerKind, setDismissedBannerKind] = useState(() => {
+    try { return localStorage.getItem(NATIVE_BANNER_DISMISSED_KEY) || ""; } catch { return ""; }
+  });
   const [extensionFileStatus, setExtensionFileStatus] = useState("");
   // Slice 6: clipboard watcher + LinkGrabber. Off by default — the
   // user turns it on in Settings. The seen set lives in a ref so a
@@ -483,6 +511,9 @@ export default function App() {
   useEffect(() => { localStorage.setItem(CONNECTIONS_KEY, String(connections)); }, [connections]);
   useEffect(() => { localStorage.setItem(PARALLEL_KEY, String(parallel)); }, [parallel]);
   useEffect(() => { localStorage.setItem(CLIPBOARD_WATCH_KEY, clipboardWatch ? "1" : "0"); }, [clipboardWatch]);
+  useEffect(() => {
+    try { localStorage.setItem(NATIVE_BANNER_DISMISSED_KEY, dismissedBannerKind); } catch { /* dismissal is best-effort */ }
+  }, [dismissedBannerKind]);
   // H1 (P0-14c): the Tauri clipboard-manager plugin, not the webview's
   // navigator.clipboard — polling the web clipboard every 2 s with
   // only a focus guard is what the audit flagged. The plugin read is
@@ -509,6 +540,10 @@ export default function App() {
       }
       if (fresh.length) {
         setGrabbedLinks((current) => [...current, ...fresh.filter((url) => !current.includes(url))]);
+        // P1-11: a notice from the last visit ("That link could not
+        // be queued") must not still be showing when the dialog
+        // reopens — nothing about it was cleared on close.
+        setLinkGrabberNotice("");
         setLinkGrabberOpen(true);
       }
     }, 2000);
@@ -522,8 +557,15 @@ export default function App() {
   // starts use the separate 15 s schedule tick (see the dispatcher),
   // so the dispatcher and the schedule input's minimum do not re-run
   // every second.
+  // P1-22: a stale rate only ever shows on a Downloading row
+  // (jobSpeed returns early otherwise), so when nothing is
+  // downloading the tick has nothing to update — skip the setClock
+  // instead of re-rendering the whole app every second while idle.
+  // While any transfer runs, the tick behaves exactly as before.
   useEffect(() => {
-    const timer = window.setInterval(() => setClock(Date.now()), 1000);
+    const timer = window.setInterval(() => {
+      if (itemsRef.current.some((item) => item.status === "Downloading")) setClock(Date.now());
+    }, 1000);
     const scheduleTimer = window.setInterval(() => setScheduleTick(Date.now()), 15000);
     return () => { window.clearInterval(timer); window.clearInterval(scheduleTimer); };
   }, []);
@@ -619,15 +661,24 @@ export default function App() {
   // silently when it went missing (browser reset, registry cleaner,
   // moved install). When no ID was ever saved, show a prominent
   // non-blocking banner instead — never a modal, never a silent no-op.
+  // P0-4: Chrome and Opera share one Windows registry key and one
+  // manifest behind it whose allowed_origins merges both IDs, so
+  // re-registering either browser merges the other's ID instead of
+  // flipping the key. Check Chrome first so the shared manifest is
+  // seeded from Chrome deterministically, whatever order the IDs were
+  // saved in; Opera's check then sees the merged manifest and stays a
+  // no-op, and a second launch registers nothing at all.
   const nativeCheckedRef = useRef(false);
   useEffect(() => {
     if (nativeCheckedRef.current) return;
     nativeCheckedRef.current = true;
     const entries = Object.entries(readNativeIds());
     if (!entries.length) { setNativeBanner("missing-id"); return; }
+    const chromeKeyRank = (browser: string) => (browser === "chrome" ? 0 : browser === "opera" ? 1 : 2);
+    const ordered = [...entries].sort((a, b) => chromeKeyRank(a[0]) - chromeKeyRank(b[0]));
     void (async () => {
       let failed = false;
-      for (const [browser, extensionId] of entries) {
+      for (const [browser, extensionId] of ordered) {
         try {
           const registered = await invoke<boolean>("check_native_host", { browser, extensionId });
           if (registered) continue;
@@ -745,22 +796,35 @@ export default function App() {
           // same way. Segment counts ride the same event and are kept
           // when the transfer reports them.
           recordSpeedSample(speedSamples.current, payload.jobId, payload.progress.downloaded, Date.now());
-          setItems((current) => current.map((item) => item.id !== payload.jobId ? item : {
-            ...item,
-            downloaded: payload.progress.downloaded,
-            total: payload.progress.total,
-            percent: Math.max(0, Math.min(100, payload.progress.percent ?? item.percent)),
-            segmentsDone: payload.progress.segments_done ?? item.segmentsDone,
-            segmentsTotal: payload.progress.segments_total ?? item.segmentsTotal,
-            // M2: a progress event must not overwrite the detail of a
-            // Pausing/Cancelling row or a terminal row (e.g. a late
-            // event arriving after the user paused) — the status is
-            // never overwritten here, and neither is its detail.
-            detail: ["Pausing", "Cancelling", "Paused", "Completed", "Failed", "Interrupted", "Cancelled"].includes(item.status)
-              ? item.detail
-              : item.kind === "hls"
-                ? "Downloading media segments · " + Math.round(payload.progress.percent ?? 0) + "%"
-                : bytes(payload.progress.downloaded) + (payload.progress.total ? " of " + bytes(payload.progress.total) : " downloaded")
+          setItems((current) => current.map((item) => {
+            if (item.id !== payload.jobId) return item;
+            // P1-10: a tick may omit total, and may carry a non-finite
+            // percent (NaN from a 0/0 division upstream) — keep the
+            // row's total and percent in those cases, and store the
+            // percent rounded, so the table and inspector never render
+            // 37.4829…% or NaN%.
+            const total = payload.progress.total ?? item.total;
+            const incoming = payload.progress.percent;
+            const percent = typeof incoming === "number" && Number.isFinite(incoming)
+              ? Math.round(Math.max(0, Math.min(100, incoming)))
+              : item.percent;
+            return {
+              ...item,
+              downloaded: payload.progress.downloaded,
+              total,
+              percent,
+              segmentsDone: payload.progress.segments_done ?? item.segmentsDone,
+              segmentsTotal: payload.progress.segments_total ?? item.segmentsTotal,
+              // M2: a progress event must not overwrite the detail of a
+              // Pausing/Cancelling row or a terminal row (e.g. a late
+              // event arriving after the user paused) — the status is
+              // never overwritten here, and neither is its detail.
+              detail: ["Pausing", "Cancelling", "Paused", "Completed", "Failed", "Interrupted", "Cancelled"].includes(item.status)
+                ? item.detail
+                : item.kind === "hls"
+                  ? "Downloading media segments · " + percent + "%"
+                  : bytes(payload.progress.downloaded) + (total ? " of " + bytes(total) : " downloaded")
+            };
           }));
         }),
         listen<{ jobId: string; path: string }>("download-complete", ({ payload }) => {
@@ -920,9 +984,11 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     });
   }, [items, parallel, connections, scheduleTick, seeded]);
 
-  // Returns true when a job was queued, false when nothing was queued
-  // (invalid URL, past schedule, yt-dlp page routed to the grabber,
-  // webpage verdict) — downloadGrabbed counts on this.
+  // Returns true when a job was queued OR the request was handed to
+  // the Video Grabber for the user to pick a format, false when
+  // nothing was queued or opened (invalid URL, past schedule,
+  // webpage verdict, live DASH) — downloadGrabbed and the
+  // LinkGrabber count on this.
   async function add(value: string, saveAs?: string, requestedKind?: Kind, representationId?: string, audioRepresentationId?: string, live?: boolean, scheduledFor?: string, clearForm = false): Promise<boolean> {
     const clean = value.trim();
     if (!/^https?:\/\//i.test(clean)) { setNotice("Enter a valid HTTP or HTTPS URL."); return false; }
@@ -941,11 +1007,18 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     }
     let resolvedRepId = representationId;
     let resolvedAudioRepId = audioRepresentationId;
+    // P1-9: the paste path derives live from the inspected variants
+    // below (a live playlist has no URL-suffix tell); callers that
+    // pass live already classified it.
+    let resolvedLive = live;
     const openInVideoGrabber = (ytdlp: boolean) => {
       setVideoUrl(clean);
       setAddOpen(false);
       setScheduleAt("");
       setLinkGrabberOpen(false);
+      // P1-11: the LinkGrabber notice must not outlive the dialog it
+      // was shown in — it resurfaces stale on the next reopen.
+      setLinkGrabberNotice("");
       setGrabbedLinks((current) => current.filter((entry) => entry !== clean && entry.trim() !== clean));
       setGrabberOpen(true);
       if (ytdlp) void inspectYtDlp(clean);
@@ -966,7 +1039,10 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     if (!requestedKind) {
       if (isYtDlpPageUrl(clean)) {
         openInVideoGrabber(true);
-        return false;
+        // P1-11: the grabber opened — the request was handled, not
+        // failed. Returning false here made the LinkGrabber show
+        // "That link could not be queued" for a YouTube URL.
+        return true;
       }
       setNotice("Checking link…");
       try {
@@ -974,6 +1050,28 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
         // accept a same-origin referer, and the desktop has no better
         // one (Slice 5). The engine validates it before use.
         const inspected = await invoke<Variant[]>("inspect_video_url", { url: clean, referer: clean });
+        // P1-9: kind + live come from the inspected variants, not the
+        // URL suffix. An extensionless HLS/DASH URL has no suffix to
+        // read (it used to queue as "direct" and download raw
+        // playlist text), and a live playlist looks identical to a
+        // VOD one until its media playlist is read (no ENDLIST) — it
+        // used to queue as VOD and fail at start, because the engine
+        // rejects live playlists on the VOD path. inspect_video_url
+        // classifies by suffix first, then by Content-Type, so its
+        // kind is the engine's own verdict; isLive rides on the
+        // variants (HLS without ENDLIST, dynamic DASH).
+        const inspectedKind = inspected[0]?.kind;
+        if (inspectedKind === "hls" || inspectedKind === "dash" || inspectedKind === "direct") kind = inspectedKind;
+        const inspectedLive = inspected.some((variant) => variant.isLive === true);
+        if (kind === "dash" && inspectedLive) {
+          // The engine has no live DASH recorder (dynamic MPDs are
+          // refused at start), and a dash row never carries the live
+          // flag — refuse honestly instead of queueing a VOD job
+          // that fails at start.
+          setNotice("This is a live DASH stream, which ThunderLoad can't record yet.");
+          return false;
+        }
+        if (kind === "hls" && inspectedLive) resolvedLive = true;
         if (kind === "dash" && !resolvedRepId) {
           const best = inspected.find((variant) => variant.downloadable && variant.representationId);
           if (best?.representationId) {
@@ -983,7 +1081,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
             }
           } else {
             openInVideoGrabber(false);
-            return false;
+            return true;
           }
         }
       } catch (error) {
@@ -993,13 +1091,13 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
         }
         if (kind === "dash" && !resolvedRepId) {
           openInVideoGrabber(false);
-          return false;
+          return true;
         }
       }
     }
     if (kind === "dash" && !resolvedRepId) {
       openInVideoGrabber(false);
-      return false;
+      return true;
     }
     const suggested = nameFromUrl(clean);
     const item: Item = {
@@ -1010,7 +1108,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       // routes it to the live recorder; yt-dlp live and DASH live
       // never take this path (yt-dlp handles its own, DASH live is
       // refused by the engine).
-      live: live === true && kind === "hls" ? true : undefined,
+      live: resolvedLive === true && kind === "hls" ? true : undefined,
       detail: scheduledAt ? "Scheduled for " + new Date(scheduledAt).toLocaleString() : "Waiting in queue",
       createdAt: Date.now(),
       scheduledAt
@@ -1112,6 +1210,10 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           detail: "Recovering browser checkpoint in desktop engine", error: undefined
         };
         setItems((current) => [recovered, ...current.filter((entry) => entry.id !== item.id && entry.id !== bareId)]);
+        // P1-26: the handover renames the row (native-<id> -> <id>),
+        // so a selection pointing at the old id would find nothing
+        // and the inspector would close — carry it to the new id.
+        setSelectedId((current) => current === item.id ? bareId : current);
         void invoke("sync_jobs", { jobs: [itemToSyncJob(recovered)] }).catch(() => {});
         setNotice("Browser checkpoint moved to the desktop queue.");
         return;
@@ -1439,6 +1541,42 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       downloadingSubtitles.current.delete(subtitle.url);
     }
   }
+  // P1-21 + P1-24: one Video Grabber variant's Download button. The
+  // add() result is awaited and surfaced in the modal: success shows
+  // confirmation, failure shows the error — never a success for an
+  // add() that returned false. The filename comes from the variant
+  // itself: a direct file keeps its real name from the URL (a .zip
+  // or .pdf is saved under its own name, not video.mp4); HLS/DASH
+  // pass a bare stem — the backend probes the real container
+  // extension and appends it on disk — audio-only variants use the
+  // "audio" stem; yt-dlp keeps title + ".mp4" because the backend
+  // strips the extension and substitutes the real one
+  // ({stem}.%(ext)s), and a bare title would truncate dotted titles
+  // via Path::with_extension("").
+  async function downloadVariant(variant: Variant, key: string) {
+    if (grabberVariantBusy !== null) return;
+    setGrabberVariantBusy(key);
+    setVideoNotice("");
+    try {
+      const kind: Kind = variant.kind === "hls" ? "hls" : variant.kind === "dash" ? "dash" : variant.kind === "ytdlp" ? "ytdlp" : "direct";
+      const filename = kind === "direct"
+        ? nameFromUrl(variant.url)
+        : kind === "ytdlp"
+          ? (videoTitle ? videoTitle + ".mp4" : variant.audioOnly ? "audio.mp4" : "video.mp4")
+          : variant.audioOnly ? "audio" : "video";
+      const queued = await add(
+        kind === "dash" || kind === "hls" || kind === "ytdlp" ? (inspectedUrl || videoUrl) : variant.url,
+        filename, kind,
+        kind === "hls" ? variant.url : variant.representationId,
+        variant.audioRepresentationId, variant.isLive
+      );
+      setVideoNotice(queued ? "Added to queue." : "That link could not be queued.");
+    } catch (error) {
+      setVideoNotice(String(error));
+    } finally {
+      setGrabberVariantBusy(null);
+    }
+  }
   async function downloadGrabbed() {
     if (downloadingGrabbed) return;
     const chosen = grabbed.filter((item) => grabChecked[item.url]);
@@ -1522,6 +1660,9 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       ids[nativeBrowser] = extensionId;
       localStorage.setItem(NATIVE_IDS_KEY, JSON.stringify(ids));
       setNativeBanner(null);
+      // P1-23: the connection is fixed — a dismissal stored for the
+      // old banner must not hide a future one.
+      setDismissedBannerKind("");
       setNativeSetupStatus(message);
     } catch (error) {
       setNativeSetupStatus(String(error));
@@ -1755,7 +1896,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           {variants.length > 0 && <div className="variants"><div className="variants-heading"><h3>Available streams</h3><span>{variants.length} OPTIONS</span></div>
             {variants.map((variant, index) => <div className="variant" key={variant.url + index}>
               <div><strong>{variant.isLive ? "Live · " : ""}{variant.quality}</strong><small>{variant.kind.toUpperCase()}{variant.width && variant.height ? " · " + variant.width + " × " + variant.height : ""}{variant.bandwidth ? " · " + Math.round(variant.bandwidth / 1000) + " kbps" : ""}{variant.fps ? " · " + Math.round(variant.fps) + " fps" : ""}</small>{variant.note && <p>{variant.note}</p>}</div>
-              <button className="secondary-button" disabled={!variant.downloadable} onClick={() => add(variant.kind === "dash" || variant.kind === "hls" || variant.kind === "ytdlp" ? (inspectedUrl || videoUrl) : variant.url, variant.kind === "ytdlp" ? (videoTitle ? videoTitle + ".mp4" : "video.mp4") : "video.mp4", variant.kind === "hls" ? "hls" : variant.kind === "dash" ? "dash" : variant.kind === "ytdlp" ? "ytdlp" : "direct", variant.kind === "hls" ? variant.url : variant.representationId, variant.audioRepresentationId, variant.isLive)}>{variant.downloadable ? "Download" : "Unavailable"}</button>
+              <button className="secondary-button" disabled={!variant.downloadable || grabberVariantBusy === variant.url + index} onClick={() => void downloadVariant(variant, variant.url + index)}>{grabberVariantBusy === variant.url + index ? "Queueing…" : variant.downloadable ? "Download" : "Unavailable"}</button>
             </div>)}
             {allSubtitles.length > 0 && <div className="variants"><div className="variants-heading"><h3>Subtitles</h3><span>{allSubtitles.length} TRACKS</span></div>
               {allSubtitles.map((subtitle) => <div className="variant" key={subtitle.url}>
@@ -1786,7 +1927,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
               <label className="grab-item"><input type="checkbox" checked={!!grabChecked[item.url]} onChange={(event) => setGrabChecked((current) => ({ ...current, [item.url]: event.target.checked }))} /><span><strong>{item.name}</strong><small>{item.kind.toUpperCase()} · {hostOf(item.url)}</small></span></label>
             </div>)}
           </div>}
-          <div className="support-note"><strong>Format support</strong><p>Direct HTTP/HTTPS files use resumable transfers. HLS supports completed unencrypted VOD, with Pause/Resume/Cancel. Live HLS streams can be recorded as they arrive — the partial file is kept when you stop. DASH supports static MPDs with SegmentTemplate/SegmentTimeline, SegmentList, SegmentBase and multi-period, with Pause/Resume/Cancel; separate audio/video requires FFmpeg. Live/dynamic MPDs and DRM are not supported. YouTube and social video pages are inspected with yt-dlp — paste a video page URL above and pick a format; yt-dlp and Deno download on first use from Settings. "Grab a page" below lists media files a page links to directly.</p></div>
+          <div className="support-note"><strong>Format support</strong><p>Direct HTTP/HTTPS files use resumable transfers. HLS supports completed VOD, unencrypted or AES-128 encrypted, with Pause/Resume/Cancel. Live HLS streams can be recorded as they arrive — the partial file is kept when you stop. DASH supports static MPDs with SegmentTemplate/SegmentTimeline, SegmentList, SegmentBase and multi-period, with Pause/Resume/Cancel; separate audio/video requires FFmpeg. Live/dynamic MPDs and DRM are not supported. YouTube and social video pages are inspected with yt-dlp — paste a video page URL above and pick a format; yt-dlp and Deno download on first use from Settings. "Grab a page" below lists media files a page links to directly.</p></div>
         </div>
       </div>
     </div>;
@@ -1813,16 +1954,21 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       <header className="topbar"><div>THUNDERLOAD <span>/</span> {title.toUpperCase()}</div><button className="quiet-button folder-button" onClick={openFolder}>Open downloads folder ↗</button></header>
       <div className="content-row">
       <div className="page">
-        {nativeBanner && !nativeBannerDismissed && <div className="setup-banner" role="status">
+        {nativeBanner && dismissedBannerKind !== nativeBanner && <div className="setup-banner" role="status">
           <div><strong>{nativeBanner === "missing-id" ? "Browser connection not set up yet" : "Browser connection could not be restored"}</strong><p>{nativeBanner === "missing-id"
             ? "Downloads from the browser extension need a one-time connection. It takes a minute: install the extension, copy its ID, and connect it in Settings."
             : "ThunderLoad tried to reconnect a browser whose extension ID was saved before, but registration failed. Open the browser setup to try again."}</p></div>
           <div className="setup-banner-actions">
             <button className="secondary-button" onClick={() => goTo("settings")}>Set up browser connection →</button>
-            <button className="quiet-button" onClick={() => setNativeBannerDismissed(true)}>Dismiss</button>
+            <button className="quiet-button" onClick={() => { if (nativeBanner) setDismissedBannerKind(nativeBanner); }}>Dismiss</button>
           </div>
         </div>}
         <div className="page-heading"><div><h1>{title}</h1><p>{subtitle}</p></div>{page !== "settings" && <button className="primary-button" onClick={() => setAddOpen(true)}>＋ Add</button>}</div>
+        {/* P1-25: the global notice lives here, above the view switch,
+          so it shows on every page — it used to render only on
+          Downloads (and inside the Add dialog), leaving Queues,
+          Scheduler and Settings silent. */}
+        {notice !== "Ready." && <div className="notice">{notice}</div>}
 
         {page === "downloads" && <>
           <div className="list-toolbar">
@@ -1840,7 +1986,6 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
             statusTab === "all" ? "Download list is empty." : statusTab === "active" ? "No active transfers." : statusTab === "completed" ? "No completed downloads yet." : "No failed downloads.",
             statusTab === "all" ? "Add new download URL." : statusTab === "active" ? "Active, queued and paused transfers appear here." : statusTab === "completed" ? "Finished and cancelled downloads appear here." : "Failed and interrupted transfers appear here with a Retry action.",
             showKind)}
-          {notice !== "Ready." && <div className="notice">{notice}</div>}
         </>}
 
         {page === "queues" && <>
