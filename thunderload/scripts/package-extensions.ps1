@@ -70,8 +70,17 @@ function New-ForwardSlashZip {
       # separator (backslash on Windows), which must never reach
       # the archive — ZIP entry names are slash-separated.
       $relative = [System.IO.Path]::GetRelativePath($SourceDir, $file.FullName).Replace([System.IO.Path]::DirectorySeparatorChar, "/")
-      $entry = [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $file.FullName, $relative, [System.IO.Compression.CompressionLevel]::Optimal)
+      # CreateEntryFromFile writes the file immediately, so LastWriteTime
+      # cannot be set after it returns (the entry is already opened for
+      # writing in Create mode). Create the entry, stamp it, then copy
+      # the bytes in — same name, same compression, same fixed time.
+      $entry = $zip.CreateEntry($relative, [System.IO.Compression.CompressionLevel]::Optimal)
       $entry.LastWriteTime = $FixedTime
+      $entryStream = $entry.Open()
+      try {
+        $sourceStream = [System.IO.File]::OpenRead($file.FullName)
+        try { $sourceStream.CopyTo($entryStream) } finally { $sourceStream.Dispose() }
+      } finally { $entryStream.Dispose() }
     }
   } finally { $zip.Dispose() }
   # Verify what was written: no entry may contain a backslash.
