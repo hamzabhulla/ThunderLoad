@@ -1,21 +1,21 @@
 :root{color-scheme:dark;font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;background:#0b1220;color:#e8edf4}
 *{box-sizing:border-box}body{margin:0;width:390px;min-height:200px;background:#0b1220}.shell{padding:14px 14px 12px}
 .topbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}.brand{display:flex;align-items:center;gap:9px}
-.brand-mark{width:30px;height:30px;display:grid;place-items:center;border-radius:8px;background:#16a34a;color:#fff;font-size:18px}
+.brand-mark{width:30px;height:30px;display:grid;place-items:center;border-radius:8px;background:#30d158;color:#06130a;font-size:18px}
 .brand strong{color:#f0f4f8;font-size:13px;font-weight:650}
 button{cursor:pointer}.secondary{min-height:30px;padding:0 10px;border:1px solid #1e293b;border-radius:6px;background:#111c2e;color:#dbe6f1;font-size:10px}.secondary:hover{background:#1e293b}
 .source-list{display:grid;gap:10px;max-height:340px;overflow:auto}
 .primary-card{display:grid;gap:10px}
-.primary{display:block;width:100%;min-height:36px;padding:0 12px;border:0;border-radius:8px;background:#16a34a;color:#fff;font-size:12px;font-weight:650}.primary:hover{background:#22c55e}.primary:disabled{opacity:.5;cursor:not-allowed}
+.primary{display:block;width:100%;min-height:36px;padding:0 12px;border:0;border-radius:8px;background:#30d158;color:#06130a;font-size:12px;font-weight:650}.primary:hover{background:#3ce165}.primary:disabled{opacity:.5;cursor:not-allowed}
 .quality-list{display:grid;gap:6px}
 .quality{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;border:1px solid #1e293b;border-radius:6px;background:#111c2e}
 .quality strong{color:#e2eaf2;font-size:11px;font-weight:600}
 .quality-empty{padding:8px;color:#8b9eb2;font-size:10px;line-height:1.5}
-.download-btn{flex:none;min-height:26px;padding:0 10px;border:1px solid #16a34a;border-radius:5px;background:transparent;color:#4ade80;font-size:10px;font-weight:600}.download-btn:hover{background:rgba(22,163,74,.15)}.download-btn:disabled{opacity:.45;cursor:not-allowed}
+.download-btn{flex:none;min-height:26px;padding:0 10px;border:1px solid #30d158;border-radius:5px;background:transparent;color:#7ee2a0;font-size:10px;font-weight:600}.download-btn:hover{background:rgba(48,209,88,.15)}.download-btn:disabled{opacity:.45;cursor:not-allowed}
 .other-media{border-top:1px solid #1e293b;padding-top:10px}
 .other-media summary{list-style:none;color:#aebdce;font-size:11px;font-weight:600;cursor:pointer}
 .other-media summary::-webkit-details-marker{display:none}
-.other-media summary::before{content:"▸ ";color:#4ade80}
+.other-media summary::before{content:"▸ ";color:#7ee2a0}
 .other-media[open] summary::before{content:"▾ "}
 .other-list{display:grid;gap:6px;margin-top:8px}
 .other-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;border:1px solid #1e293b;border-radius:6px;background:#111c2e}
@@ -31,10 +31,10 @@ button{cursor:pointer}.secondary{min-height:30px;padding:0 10px;border:1px solid
 .toggle-row{display:flex;align-items:center;justify-content:space-between;gap:12px;color:#dbe6f1;font-size:11px;font-weight:600;cursor:pointer}
 .switch{position:relative;display:inline-block;width:36px;height:20px;flex:none}
 .switch input{position:absolute;opacity:0;width:100%;height:100%;margin:0;cursor:pointer}
-.switch input:focus-visible + .slider{outline:2px solid #4ade80;outline-offset:2px}
+.switch input:focus-visible + .slider{outline:2px solid #7ee2a0;outline-offset:2px}
 .slider{position:absolute;inset:0;border-radius:999px;background:#1e293b;transition:background .15s ease}
 .slider::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#8b9eb2;transition:transform .15s ease,background .15s ease}
-.switch input:checked + .slider{background:#16a34a}
+.switch input:checked + .slider{background:#30d158}
 .switch input:checked + .slider::after{transform:translateX(16px);background:#fff}
 .toast{display:none;margin-top:10px;padding:8px 9px;border:1px solid #1e293b;border-radius:5px;background:#111c2e;color:#c8def2;font-size:10px;line-height:1.4}.toast.show{display:block}
 /* Slice 6: subtitle rows under the quality list, and the note for
@@ -44,7 +44,7 @@ button{cursor:pointer}.secondary{min-height:30px;padding:0 10px;border:1px solid
 .truncated-note{padding:8px;color:#aebdce;font-size:10px;line-height:1.5}
 .ytdlp-note{padding:8px;color:#aebdce;font-size:10px;line-height:1.5}
 .ytdlp-consent{display:grid;gap:8px}
-.secondary-btn{min-height:30px;padding:0 12px;border:1px solid #16a34a;border-radius:6px;background:transparent;color:#4ade80;font-size:11px;font-weight:600}.secondary-btn:hover{background:rgba(22,163,74,.15)}.secondary-btn:disabled{opacity:.5;cursor:wait}
+.secondary-btn{min-height:30px;padding:0 12px;border:1px solid #30d158;border-radius:6px;background:transparent;color:#7ee2a0;font-size:11px;font-weight:600}.secondary-btn:hover{background:rgba(48,209,88,.15)}.secondary-btn:disabled{opacity:.5;cursor:wait}
 .ytdlp-progress{color:#aebdce;font-size:10px;line-height:1.5}
 .ytdlp-progress.hidden{display:none}
-.ytdlp-manual{justify-self:start;padding:0;border:0;background:transparent;color:#4ade80;font-size:10px;text-decoration:underline}
+.ytdlp-manual{justify-self:start;padding:0;border:0;background:transparent;color:#7ee2a0;font-size:10px;text-decoration:underline}
