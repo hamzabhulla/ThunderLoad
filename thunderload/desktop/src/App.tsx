@@ -293,7 +293,7 @@ export default function App() {
   const [grabberVariantBusy, setGrabberVariantBusy] = useState<string | null>(null);
   const [grabNotice, setGrabNotice] = useState("");
   const [grabScheduleAt, setGrabScheduleAt] = useState("");
-  const [connections, setConnections] = useState(() => readSetting(CONNECTIONS_KEY, 8, [1, 2, 4, 8]));
+  const [connections, setConnections] = useState(() => readSetting(CONNECTIONS_KEY, 8, [1, 2, 4, 8, 16]));
   const [parallel, setParallel] = useState(() => readSetting(PARALLEL_KEY, 2, [1, 2, 3, 4]));
   const [speedLimit, setSpeedLimit] = useState(() => readSetting(SPEED_LIMIT_KEY, 0, [0, 262144, 524288, 1048576, 2097152, 5242880, 10485760]));
   const [clock, setClock] = useState(Date.now());
@@ -1457,8 +1457,17 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     }
   }
   async function checkYtDlpUpdate() {
+    // This button APPLIES an update, it does not just check: yt-dlp -U
+    // downloads and installs the latest release, so ask first.
+    let ok: boolean;
+    try {
+      ok = await confirm("Update yt-dlp?\n\nThis downloads and installs the latest yt-dlp release — it does not just check for one. The new version replaces the installed binary.");
+    } catch {
+      ok = window.confirm("Update yt-dlp? This downloads and installs the latest yt-dlp release — it does not just check for one. The new version replaces the installed binary.");
+    }
+    if (!ok) return;
     setYtdlpCheckingUpdate(true);
-    setYtdlpUpdateStatus("Checking for yt-dlp updates…");
+    setYtdlpUpdateStatus("Updating yt-dlp…");
     try {
       setYtdlpUpdateStatus(await invoke<string>("check_ytdlp_update"));
       await loadYtDlpTools();
@@ -1934,6 +1943,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       <div className="sidebar-bottom">
         <div className="engine-line"><i />Local engine</div>
         <button title="Settings" aria-label="Settings" className={"nav-item " + (page === "settings" ? "selected" : "")} onClick={() => goTo("settings")}><span>⚙</span>Settings</button>
+        {/* Version shown here is display-only; the release version lives in thunderload/Cargo.toml [workspace.package]. */}
         <div className="version">ThunderLoad · 0.3.5</div>
       </div>
     </aside>
@@ -1999,7 +2009,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
 
         {page === "settings" && <section className="panel settings-panel">
           <div className="settings-section"><div><h2>Transfer behaviour</h2><p>Saved locally. Applies to new downloads.</p></div>
-            <label className="setting-row"><span><strong>Connections per file</strong><small>Parallel connections per file, for direct, HLS and DASH downloads. Applies to new downloads; a resumed direct download keeps the connections it started with; HLS/DASH resumes use the current setting.</small></span><select className="select-field" value={connections} onChange={(event) => setConnections(Number(event.target.value))}>{[1, 2, 4, 8].map((n) => <option key={n} value={n}>{n} {n === 1 ? "connection" : "connections"}</option>)}</select></label>
+            <label className="setting-row"><span><strong>Connections per file</strong><small>Parallel connections per file, for direct, HLS and DASH downloads. Applies to new downloads; a resumed direct download keeps the connections it started with; HLS/DASH resumes use the current setting.</small></span><select className="select-field" value={connections} onChange={(event) => setConnections(Number(event.target.value))}>{[1, 2, 4, 8, 16].map((n) => <option key={n} value={n}>{n} {n === 1 ? "connection" : "connections"}</option>)}</select></label>
             <label className="setting-row"><span><strong>Simultaneous downloads</strong><small>Maximum number of active queue items.</small></span><select className="select-field" value={parallel} onChange={(event) => setParallel(Number(event.target.value))}>{[1, 2, 3, 4].map((n) => <option key={n} value={n}>{n} {n === 1 ? "download" : "downloads"}</option>)}</select></label>
             <label className="setting-row"><span><strong>Speed limit</strong><small>Applies to active direct, HLS and DASH transfers in each ThunderLoad process. Browser companion and desktop share this saved setting; each process enforces its own aggregate cap. Zero means unlimited.</small></span><select className="select-field" value={speedLimit} onChange={(event) => setSpeedLimit(Number(event.target.value))}>
               <option value={0}>Unlimited</option><option value={262144}>256 KB/s</option><option value={524288}>512 KB/s</option><option value={1048576}>1 MB/s</option><option value={2097152}>2 MB/s</option><option value={5242880}>5 MB/s</option><option value={10485760}>10 MB/s</option>
@@ -2035,6 +2045,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
                 <option value="edge">Microsoft Edge</option>
                 <option value="brave">Brave</option>
                 <option value="opera">Opera</option>
+                <option value="vivaldi">Vivaldi</option>
                 <option value="firefox">Firefox</option>
               </select></label>
               <label><span>Extension ID</span><input className="field" value={nativeExtensionId} onChange={(event) => setNativeExtensionId(event.target.value)} placeholder={nativeBrowser === "firefox" ? "thunderload@example.com" : "32 characters a–p"} /></label>
@@ -2043,7 +2054,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
             {nativeSetupStatus && <div className="notice native-host-notice">{nativeSetupStatus}</div>}
             <ol className="setup-steps">
               <li><strong>Install the extension first</strong> — download it below in Browser extension files and load it in your browser (Chromium: Load unpacked in developer mode; Firefox: Install Add-on From File).</li>
-              <li><strong>Find the extension ID</strong> — open <code>chrome://extensions</code> (Edge: <code>edge://extensions</code>, Brave: <code>brave://extensions</code>), turn <strong>Developer mode</strong> on, and copy the <strong>ID</strong> shown under the ThunderLoad extension. Firefox uses the fixed ID <code>thunderload@example.com</code> — it is filled in for you.</li>
+              <li><strong>Find the extension ID</strong> — open <code>chrome://extensions</code> (Edge: <code>edge://extensions</code>, Brave: <code>brave://extensions</code>, Opera: <code>opera://extensions</code>, Vivaldi: <code>vivaldi://extensions</code>), turn <strong>Developer mode</strong> on, and copy the <strong>ID</strong> shown under the ThunderLoad extension. Firefox uses the fixed ID <code>thunderload@example.com</code> — it is filled in for you.</li>
               <li><strong>Connect it here</strong> — paste the ID above, choose your browser, and click <strong>Connect browser</strong>. ThunderLoad copies the native host into place, writes the browser manifest, and registers it. You only do this once per browser.</li>
               <li><strong>Restart the browser</strong> and allow <strong>Native messaging</strong> in the ThunderLoad extension when prompted. ThunderLoad re-registers automatically on later startups if the registration ever goes missing.</li>
             </ol>
@@ -2052,7 +2063,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           <div className="settings-section">
             <div><h2>Browser extension files</h2><p>Download the extension package for your browser and load it in developer mode. No store listing is needed for this path.</p></div>
             <div className="setting-row">
-              <div><strong>Chrome · Edge · Brave · Opera — ThunderLoad-Chromium.zip</strong><small>Extract the ZIP, then open chrome://extensions (Edge: edge://extensions, Brave: brave://extensions, Opera: opera://extensions), turn Developer mode on, click “Load unpacked” and select the extracted folder.</small></div>
+              <div><strong>Chrome · Edge · Brave · Opera · Vivaldi — ThunderLoad-Chromium.zip</strong><small>Extract the ZIP, then open chrome://extensions (Edge: edge://extensions, Brave: brave://extensions, Opera: opera://extensions, Vivaldi: vivaldi://extensions), turn Developer mode on, click “Load unpacked” and select the extracted folder.</small></div>
               <button className="secondary-button" onClick={() => downloadExtensionFile("chromium")} disabled={extensionFileSaving}>Download ZIP</button>
             </div>
             <div className="setting-row">
@@ -2077,8 +2088,8 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
             {ytdlpToolProgress?.tool === "Deno" && <div className="notice native-host-notice">Deno download ho raha hai{ytdlpToolProgress.percent !== undefined ? " — " + Math.round(ytdlpToolProgress.percent) + "%" : "…"}</div>}
             {ytdlpUpdateStatus && <div className="notice native-host-notice">{ytdlpUpdateStatus}</div>}
             <div className="setting-row">
-              <div><strong>Check for yt-dlp updates</strong><small>YouTube changes often — an extractor error usually means yt-dlp needs an update.</small></div>
-              <button className="secondary-button" onClick={() => void checkYtDlpUpdate()} disabled={ytdlpCheckingUpdate}>{ytdlpCheckingUpdate ? "Checking…" : "Check for updates"}</button>
+              <div><strong>Update yt-dlp</strong><small>YouTube changes often — an extractor error usually means yt-dlp needs an update. This downloads and installs the latest release.</small></div>
+              <button className="secondary-button" onClick={() => void checkYtDlpUpdate()} disabled={ytdlpCheckingUpdate}>{ytdlpCheckingUpdate ? "Updating…" : "Update yt-dlp"}</button>
             </div>
             <div className="setting-row">
               <div><strong>Download it yourself instead</strong><small>Or download the file yourself from the official release page and drop it in the tools folder — ThunderLoad picks it up automatically.</small></div>
@@ -2091,7 +2102,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
             <p className="footnote">Tools folder: {ytdlpTools ? ytdlpTools.toolsDir : "…"}</p>
           </div>
           <div className="rule" />
-          <div className="settings-section"><div><h2>About</h2><p>Local desktop transfer engine · Version 0.3.5</p></div><div className="about-line"><span>Supported media</span><strong>Direct files · HLS VOD · Live HLS recording · Static DASH VOD · YouTube &amp; social (yt-dlp)</strong></div><div className="about-line"><span>Direct downloads</span><strong>Pause · Resume · Cancel · Speed limit · Schedule</strong></div><div className="about-line"><span>Still in development</span><strong>Live DASH</strong></div></div>
+          <div className="settings-section"><div><h2>About</h2><p>Local desktop transfer engine · Version 0.3.5</p>{/* Display-only; the release version lives in thunderload/Cargo.toml [workspace.package]. */}</div><div className="about-line"><span>Supported media</span><strong>Direct files · HLS VOD · Live HLS recording · Static DASH VOD · YouTube &amp; social (yt-dlp)</strong></div><div className="about-line"><span>Direct downloads</span><strong>Pause · Resume · Cancel · Speed limit · Schedule</strong></div><div className="about-line"><span>Still in development</span><strong>Live DASH</strong></div></div>
         </section>}
 
       </div>

@@ -40,7 +40,7 @@ cargo run --release -p thunderload-engine --bin bench
 Browser downloads need one manual setup per browser — after that, ThunderLoad re-registers the connection automatically on later startups if it ever goes missing:
 
 1. Install the desktop app and the browser extension (in the app: Settings → Browser extension files).
-2. Copy the extension ID: open `chrome://extensions` (`edge://extensions`, `brave://extensions`), turn Developer mode on — the ID is shown under the ThunderLoad extension. Firefox uses the fixed ID `thunderload@example.com`.
+2. Copy the extension ID: open `chrome://extensions` (`edge://extensions`, `brave://extensions`, `opera://extensions`, `vivaldi://extensions`), turn Developer mode on — the ID is shown under the ThunderLoad extension. Firefox uses the fixed ID `thunderload@example.com`.
 3. In the app, open Settings → Browser connection, paste the ID and click Connect browser, then restart the browser and allow Native messaging when prompted.
 4. Done — direct file downloads never need this setup.
 
@@ -49,7 +49,7 @@ Browser downloads need one manual setup per browser — after that, ThunderLoad 
 ## Features
 
 **Downloads that survive interruptions**
-- Multi-connection checkpoint resume: up to 8 parallel connections against one preallocated file, per-segment completion persisted in a metadata sidecar. Pause, resume, and restart recovery all re-fetch only the unfinished bytes.
+- Multi-connection checkpoint resume: up to 16 parallel connections against one preallocated file, per-segment completion persisted in a metadata sidecar. Pause, resume, and restart recovery all re-fetch only the unfinished bytes.
 - Dynamic segmentation: fresh downloads split into near-equal chunks (≥256 KiB, ≤1024 chunks) and connections pull work-stealing style, so a fast connection takes the larger share. A connection silent for 30 s has its chunk re-assigned (max 3 re-assignments, then the download errors with its checkpoint preserved).
 - A durable job database (`jobs.json`, atomic writes): the queue survives restarts and crashes. Interrupted jobs come back resumable, paused jobs stay paused, orphaned checkpoints on disk are imported as Interrupted jobs.
 - Scheduled starts with a one-time OS wake task — Task Scheduler on Windows, systemd user timer on Linux, launchd agent on macOS.
@@ -61,7 +61,7 @@ Browser downloads need one manual setup per browser — after that, ThunderLoad 
 - Dynamic/live DASH MPDs, SAMPLE-AES and other non-AES-128 HLS encryption, encrypted live HLS, and DRM are not supported — DRM never, by design.
 
 **YouTube and social video (yt-dlp)**
-- YouTube, Instagram, TikTok, X, Facebook, Reddit, Twitch, and Vimeo pages are inspected and downloaded with yt-dlp; Deno runs the JavaScript yt-dlp needs for YouTube's full quality. Neither tool is bundled with the installer — each downloads once from its GitHub Releases page (yt-dlp 2026.10.26, Deno 2.9.8) when you click its Download button in Settings, with visible progress, and is SHA256-verified against a pinned hash before use. Without Deno, YouTube falls back to fewer formats.
+- YouTube, Instagram, TikTok, X, Facebook, Reddit, Twitch, and Vimeo pages are inspected and downloaded with yt-dlp; Deno runs the JavaScript yt-dlp needs for YouTube's full quality. Neither tool is bundled with the installer — each downloads from its GitHub Releases page (yt-dlp 2026.10.26, Deno 2.9.8) when you click its Download button in Settings, with visible progress, and a first install is SHA256-verified against a pinned hash before use. Updating yt-dlp is different: it downloads and installs the latest yt-dlp release unpinned, via `yt-dlp -U`, after asking for confirmation; the new binary's hash is then recorded as tamper-evidence on later launches, not a pinned-release guarantee. Without Deno, YouTube falls back to fewer formats.
 
 **Browser integration**
 - Chrome/Firefox extension (Chromium ZIP + Firefox XPI) with automatic media detection, an in-player Download control, and a site grabber: the popup lists what it found on the active tab, each row with its own Download button. Multi-select checkboxes exist only in the desktop app's Video grabber dialog ("Grab a page", first 100 items).
