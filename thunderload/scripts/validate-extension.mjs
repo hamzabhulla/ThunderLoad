@@ -41,6 +41,44 @@ if (!firefox.browser_specific_settings?.gecko?.id) throw new Error("Firefox mani
 // cannot block, so its manifest must NOT carry the permission.
 if (!firefox.permissions?.includes("webRequestBlocking")) throw new Error("Firefox manifest must request webRequestBlocking for the blocking download handoff");
 if (chromium.permissions?.includes("webRequestBlocking")) throw new Error("Chromium manifest must NOT request webRequestBlocking (MV3 cannot block)");
+// P1 #28 (Gemini cross-check): the gate never checked
+// data_collection_permissions, alarms, or manifest parity, so it
+// would have passed the AMO auto-reject gap. MERGE ORDER: the
+// data_collection_permissions field lands in Slice F (P0 #6,
+// PR #35), still unmerged — this gate FAILS on origin/main until
+// PR #35 merges. That is the gate working as intended: do not
+// weaken it to a warning and do not add the field here.
+// Categories per MDN browser_specific_settings (gecko):
+// required holds "none" alone, or one or more of the personal-data
+// categories; optional holds one or more of those plus
+// technicalAndInteraction, which can never be required.
+const DATA_COLLECTION_REQUIRED = new Set(["authenticationInfo", "bookmarksInfo", "browsingActivity", "financialAndPaymentInfo", "healthInfo", "locationInfo", "personalCommunications", "personallyIdentifyingInfo", "searchTerms", "websiteActivity", "websiteContent"]);
+const DATA_COLLECTION_OPTIONAL = new Set([...DATA_COLLECTION_REQUIRED, "technicalAndInteraction"]);
+const dcp = firefox.browser_specific_settings?.gecko?.data_collection_permissions;
+if (!dcp || !Array.isArray(dcp.required) || !dcp.required.length) throw new Error("Firefox manifest.firefox.json must declare browser_specific_settings.gecko.data_collection_permissions.required (AMO rejects new submissions without it)");
+if (dcp.required.includes("none") && dcp.required.length !== 1) throw new Error("Firefox manifest.firefox.json data_collection_permissions.required must be exactly [\"none\"] when it declares no collection");
+for (const category of dcp.required) {
+  if (category !== "none" && !DATA_COLLECTION_REQUIRED.has(category)) throw new Error("Firefox manifest.firefox.json data_collection_permissions.required lists unknown category " + JSON.stringify(category));
+}
+if (dcp.optional !== undefined) {
+  if (!Array.isArray(dcp.optional) || !dcp.optional.length) throw new Error("Firefox manifest.firefox.json data_collection_permissions.optional must be a non-empty array when present");
+  for (const category of dcp.optional) {
+    if (!DATA_COLLECTION_OPTIONAL.has(category)) throw new Error("Firefox manifest.firefox.json data_collection_permissions.optional lists unknown category " + JSON.stringify(category));
+  }
+}
+// Chromium and Firefox ship the same extension, so version, name,
+// and the permission sets must agree. The one intentional
+// difference is webRequestBlocking, Firefox-only (MV3 cannot block
+// on Chromium).
+if (chromium.version !== firefox.version) throw new Error("Extension manifests disagree on version: manifest.json has " + chromium.version + ", manifest.firefox.json has " + firefox.version);
+if (chromium.name !== firefox.name) throw new Error("Extension manifests disagree on name: manifest.json has " + JSON.stringify(chromium.name) + ", manifest.firefox.json has " + JSON.stringify(firefox.name));
+const FIREFOX_ONLY_PERMISSIONS = new Set(["webRequestBlocking"]);
+for (const key of ["permissions", "optional_permissions", "host_permissions"]) {
+  const chromiumSet = new Set(chromium[key] ?? []);
+  const firefoxSet = new Set(firefox[key] ?? []);
+  for (const permission of chromiumSet) if (!firefoxSet.has(permission)) throw new Error("Permission " + JSON.stringify(permission) + " is in manifest.json " + key + " but missing from manifest.firefox.json");
+  for (const permission of firefoxSet) if (!chromiumSet.has(permission) && !(key === "permissions" && FIREFOX_ONLY_PERMISSIONS.has(permission))) throw new Error("Permission " + JSON.stringify(permission) + " is in manifest.firefox.json " + key + " but missing from manifest.json");
+}
 // Slice 3: yt-dlp routing contract. The background must handle the
 // new YTDLP message types; the panel and popup must show the tool by
 // name on the consent + progress steps ("yt-dlp download ho raha
@@ -48,6 +86,19 @@ if (chromium.permissions?.includes("webRequestBlocking")) throw new Error("Chrom
 // "downloading tool" label. No manifest permission was added for
 // this slice (the tools run in the native host, not the extension).
 const background = await readFile(resolve(ext, "background.js"), "utf8");
+// The background uses the alarms API for its 30 s intercept-flush
+// ticker (alarms.create + onAlarm). The same background.js ships in
+// both builds, so both manifests must declare the permission: the
+// code falls back to setInterval without it, which is unreliable
+// in an MV3 service worker, so a missing declaration would silently
+// degrade the flush instead of failing loudly. (PRIVACY.md
+// disclosure of alarms is Slice 2's job; this gate checks
+// manifest-vs-code consistency only.)
+if (background.includes("alarms.create") || background.includes("alarms.onAlarm")) {
+  for (const [name, manifest] of [["Chromium", chromium], ["Firefox", firefox]]) {
+    if (!manifest.permissions?.includes("alarms")) throw new Error(name + " manifest must declare the alarms permission used by background.js");
+  }
+}
 for (const type of ["YTDLP_INSPECT", "YTDLP_DOWNLOAD", "YTDLP_ENSURE_TOOL", "YTDLP_TOOLS_STATUS", "YTDLP_CHECK_UPDATE", "YTDLP_OPEN_MANUAL_PAGE"]) {
   if (!background.includes('"' + type + '"')) throw new Error("background.js must handle " + type);
 }
