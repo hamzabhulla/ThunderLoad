@@ -21,13 +21,14 @@ New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 # fails with a sharing violation while Chrome has the host running. The
 # installed copy is named after its content hash; identical bytes already
 # installed are never rewritten, and a new binary never overwrites the file
-# a running host executes from. The manifests below point at $HostExe, so
-# they follow the versioned file automatically. Stale installs are pruned
-# at the end of this script (see below): every manifest written here
-# points at the current $HostExe, so an older versioned file is referenced
-# by nothing — except a host process still executing from it, which holds
-# a Windows file lock; locked files are left alone and pruned on a later
-# run once the browser has closed.
+# a running host executes from. The manifests written by THIS run point at
+# $HostExe, so they follow the versioned file automatically. Stale installs
+# are pruned at the end of this script (see below) — but only binaries no
+# manifest still points at: a manifest written by an earlier run, for a
+# browser not re-registered this run, may still point at the older file.
+# A host process still executing from a pruned file holds a Windows file
+# lock; locked files are left alone and pruned on a later run once the
+# browser has closed.
 $SourceHash = (Get-FileHash -LiteralPath $HostSource -Algorithm SHA256).Hash
 $HostExe = Join-Path $InstallDir ("thunderload-host-" + $SourceHash.Substring(0, 16).ToLowerInvariant() + ".exe")
 $InstalledHash = if (Test-Path -LiteralPath $HostExe) { (Get-FileHash -LiteralPath $HostExe -Algorithm SHA256).Hash } else { $null }
@@ -120,11 +121,34 @@ if (-not [string]::IsNullOrWhiteSpace($FirefoxExtensionId)) { Register-FirefoxHo
 # no Opera build reads.
 $LegacyOperaKey = "HKCU:\Software\Opera Software\NativeMessagingHosts\com.thunderload.host"
 if (Test-Path $LegacyOperaKey) { Remove-Item -Path $LegacyOperaKey -Recurse -Force }
-# Prune versioned host binaries older than the one just installed.
+# Prune versioned host binaries older than the one just installed — but
+# ONLY ones no manifest still points at. Each browser registers on its
+# own schedule, so a Chrome-only run after an upgrade must not delete
+# the older binary Firefox's manifest still references (that broke
+# Firefox native messaging until Firefox was re-registered). Every
+# *-native-host.json in the install dir is read first — including ones
+# this run did not rewrite — and a binary referenced by any of them is
+# kept. Fail safe: a manifest that cannot be read or parsed might
+# reference any binary, so pruning is skipped entirely for this run
+# rather than risk deleting a file a browser still needs.
 # A file a running host executes from is locked and cannot be deleted;
 # that failure is expected and ignored — the file is pruned on a later
 # run once the browser has closed and released it.
-Get-ChildItem -LiteralPath $InstallDir -Filter "thunderload-host-*.exe" -File -ErrorAction SilentlyContinue | Where-Object { $_.FullName -ne $HostExe } | ForEach-Object {
-  try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop } catch { }
+$ReferencedHosts = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$PruneBlocked = $false
+Get-ChildItem -LiteralPath $InstallDir -Filter "*-native-host.json" -File -ErrorAction SilentlyContinue | ForEach-Object {
+  $ManifestPath = $_.FullName
+  try {
+    $Manifest = Get-Content -LiteralPath $ManifestPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    if ($Manifest.path) { [void]$ReferencedHosts.Add($Manifest.path) }
+  } catch {
+    Write-Warning "Could not read $ManifestPath; skipping binary pruning this run so no in-use host is deleted."
+    $PruneBlocked = $true
+  }
+}
+if (-not $PruneBlocked) {
+  Get-ChildItem -LiteralPath $InstallDir -Filter "thunderload-host-*.exe" -File -ErrorAction SilentlyContinue | Where-Object { $_.FullName -ne $HostExe -and -not $ReferencedHosts.Contains($_.FullName) } | ForEach-Object {
+    try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop } catch { }
+  }
 }
 Write-Host "Done. Restart the selected browsers."
