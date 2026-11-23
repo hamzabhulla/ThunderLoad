@@ -21,9 +21,9 @@ type Item = { id: string; name: string; url: string; kind: Kind; status: Status;
 type StoredJob = { id: string; name: string; url: string; kind: string; origin: string; state: string; downloaded: number; total?: number; percent?: number; segmentsDone?: number; segmentsTotal?: number; targetPath?: string; checkpointPath?: string; representationId?: string; audioRepresentationId?: string; scheduledAtMs?: number; detail: string; error?: string; createdAtMs: number; updatedAtMs: number; live?: boolean };
 
 const HISTORY_KEY = "thunderload.history.v2";
-// Slice 7b (Gemini claim 7): v2 key — the v1 control was disabled and
-// never a user choice, and v1 stored 1, which was never the engine's
-// real value. v2 starts fresh at the engine default, 8.
+// The v2 history key was never a user choice: the v1 control was
+// disabled, and v1 stored 1, which was never the engine's real value.
+// v2 starts fresh at the engine default, 8.
 const CONNECTIONS_KEY = "thunderload.connections.v2";
 const PARALLEL_KEY = "thunderload.parallel.v1";
 const SPEED_LIMIT_KEY = "thunderload.speed-limit.v1";
@@ -52,7 +52,7 @@ function readNativeIds(): Record<string, string> {
 // yt-dlp inspect flow in add() below.)
 const YOUTUBE_PAGE_MESSAGE = "That page is not a direct media URL. Paste a YouTube or social video page to inspect it with yt-dlp, or a direct media link.";
 
-// Slice 3: pages yt-dlp knows how to extract — same host list as the
+// Pages yt-dlp knows how to extract — same host list as the
 // extension's YTDLP_HOSTS. A pasted page URL here routes to the yt-dlp
 // inspect flow instead of the direct-media probe.
 const YTDLP_PAGE_HOSTS = ["youtube.com", "youtu.be", "instagram.com", "tiktok.com", "twitter.com", "x.com", "facebook.com", "fb.watch", "reddit.com", "twitch.tv", "vimeo.com"];
@@ -62,9 +62,9 @@ function isYtDlpPageUrl(value: string): boolean {
     return YTDLP_PAGE_HOSTS.some((listed) => host === listed || host.endsWith("." + listed));
   } catch { return false; }
 }
-// Slice 6: a URL the clipboard watcher treats as downloadable — a
-// direct media file, or a YouTube/social page (which the yt-dlp
-// inspect flow handles once the user picks Download).
+// A URL the clipboard watcher treats as downloadable — a direct media
+// file, or a YouTube/social page (which the yt-dlp inspect flow
+// handles once the user picks Download).
 const CLIPBOARD_MEDIA_EXT = /\.(mp4|m4v|mov|webm|mkv|avi|mp3|m4a|aac|wav|ogg|opus|flac|m3u8|mpd|zip|pdf)$/i;
 function isClipboardMediaUrl(value: string): boolean {
   try {
@@ -81,10 +81,10 @@ function bytes(value: number): string {
   return (value / Math.pow(1024, unit)).toFixed(unit ? 1 : 0) + " " + units[unit];
 }
 
-// Slice 7b (Gemini claim 14): one speed sample per job — the rate comes
-// from the bytes moved since the previous sample, never from a single
-// absolute value (the Motrix rule). `rate: null` means only one sample
-// exists so far and the rate is still unknown.
+// One speed sample per job — the rate comes from the bytes moved since
+// the previous sample, never from a single absolute value (the Motrix
+// rule). `rate: null` means only one sample exists so far and the rate
+// is still unknown.
 type SpeedSample = { downloaded: number; at: number; rate: number | null };
 function recordSpeedSample(samples: Map<string, SpeedSample>, jobId: string, downloaded: number, now: number): void {
   const prev = samples.get(jobId);
@@ -103,12 +103,11 @@ function readItems(): Item[] {
     return saved.map((item: Item) => forgetStaleSchedule(item.source === "native"
       ? item
       : item.live && item.targetPath && (item.status === "Downloading" || item.status === "Pausing" || item.status === "Queued")
-        // Slice 6 fix (MAJOR): a live recording has no checkpoint to
-        // recover from — re-queuing it would re-record over the kept
-        // partial. It comes back Paused, file kept; Pause is terminal.
-        // (Queued with a target is a resume-queued recording from
-        // before this fix; a live job that never started has no
-        // target and stays Queued.)
+        // A live recording has no checkpoint to recover from —
+        // re-queuing it would re-record over the kept partial. It comes
+        // back Paused, file kept; Pause is terminal. (Queued with a
+        // target is a resume-queued recording from an older version; a
+        // live job that never started has no target and stays Queued.)
         ? { ...item, status: "Paused", detail: "Paused · partial recording kept" }
         : item.status === "Downloading" || item.status === "Pausing"
           ? item.targetPath
@@ -137,16 +136,15 @@ function nameFromUrl(value: string): string {
 function storedJobToItem(row: StoredJob): Item {
   const kind: Kind = row.kind === "hls" ? "hls" : row.kind === "dash" ? "dash" : row.kind === "ytdlp" ? "ytdlp" : "direct";
   const rawStatus: Status = (["Queued", "Downloading", "Pausing", "Paused", "Completed", "Failed", "Interrupted", "Cancelled"].includes(row.state) ? row.state : "Failed") as Status;
-  // Slice 6 fix round 2 (focused re-audit MAJOR + MINOR): readItems'
-  // recovery mapping is dead code unless stored rows get the same
-  // treatment — the seeding effect lets stored rows win by id, so a
+  // readItems' recovery mapping is dead code unless stored rows get the
+  // same treatment — the seeding effect lets stored rows win by id, so a
   // live recording closed mid-flight came back Downloading (wedged:
   // no Pause target, no Resume, no Cancel, no Remove, and one
   // parallel slot eaten forever), and a VOD job came back Downloading
   // instead of Queued "Recovering saved partial download…". This
   // mirrors readItems' mapping exactly, including the Queued case:
   // a live Queued row WITH a target is a resume-queued recording
-  // from before the fix; a live Queued row WITHOUT one is a schedule
+  // from an older version; a live Queued row WITHOUT one is a schedule
   // that never started, and stays Queued. "Pausing" is in the list
   // even though the durable JobState enum has no such variant
   // (sync maps it to Queued/Interrupted) — a row carrying it must
@@ -180,9 +178,9 @@ function storedJobToItem(row: StoredJob): Item {
     scheduledAt: row.scheduledAtMs, representationId: row.representationId,
     audioRepresentationId: row.audioRepresentationId,
     segmentsDone: row.segmentsDone, segmentsTotal: row.segmentsTotal,
-    // Slice 6 fix (MAJOR): restore the live flag, or a live row
-    // re-seeded from the durable store loses live routing and takes
-    // the VOD start path, which rejects live playlists.
+    // Restore the live flag, or a live row re-seeded from the durable
+    // store loses live routing and takes the VOD start path, which
+    // rejects live playlists.
     live: row.live ? true : undefined
   };
 }
@@ -194,8 +192,8 @@ function itemToSyncJob(item: Item) {
     scheduledAt: item.scheduledAt ?? null, representationId: item.representationId ?? null,
     audioRepresentationId: item.audioRepresentationId ?? null, detail: item.detail,
     error: item.error ?? null,
-    // Slice 6 fix (MAJOR): carry the live flag, or a live row synced
-    // to the durable store loses it and comes back as VOD.
+    // Carry the live flag when syncing to the durable store, or a live
+    // row loses it and comes back as VOD.
     live: item.live ?? false
   };
 }
@@ -217,7 +215,6 @@ function Status({ value }: { value: Status }) {
 // silently ignores (a completed job has no live task to cancel).
 // Live recordings are never cancellable: a live partial file IS the
 // recording, and Pause — not Cancel — is how a live recording stops
-// (Slice 6 fix, MAJOR).
 const CANCELLABLE_STATUSES: Status[] = ["Downloading", "Pausing", "Paused", "Failed", "Interrupted", "Queued"];
 function canCancel(item: Item): boolean {
   return !item.live && CANCELLABLE_STATUSES.includes(item.status);
@@ -269,19 +266,19 @@ export default function App() {
   const [filename, setFilename] = useState("");
   const [scheduleAt, setScheduleAt] = useState("");
   const [videoUrl, setVideoUrl] = useState("");
-  // P0-7: the URL the variants were actually inspected from. The
-  // input above stays editable, so the Download button must not read
-  // the live input — a yt-dlp format needs the inspected page URL,
-  // and an edited input would send yt-dlp a wrong URL.
+  // The URL the variants were actually inspected from. The input above
+  // stays editable, so the Download button must not read the live input
+  // — a yt-dlp format needs the inspected page URL, and an edited input
+  // would send yt-dlp a wrong URL.
   const [inspectedUrl, setInspectedUrl] = useState("");
   const [items, setItems] = useState<Item[]>(readItems);
   const [variants, setVariants] = useState<Variant[]>([]);
   const [inspecting, setInspecting] = useState(false);
   const [notice, setNotice] = useState("Ready.");
   const [videoNotice, setVideoNotice] = useState("");
-  // Site grabber (Slice 7): paste-a-page-URL path. The desktop reads
-  // the page's static HTML only, so `grabbed` may miss media that a
-  // login or JavaScript would reveal; the extension sees the live page.
+  // Site grabber: paste-a-page-URL path. The desktop reads the page's
+  // static HTML only, so `grabbed` may miss media that a login or
+  // JavaScript would reveal; the extension sees the live page.
   const [grabUrl, setGrabUrl] = useState("");
   const [grabbed, setGrabbed] = useState<GrabItem[]>([]);
   const [grabChecked, setGrabChecked] = useState<Record<string, boolean>>({});
@@ -318,9 +315,9 @@ export default function App() {
     try { return localStorage.getItem(NATIVE_BANNER_DISMISSED_KEY) || ""; } catch { return ""; }
   });
   const [extensionFileStatus, setExtensionFileStatus] = useState("");
-  // Slice 6: clipboard watcher + LinkGrabber. Off by default — the
-  // user turns it on in Settings. The seen set lives in a ref so a
-  // URL is never offered twice in one app session.
+  // Clipboard watcher + LinkGrabber. Off by default — the user turns it
+  // on in Settings. The seen set lives in a ref so a URL is never
+  // offered twice in one app session.
   const [clipboardWatch, setClipboardWatch] = useState(() => localStorage.getItem(CLIPBOARD_WATCH_KEY) === "1");
   const [grabbedLinks, setGrabbedLinks] = useState<string[]>([]);
   const [linkGrabberOpen, setLinkGrabberOpen] = useState(false);
@@ -334,8 +331,8 @@ export default function App() {
   const [ffmpegPath, setFfmpegPath] = useState("ffmpeg");
   const [ffmpegStatus, setFfmpegStatus] = useState("");
   const [ffmpegSaving, setFfmpegSaving] = useState(false);
-  // Slice 3: on-demand yt-dlp/Deno tools (option b — nothing bundled).
-  // The title from a yt-dlp inspect becomes the download filename.
+  // On-demand yt-dlp/Deno tools — nothing is bundled. The title from a
+  // yt-dlp inspect becomes the download filename.
   const [videoTitle, setVideoTitle] = useState("");
   const [ytdlpTools, setYtdlpTools] = useState<{ ytdlp: { present: boolean; version?: string }; deno: { present: boolean; version?: string }; toolsDir: string } | null>(null);
   const [ytdlpToolProgress, setYtdlpToolProgress] = useState<{ tool: string; percent?: number } | null>(null);
@@ -379,12 +376,12 @@ export default function App() {
   const downloadingSubtitles = useRef(new Set<string>());
   // P2: pending throttled history write (see the HISTORY_KEY effect).
   const historyWriteTimer = useRef<number | null>(null);
-  // H4: ids with a cancel()/remove() call in flight — the row ×, the
+  // Ids with a cancel()/remove() call in flight — the row ×, the
   // context-menu Remove and keyboard Delete stay disabled until the
   // call settles, so a second Remove cannot race the first.
   const [busyIds, setBusyIds] = useState<string[]>([]);
-  // M9: schedule wake-ups tick every 15 s, not every second — the 1 s
-  // clock below exists only for speed/ETA staleness.
+  // Schedule wake-ups tick every 15 s, not every second — the 1 s clock
+  // below exists only for speed/ETA staleness.
   const [scheduleTick, setScheduleTick] = useState(() => Date.now());
 
   // Live transfer rate for one job: a number when a fresh rate is
@@ -424,9 +421,9 @@ export default function App() {
   }
 
   const active = items.filter((item) => item.status === "Downloading" || item.status === "Pausing" || item.status === "Cancelling").length;
-  // H5: native jobs run in the companion and never consume a desktop
-  // slot — only desktop actives count against the parallel limit, or
-  // browser downloads would starve the desktop queue.
+  // Native jobs run in the companion and never consume a desktop slot —
+  // only desktop actives count against the parallel limit, or browser
+  // downloads would starve the desktop queue.
   const activeDesktop = items.filter((item) => item.source !== "native" && (item.status === "Downloading" || item.status === "Pausing" || item.status === "Cancelling")).length;
   const queued = items.filter((item) => item.status === "Queued").length;
   const done = items.filter((item) => item.status === "Completed").length;
@@ -457,7 +454,7 @@ export default function App() {
   // The Queues page promises "waiting, running, or needing attention":
   // Failed/Interrupted jobs belong here too, with their Retry action.
   const queueItems = useMemo(() => ordered.filter((item) => tabOf(item) === "active" || tabOf(item) === "failed"), [ordered]);
-  // M9: the schedule input's minimum is derived from the 15 s schedule
+  // The schedule input's minimum is derived from the 15 s schedule
   // tick, not the 1 s clock — it must not recompute every second.
   const scheduleMin = useMemo(() => new Date(scheduleTick - new Date(scheduleTick).getTimezoneOffset() * 60000).toISOString().slice(0, 16), [scheduleTick]);
   const scheduledItems = useMemo(() => ordered.filter((item) => item.scheduledAt !== undefined).sort((a, b) => (a.scheduledAt || 0) - (b.scheduledAt || 0)), [ordered]);
@@ -486,12 +483,11 @@ export default function App() {
       try { localStorage.setItem(HISTORY_KEY, JSON.stringify(itemsRef.current)); } catch { /* history is best-effort */ }
     }, 500);
   }, [items]);
-  // P0-1: the 500 ms trailing write above can lose the last state
-  // when the app closes or the window hides before the timer fires —
-  // the next startup would then re-seed stale statuses. Flush the
-  // pending write synchronously on beforeunload and when the page
-  // becomes hidden, so the history on disk is never older than the
-  // last committed list.
+  // The 500 ms trailing write above can lose the last state when the app
+  // closes or the window hides before the timer fires — the next startup
+  // would then re-seed stale statuses. Flush the pending write
+  // synchronously on beforeunload and when the page becomes hidden, so
+  // the history on disk is never older than the last committed list.
   useEffect(() => {
     const flushHistory = () => {
       if (historyWriteTimer.current !== null) {
@@ -514,7 +510,7 @@ export default function App() {
   useEffect(() => {
     try { localStorage.setItem(NATIVE_BANNER_DISMISSED_KEY, dismissedBannerKind); } catch { /* dismissal is best-effort */ }
   }, [dismissedBannerKind]);
-  // H1 (P0-14c): the Tauri clipboard-manager plugin, not the webview's
+  // The Tauri clipboard-manager plugin, not the webview's
   // navigator.clipboard — polling the web clipboard every 2 s with
   // only a focus guard is what the audit flagged. The plugin read is
   // an explicit, user-opted-in capability
@@ -553,10 +549,10 @@ export default function App() {
     localStorage.setItem(SPEED_LIMIT_KEY, String(speedLimit));
     void invoke("set_speed_limit", { bytesPerSecond: speedLimit }).catch((error) => setNotice("Could not apply speed limit: " + String(error)));
   }, [speedLimit]);
-  // M9: the 1 s clock drives speed/ETA staleness only. Scheduled
-  // starts use the separate 15 s schedule tick (see the dispatcher),
-  // so the dispatcher and the schedule input's minimum do not re-run
-  // every second.
+  // The 1 s clock drives speed/ETA staleness only. Scheduled starts use
+  // the separate 15 s schedule tick (see the dispatcher), so the
+  // dispatcher and the schedule input's minimum do not re-run every
+  // second.
   // P1-22: a stale rate only ever shows on a Downloading row
   // (jobSpeed returns early otherwise), so when nothing is
   // downloading the tick has nothing to update — skip the setClock
@@ -595,7 +591,7 @@ export default function App() {
           event.preventDefault();
           // Same gate as the row × button and context-menu Remove: a
           // live transfer must not be killed (and its partial file
-          // deleted) from the keyboard. H4: also blocked while a
+          // deleted) from the keyboard. Also blocked while a
           // cancel/remove is already in flight for this row.
           if (canRemove(item) && !busyIds.includes(selectedId)) void remove(selectedId);
         } else if (event.key.toLowerCase() === "p") {
@@ -608,17 +604,17 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [addOpen, grabberOpen, linkGrabberOpen, selectedId, items, contextMenu, busyIds]);
 
-  // Slice 5: seed the queue from the durable job database on startup,
-  // then send the merged desktop list back so jobs the store does not
-  // know yet (pre-Slice-5 history, queued jobs that never started)
-  // enter the database. Stored rows win by id; local history fills the
-  // rest. Browser-started rows keep coming through the native poll.
-  // P0-1: the dispatcher must not auto-start anything until this
-  // initial merge has run — a stale local row re-queued from history
-  // would otherwise start before the authoritative jobs.json state
-  // lands, and that start would durably overwrite the stored row
-  // via start_job. Seeded also flips true when get_jobs fails,
-  // so a dead backend cannot wedge the queue forever.
+  // Seed the queue from the durable job database on startup, then send
+  // the merged desktop list back so jobs the store does not know yet
+  // (older history, queued jobs that never started) enter the database.
+  // Stored rows win by id; local history fills the rest.
+  // Browser-started rows keep coming through the native poll. The
+  // dispatcher must not auto-start anything until this initial merge has
+  // run — a stale local row re-queued from history would otherwise start
+  // before the authoritative jobs.json state lands, and that start would
+  // durably overwrite the stored row via start_job. Seeded also flips
+  // true when get_jobs fails, so a dead backend cannot wedge the queue
+  // forever.
   const [seeded, setSeeded] = useState(false);
   const seededRef = useRef(false);
   useEffect(() => {
@@ -627,12 +623,11 @@ export default function App() {
     void invoke<Array<StoredJob>>("get_jobs").then((rows) => {
       const stored = rows.filter((row) => row.origin !== "native").map(storedJobToItem);
       const byId = new Map(itemsRef.current.map((item) => [item.id, item]));
-      // P0-1: ids whose stored row the C1 skip below dropped. The
-      // local row wins in memory, but the stored row is authoritative
-      // — skipped ids stay out of the sync_jobs payload below as
-      // belt-and-braces (the backend already skips ids it knows, so
-      // the echo could not overwrite them; this guards a future
-      // sync_jobs change).
+      // Ids whose stored row the C1 skip below dropped. The local row
+      // wins in memory, but the stored row is authoritative — skipped ids
+      // stay out of the sync_jobs payload below as belt-and-braces (the
+      // backend already skips ids it knows, so the echo could not
+      // overwrite them; this guards a future sync_jobs change).
       const skipped = new Set<string>();
       for (const item of stored) {
         // C1: never overwrite a row the dispatcher/engine already
@@ -710,8 +705,8 @@ export default function App() {
           name: job.name || "Browser download",
           url: job.url || "",
           kind: job.kind === "hls" ? "hls" : job.kind === "dash" ? "dash" : job.kind === "ytdlp" ? "ytdlp" : "direct",
-          // H2: Pausing/Cancelling/Queued are real states, not errors —
-          // the old whitelist mapped them to "Failed".
+          // Pausing/Cancelling/Queued are real states, not errors — the
+          // old whitelist mapped them to "Failed".
           status: (["Downloading", "Pausing", "Paused", "Cancelling", "Queued", "Completed", "Failed", "Interrupted", "Cancelled"].includes(job.status || "") ? job.status : "Failed") as Status,
           percent: Math.max(0, Math.min(100, job.percent || 0)),
           downloaded: job.downloaded || 0,
@@ -725,16 +720,15 @@ export default function App() {
           source: "native",
           segmentsDone: job.segmentsDone,
           segmentsTotal: job.segmentsTotal,
-          // Slice 6 fix (MAJOR): carry the companion's live flag, or
-          // a browser-started live recording shows Resume/Cancel
-          // buttons that destroy it.
+          // Carry the companion's live flag, or a browser-started live
+          // recording shows Resume/Cancel buttons that destroy it.
           live: job.live ? true : undefined
         }));
-        // Slice 7b (Gemini claim 14): native jobs are polled, never
-        // pushed, so the poll is where their speed samples come from —
-        // the same helper the local download-progress listener uses.
-        // Samples for jobs that stopped downloading (or vanished) are
-        // dropped, so a finished job never shows a stale rate.
+        // Native jobs are polled, never pushed, so the poll is where
+        // their speed samples come from — the same helper the local
+        // download-progress listener uses. Samples for jobs that stopped
+        // downloading (or vanished) are dropped, so a finished job never
+        // shows a stale rate.
         const now = Date.now();
         for (const item of external) {
           if (item.status === "Downloading") recordSpeedSample(speedSamples.current, item.id, item.downloaded, now);
@@ -746,10 +740,10 @@ export default function App() {
           const merged = new Map(current.map((item) => [item.id, item]));
           for (const item of external) {
             const prev = merged.get(item.id);
-            // H2: the poll must not clobber an optimistic Pausing/
-            // Cancelling row — the companion still reports Downloading
-            // until its control loop acts, and the row would flicker
-            // back to Downloading on every poll.
+            // The poll must not clobber an optimistic Pausing/Cancelling
+            // row — the companion still reports Downloading until its
+            // control loop acts, and the row would flicker back to
+            // Downloading on every poll.
             if (prev && (prev.status === "Pausing" || prev.status === "Cancelling") && item.status === "Downloading") {
               merged.set(item.id, { ...item, status: prev.status, detail: prev.detail });
             } else {
@@ -779,7 +773,6 @@ export default function App() {
     return () => { alive = false; };
   }, []);
 
-  // Slice 3: load the yt-dlp/Deno tool status whenever Settings opens.
   useEffect(() => { if (page === "settings") void loadYtDlpTools(); }, [page]);
 
   useEffect(() => {
@@ -791,10 +784,10 @@ export default function App() {
           setYtdlpToolProgress({ tool: payload.tool, percent: payload.percent });
         }),
         listen<{ jobId: string; progress: Progress }>("download-progress", ({ payload }) => {
-          // Slice 7b: the shared sampler — the native poll feeds the
-          // same helper, so local and native jobs measure speed the
-          // same way. Segment counts ride the same event and are kept
-          // when the transfer reports them.
+          // The shared sampler — the native poll feeds the same helper,
+          // so local and native jobs measure speed the same way. Segment
+          // counts ride the same event and are kept when the transfer
+          // reports them.
           recordSpeedSample(speedSamples.current, payload.jobId, payload.progress.downloaded, Date.now());
           setItems((current) => current.map((item) => {
             if (item.id !== payload.jobId) return item;
@@ -815,7 +808,7 @@ export default function App() {
               percent,
               segmentsDone: payload.progress.segments_done ?? item.segmentsDone,
               segmentsTotal: payload.progress.segments_total ?? item.segmentsTotal,
-              // M2: a progress event must not overwrite the detail of a
+              // A progress event must not overwrite the detail of a
               // Pausing/Cancelling row or a terminal row (e.g. a late
               // event arriving after the user paused) — the status is
               // never overwritten here, and neither is its detail.
@@ -841,15 +834,14 @@ export default function App() {
           setNotice("Download completed.");
         }),
         listen<{ jobId: string; targetPath: string }>("download-paused", ({ payload }) => {
-          // M1: a paused job's rate sample is done, like complete/
-          // cancelled/error — without this a paused row kept a stale
-          // sample that skewed the status-bar aggregate.
+          // A paused job's rate sample is done, like complete, cancelled
+          // or error — without this a paused row kept a stale sample that
+          // skewed the status-bar aggregate.
           speedSamples.current.delete(payload.jobId);
           startingIds.current.delete(payload.jobId);
           setItems((current) => current.map((item) => item.id === payload.jobId
-            // Slice 6 fix round 2 (nit 3): a live recording has no
-            // checkpoint, so "partial file saved" is the wrong words
-            // for it — the partial IS the recording.
+            // A live recording has no checkpoint, so "partial file saved"
+            // is the wrong words for it — the partial IS the recording.
             ? { ...item, status: "Paused", targetPath: payload.targetPath, detail: item.live ? "Paused · partial recording kept" : "Paused · partial file saved", error: undefined }
             : item));
         }),
@@ -858,13 +850,12 @@ export default function App() {
           startingIds.current.delete(payload.jobId);
           setBusyIds((current) => current.filter((id) => id !== payload.jobId));
           setItems((current) => current.map((item) => item.id === payload.jobId
-            // Slice 6 fix round 2 (nit 2, defense-in-depth): the live
-            // finish arms emit this event too, and a live partial file
-            // IS the recording — never wipe its target or claim it was
-            // removed. No UI path cancels a live job today (every
-            // cancel call site is live-gated), so this is the
-            // finishing race only, but the row must stay honest if it
-            // ever fires: the recording stays on disk, with its size.
+            // The live finish arms emit this event too, and a live partial
+            // file IS the recording — never wipe its target or claim it
+            // was removed. No UI path cancels a live job today (every
+            // cancel call site is live-gated), so this is the finishing
+            // race only, but the row must stay honest if it ever fires:
+            // the recording stays on disk, with its size.
             ? item.live
               ? { ...item, status: "Cancelled", detail: "Recording stopped · partial file kept", scheduledAt: undefined }
               : { ...item, status: "Cancelled", detail: "Cancelled · partial file removed", targetPath: undefined, downloaded: 0, percent: 0, scheduledAt: undefined }
@@ -887,19 +878,19 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
   }, []);
 
   useEffect(() => {
-    // P0-1: never auto-start before the initial get_jobs merge — a
-    // stale local row must not start (and get echoed back as
-    // Downloading) before the authoritative jobs.json state lands.
+    // Never auto-start before the initial get_jobs merge — a stale local
+    // row must not start (and get echoed back as Downloading) before the
+    // authoritative jobs.json state lands.
     if (!seeded) return;
-    // H5: slots count desktop actives only (see activeDesktop) — a
-    // browser download must not eat a desktop queue slot.
+    // Slots count desktop actives only (see activeDesktop) — a browser
+    // download must not eat a desktop queue slot.
     const slots = Math.max(0, parallel - activeDesktop);
     // C1: skip ids with a start already in flight. The optimistic flip
     // below is not enough on its own: the effect can re-run before the
     // flip commits (StrictMode double effects, a schedule re-run), and
-    // the Set — stable across renders — closes that window. M9: due
-    // times are checked against the 15 s schedule tick, not the 1 s
-    // clock, so this effect does not re-run every second.
+    // the Set — stable across renders — closes that window. Due times
+    // are checked against the 15 s schedule tick, not the 1 s clock, so
+    // this effect does not re-run every second.
     const next = items.filter((item) => item.source !== "native" && item.status === "Queued" && !startingIds.current.has(item.id) && (!item.scheduledAt || item.scheduledAt <= scheduleTick)).slice(0, slots);
     if (!next.length) return;
     const ids = new Set(next.map((item) => item.id));
@@ -917,7 +908,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, scheduledAt: undefined } : entry));
         }
         if (item.kind === "ytdlp") {
-          // Slice 3: the format selector is representationId (+ "+" +
+          // The format selector is representationId (+ "+" +
           // audioRepresentationId for a merged pick) — the backend
           // re-runs the identical yt-dlp command on resume, and yt-dlp
           // resumes from its .part files natively.
@@ -930,18 +921,18 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           });
           setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, targetPath } : entry));
         } else if (item.kind === "hls") {
-          // Slice 6: a live row records the stream as it arrives —
-          // the live command keeps the partial .ts file on pause,
-          // because the partial file IS the recording. A live row only
-          // ever reaches this command as a brand-new recording: there
-          // is NO checkpoint to reuse, and the engine re-records from
-          // the live edge and truncates the target — so no live row is
-          // ever re-queued on an existing target (Pause is terminal;
-          // see resume()/readItems). The VOD half of this branch
-          // reuses its on-disk checkpoint instead of reserving a fresh
-          // target and restarting from scratch. The returned path is
-          // stored so Cancel works while the job is running (VOD only
-          // — Cancel is never offered for live).
+          // A live row records the stream as it arrives — the live
+          // command keeps the partial .ts file on pause, because the
+          // partial file IS the recording. A live row only ever reaches
+          // this command as a brand-new recording: there is NO checkpoint
+          // to reuse, and the engine re-records from the live edge and
+          // truncates the target — so no live row is ever re-queued on an
+          // existing target (Pause is terminal; see resume()/readItems).
+          // The VOD half of this branch reuses its on-disk checkpoint
+          // instead of reserving a fresh target and restarting from
+          // scratch. The returned path is stored so Cancel works while
+          // the job is running (VOD only — Cancel is never offered for
+          // live).
           const targetPath = item.live
             ? await invoke<string>("start_hls_live_download", { jobId: item.id, url: item.url, representationId: item.representationId || null, audioRepresentationId: item.audioRepresentationId || null, filename: item.name, targetPath: item.targetPath || null, scheduledAt: null })
             : await invoke<string>("start_hls_download", { jobId: item.id, url: item.url, representationId: item.representationId || null, audioRepresentationId: item.audioRepresentationId || null, filename: item.name, targetPath: item.targetPath || null, connections, scheduledAt: null });
@@ -956,14 +947,14 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
             audioRepresentationId: item.audioRepresentationId || null, filename: item.name,
             targetPath: item.targetPath || null, connections, scheduledAt: null
           });
-          // M7: remember the connections this job started with, so the
+          // Remember the connections this job started with, so the
           // inspector shows the job's own value, not the live setting.
           setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, targetPath, connections } : entry));
         } else {
           const targetPath = await invoke<string>("start_download", {
             jobId: item.id, url: item.url, filename: item.name, targetPath: item.targetPath || null, connections, scheduledAt: null
           });
-          // M7: remember the connections this job started with, so the
+          // Remember the connections this job started with, so the
           // inspector shows the job's own value, not the live setting.
           setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, targetPath, connections } : entry));
         }
@@ -1048,7 +1039,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       try {
         // The pasted URL as its own referer: hotlink-protected hosts
         // accept a same-origin referer, and the desktop has no better
-        // one (Slice 5). The engine validates it before use.
+        // one. The engine validates it before use.
         const inspected = await invoke<Variant[]>("inspect_video_url", { url: clean, referer: clean });
         // P1-9: kind + live come from the inspected variants, not the
         // URL suffix. An extensionless HLS/DASH URL has no suffix to
@@ -1104,7 +1095,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       id: crypto.randomUUID(), name: (saveAs || "").trim() || (kind === "hls" || kind === "dash" ? "video.mp4" : suggested),
       url: clean, kind, status: "Queued", percent: 0, downloaded: 0,
       representationId: resolvedRepId, audioRepresentationId: resolvedAudioRepId,
-      // Slice 6: only an HLS row can be live — the queue effect
+      // Only an HLS row can be live — the queue effect
       // routes it to the live recorder; yt-dlp live and DASH live
       // never take this path (yt-dlp handles its own, DASH live is
       // refused by the engine).
@@ -1113,16 +1104,16 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       createdAt: Date.now(),
       scheduledAt
     };
-    // H5: append, not prepend. The table sorts newest-first for
-    // display (`ordered`), but the dispatcher takes queued jobs in
-    // list order — prepending made the newest job jump the queue and
-    // starved older ones. The functional update stays: the render
-    // closure's `items` goes stale when several adds land before a
-    // re-render, and a stale closure would keep only the last item.
+    // Append, not prepend. The table sorts newest-first for display
+    // (`ordered`), but the dispatcher takes queued jobs in list order —
+    // prepending made the newest job jump the queue and starved older
+    // ones. The functional update stays: the render closure's `items`
+    // goes stale when several adds land before a re-render, and a stale
+    // closure would keep only the last item.
     setItems((current) => [...current, item]);
-    // Slice 5: record the queued job in the durable store immediately,
-    // so it survives a restart even if it never gets a download slot
-    // before the app closes.
+    // Record the queued job in the durable store immediately, so it
+    // survives a restart even if it never gets a download slot before
+    // the app closes.
     void invoke("sync_jobs", { jobs: [itemToSyncJob(item)] }).catch(() => {});
     setNotice(scheduledAt ? "Added to queue. Registering scheduled wake…" : "Added to queue.");
     if (scheduledAt && scheduledFor) {
@@ -1130,25 +1121,24 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
         .then((status) => setNotice(status))
         .catch((error) => setNotice("Queued locally, but a scheduled wake task could not be registered: " + String(error)));
     }
-    // M6: the Add-dialog inputs are cleared only when this add came
-    // from the dialog's own submit (clearForm). Retry, grabber,
-    // subtitle and LinkGrabber adds must not wipe what the user typed
-    // in the dialog.
+    // The Add-dialog inputs are cleared only when this add came from the
+    // dialog's own submit (clearForm). Retry, grabber, subtitle and
+    // LinkGrabber adds must not wipe what the user typed in the dialog.
     if (clearForm) { setUrl(""); setFilename(""); setScheduleAt(""); }
     return true;
   }
   async function pause(item: Item) {
-    // P0-8: the row flips to "Pausing" BEFORE the invoke — the old
-    // code set it after the await, and a pause event landing in
-    // between (or a slow backend) left the row wedged. Terminal rows
-    // never flip. If the invoke fails, the row goes back to the status
-    // it had, instead of stranding on "Pausing".
+    // The row flips to "Pausing" BEFORE the invoke — the old code set it
+    // after the await, and a pause event landing in between (or a slow
+    // backend) left the row wedged. Terminal rows never flip. If the
+    // invoke fails, the row goes back to the status it had, instead of
+    // stranding on "Pausing".
     const prevStatus = item.status;
     const prevDetail = item.detail;
     setItems((current) => current.map((entry) => entry.id === item.id
       && !["Completed", "Failed", "Interrupted", "Cancelled"].includes(entry.status)
-      // Slice 6 fix round 2 (nit 3): a live recording has no
-      // checkpoint to save — the pause keeps the partial recording.
+      // A live recording has no checkpoint to save — the pause keeps the
+      // partial recording.
       ? { ...entry, status: "Pausing", detail: item.live ? "Pausing · keeping partial recording…" : "Pausing · saving checkpoint…" }
       : entry));
     try {
@@ -1176,12 +1166,12 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     }
   }
   async function resumeInner(item: Item) {
-    // Slice 6 fix (MAJOR): Pause is terminal for a live recording —
-    // there is no checkpoint to resume from, and re-queuing the same
-    // target would re-record over the kept partial. A live job never
-    // reaches this function through the UI (Resume is not offered for
-    // live jobs); this guard is the last line of defence if a caller
-    // bypasses those gates — it routes to a fresh recording instead.
+    // Pause is terminal for a live recording — there is no checkpoint to
+    // resume from, and re-queuing the same target would re-record over
+    // the kept partial. A live job never reaches this function through
+    // the UI (Resume is not offered for live jobs); this guard is the
+    // last line of defence if a caller bypasses those gates — it routes
+    // to a fresh recording instead.
     if (item.live) {
       retry(item);
       return;
@@ -1247,10 +1237,10 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       setItems((current) => current.map((entry) => entry.id === item.id ? { ...entry, scheduledAt: undefined } : entry));
     }
     if (item.source === "native") {
-      // P0-8: the row flips to "Cancelling" BEFORE the invoke — the
-      // old code set it after the await, overwriting the "Cancelled"
-      // the backend event had already delivered. If the invoke fails,
-      // the row goes back to the status it had.
+      // The row flips to "Cancelling" BEFORE the invoke — the old code
+      // set it after the await, overwriting the "Cancelled" the backend
+      // event had already delivered. If the invoke fails, the row goes
+      // back to the status it had.
       const prevStatus = item.status;
       const prevDetail = item.detail;
       try {
@@ -1258,9 +1248,9 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           // No native process owns this job anymore: delete its orphaned
           // checkpoint locally (if any) and drop its record. A live
           // recording has no checkpoint — the backend keeps its partial
-          // file, so the row keeps its target and says so (Slice 6 fix,
-          // MAJOR). Cancel is never offered for live jobs, so this is
-          // only reachable if a caller bypasses the button gates.
+          // file, so the row keeps its target and says so. Cancel is
+          // never offered for live jobs, so this is only reachable if a
+          // caller bypasses the button gates.
           if (item.targetPath) {
             await invoke("cancel_download", { jobId: item.id, targetPath: item.targetPath });
           }
@@ -1291,12 +1281,12 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     // C2: route by state, not by targetPath. A job that started — or
     // is starting, its target not yet landed in the frontend — cancels
     // through the backend, which owns the live task and the checkpoint.
-    // Only a job that never started cancels locally. H4: the row is
-    // marked busy until the call settles so ×/Delete cannot race it.
-    // P0-8: the row flips to "Cancelling" BEFORE the invoke below —
-    // setting it after the await overwrote the "Cancelled" the backend
-    // event had already delivered, wedging the row on "Cancelling".
-    // If the invoke fails, the row goes back to the status it had.
+    // Only a job that never started cancels locally. The row is marked
+    // busy until the call settles so ×/Delete cannot race it. The row
+    // flips to "Cancelling" BEFORE the invoke below — setting it after
+    // the await overwrote the "Cancelled" the backend event had already
+    // delivered, wedging the row on "Cancelling". If the invoke fails,
+    // the row goes back to the status it had.
     const prevStatus = item.status;
     const prevDetail = item.detail;
     setBusyIds((current) => current.includes(item.id) ? current : [...current, item.id]);
@@ -1312,10 +1302,10 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       }
       setItems((current) => current.map((entry) => entry.id === item.id
         && !["Completed", "Failed", "Interrupted", "Cancelled"].includes(entry.status)
-        // Slice 6 fix (MAJOR): Cancel is never offered for live jobs,
-        // so this is only reachable if a caller bypasses the button
-        // gates — the backend keeps a live target either way, so the
-        // detail must not claim the partial was deleted.
+        // Cancel is never offered for live jobs, so this is only
+        // reachable if a caller bypasses the button gates — the backend
+        // keeps a live target either way, so the detail must not claim
+        // the partial was deleted.
         ? { ...entry, status: "Cancelling", detail: item.live ? "Cancelling…" : "Cancelling and deleting partial file…" }
         : entry));
       await invoke("cancel_download", { jobId: item.id, targetPath: item.targetPath || "" });
@@ -1330,11 +1320,11 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
   async function remove(id: string) {
     const item = items.find((entry) => entry.id === id);
     if (!item) return;
-    // H3: removing a row with a saved checkpoint deletes the partial
-    // file (via cancel_download below) — destructive and irreversible,
-    // so Paused/Failed/Interrupted/Queued rows with a target ask
-    // first. Completed rows have no checkpoint to lose, and a live
-    // recording's file is never deleted, so neither asks.
+    // Removing a row with a saved checkpoint deletes the partial file
+    // (via cancel_download below) — destructive and irreversible, so
+    // Paused/Failed/Interrupted/Queued rows with a target ask first.
+    // Completed rows have no checkpoint to lose, and a live recording's
+    // file is never deleted, so neither asks.
     if (item.targetPath && !item.live && ["Paused", "Failed", "Interrupted", "Queued"].includes(item.status)) {
       let ok: boolean;
       try {
@@ -1344,8 +1334,8 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       }
       if (!ok) return;
     }
-    // H4: mark the row busy until remove settles, so a second × /
-    // Delete / context-menu Remove cannot race this one.
+    // Mark the row busy until remove settles, so a second × / Delete /
+    // context-menu Remove cannot race this one.
     setBusyIds((current) => current.includes(id) ? current : [...current, id]);
     if (item?.scheduledAt) {
       await invoke("cancel_app_wake", { jobId: item.id }).catch(() => {});
@@ -1355,7 +1345,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     // recording is the exception — its companion's job already ended
     // when it paused or failed, so there is no live task to cancel;
     // fall through to the dismiss below, which drops the stale record
-    // and keeps the recording file. (Slice 6 fix, MAJOR.)
+    // and keeps the recording file.
     if (item?.source === "native" && !item.live
         && ["Downloading", "Pausing", "Paused", "Failed"].includes(item.status)) {
       await cancel(item);
@@ -1369,36 +1359,36 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       // live companion to cancel first and waits for it, so the companion
       // cannot resurrect the record afterwards. A live Interrupted job
       // is the exception: its partial file IS the recording, so the
-      // backend must not delete it (Slice 6 fix, MAJOR — cancel_download
-      // skips target deletion for live rows, prefixed id included).
+      // backend must not delete it — cancel_download skips target
+      // deletion for live rows, prefixed id included.
       if (item.status === "Interrupted" && item.targetPath && !item.live) {
         await invoke("cancel_download", { jobId: item.id, targetPath: item.targetPath }).catch(() => {});
       }
       await invoke("dismiss_native_download", { jobId: item.id.replace(/^native-/, "") }).catch(() => {});
     } else if (item?.targetPath && item.status !== "Completed" && !item.live) {
-      // Slice 6 fix (MAJOR): never call cancel_download for a live
-      // recording — removing the row is enough; the file is kept.
+      // Never call cancel_download for a live recording — removing the
+      // row is enough; the file is kept.
       await invoke("cancel_download", { jobId: item.id, targetPath: item.targetPath }).catch(() => {});
     }
-    // Slice 5: drop the durable row too, or a removed job would be
-    // re-seeded from the database on the next startup.
+    // Drop the durable row too, or a removed job would be re-seeded from
+    // the database on the next startup.
     if (item?.source !== "native") {
       void invoke("remove_job", { jobId: id }).catch(() => {});
     }
     // The job is gone: its rate sample must not linger and skew the
     // status-bar aggregate.
     speedSamples.current.delete(id);
-    // H4: the filter keeps a Cancelling row, not just Downloading/
-    // Pausing — removing the row while the backend is still cancelling
-    // would leave the cancel event with no row to land on.
+    // The filter keeps a Cancelling row, not just Downloading/Pausing —
+    // removing the row while the backend is still cancelling would leave
+    // the cancel event with no row to land on.
     setItems((current) => current.filter((entry) => entry.id !== id || entry.status === "Downloading" || entry.status === "Pausing" || entry.status === "Cancelling"));
     setBusyIds((current) => current.filter((entry) => entry !== id));
   }
   function retry(item: Item) {
-    // Slice 6 fix (MAJOR): a live recording has no checkpoint — a
-    // retry is a FRESH recording on a fresh target, never the old one.
-    // Re-queueing the same target would re-record over the kept
-    // partial; the old partial stays on disk.
+    // A live recording has no checkpoint — a retry is a FRESH recording
+    // on a fresh target, never the old one. Re-queueing the same target
+    // would re-record over the kept partial; the old partial stays on
+    // disk.
     if (item.live) {
       add(item.url, item.name, item.kind, item.representationId, item.audioRepresentationId, true);
       return;
@@ -1416,17 +1406,17 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       .map((item) => invoke("cancel_app_wake", { jobId: item.id }).catch(() => {})));
     await Promise.all(finished.filter((item) => item.source === "native")
       .map((item) => invoke("dismiss_native_download", { jobId: item.id.replace(/^native-/, "") }).catch(() => {})));
-    // Slice 5: drop the durable rows too, or cleared jobs would be
-    // re-seeded from the database on the next startup.
+    // Drop the durable rows too, or cleared jobs would be re-seeded from
+    // the database on the next startup.
     await Promise.all(finished.filter((item) => item.source !== "native")
       .map((item) => invoke("remove_job", { jobId: item.id }).catch(() => {})));
     finished.forEach((item) => speedSamples.current.delete(item.id));
     setItems((current) => current.filter((item) => item.status !== "Completed" && item.status !== "Cancelled"));
   }
-  // Slice 3: inspect a YouTube/social page with yt-dlp and list its
-  // formats as variants (kind "ytdlp", representationId = format id).
-  // A missing tool is data, not an error — the notice names the tool and
-  // points at Settings, where the direct download button lives.
+  // Inspect a YouTube/social page with yt-dlp and list its formats as
+  // variants (kind "ytdlp", representationId = format id). A missing
+  // tool is data, not an error — the notice names the tool and points
+  // at Settings, where the direct download button lives.
   async function inspectYtDlp(pageUrl: string) {
     setInspecting(true); setVariants([]); setVideoTitle(""); setInspectedUrl("");
     setVideoNotice("Getting formats…");
@@ -1522,10 +1512,10 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       setGrabbing(false);
     }
   }
-  // Slice 6: a subtitle track from the inspected variants. An HLS
-  // subtitle playlist (.m3u8) is assembled into one .vtt file by the
-  // backend; a direct subtitle file (vtt/ttml/srt) is just a direct
-  // download and queues like any other file.
+  // A subtitle track from the inspected variants. An HLS subtitle
+  // playlist (.m3u8) is assembled into one .vtt file by the backend; a
+  // direct subtitle file (vtt/ttml/srt) is just a direct download and
+  // queues like any other file.
   async function downloadSubtitle(subtitle: SubtitleVariant) {
     // P2: in-flight guard — a double-click must not save the same
     // track twice.
@@ -1538,9 +1528,9 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
         setVideoNotice("Saved · " + path);
       } catch (error) { setVideoNotice(String(error)); }
     } else {
-      // M5: a direct subtitle file queues as a direct download with an
-      // explicit kind and a filename from the track name/language, so
-      // the saved file is named after the track instead of the URL.
+      // A direct subtitle file queues as a direct download with an
+      // explicit kind and a filename from the track name/language, so the
+      // saved file is named after the track instead of the URL.
       const base = subtitle.name || subtitle.language || "subtitles";
       const ext = subtitle.url.match(/\.(vtt|srt|ttml|ass|ssa)(\?|#|$)/i)?.[1]?.toLowerCase() || "vtt";
       const filename = base.toLowerCase().endsWith("." + ext) ? base : base + "." + ext;
@@ -1602,16 +1592,16 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     for (const item of chosen) {
       try {
         if (item.kind === "dash") {
-          // Referer is the page the manifest was grabbed from — the
-          // host that linked to it — not the manifest itself (Slice 5).
+          // Referer is the page the manifest was grabbed from — the host
+          // that linked to it, not the manifest itself.
           const result = await invoke<Variant[]>("inspect_video_url", { url: item.url, referer: grabUrl.trim() });
           const variants = result.filter((variant) => variant.downloadable && variant.url);
           variants.sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bandwidth || 0) - (a.bandwidth || 0));
           const best = variants[0];
           if (!best) { failed += 1; continue; }
-          // Slice 7b (Gemini claim 2): await the add and count what
-          // actually queued — the old fire-and-forget call counted
-          // every item while only the last survived the stale closure.
+          // Await the add and count what actually queued — the old
+          // fire-and-forget call counted every item while only the last
+          // survived the stale closure.
           if (await add(item.url, item.name, "dash", best.representationId, best.audioRepresentationId, undefined, grabScheduleAt || undefined)) queued += 1; else failed += 1;
         } else if (item.kind === "hls") {
           // Inspect first, like DASH: a live playlist must queue
@@ -1624,9 +1614,9 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
             const variants = result.filter((variant) => variant.downloadable && variant.url);
             variants.sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bandwidth || 0) - (a.bandwidth || 0));
             const best = variants[0];
-            // M4: VOD passes the chosen variant's media URL + audio
-            // rendition like the live branch does — without them the
-            // download falls back to the first variant.
+            // VOD passes the chosen variant's media URL + audio rendition
+            // like the live branch does — without them the download falls
+            // back to the first variant.
             if (best?.isLive) ok = await add(item.url, item.name, "hls", best.url, best.audioRepresentationId, true, grabScheduleAt || undefined);
             else if (best) ok = await add(item.url, item.name, "hls", best.url, best.audioRepresentationId, undefined, grabScheduleAt || undefined);
             else ok = await add(item.url, item.name, "hls", undefined, undefined, undefined, grabScheduleAt || undefined);
@@ -1840,11 +1830,10 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       </div>
     </div>;
   }
-  // Slice 6: LinkGrabber dialog (Direction A: same dialog shape as
-  // the grabber). It lists links the clipboard watcher caught — one
-  // Download button per link, nothing else inside. A YouTube/social
-  // page URL goes through the same inspect flow a paste would take,
-  // so the user still picks a format.
+  // LinkGrabber dialog (same dialog shape as the grabber). It lists
+  // links the clipboard watcher caught — one Download button per link,
+  // nothing else inside. A YouTube/social page URL goes through the same
+  // inspect flow a paste would take, so the user still picks a format.
   function linkGrabberDialog() {
     if (!linkGrabberOpen) return null;
     return <div className="dialog-overlay" role="dialog" aria-label="Link grabber" onClick={() => setLinkGrabberOpen(false)}>

@@ -27,12 +27,18 @@
 //!
 //! What the numbers mean — read this before quoting them:
 //!   * The fixture server trickles every body in 64 KiB chunks with a
-//!     1 ms sleep per chunk. That models a server that drips data with
-//!     per-chunk latency, which is what makes parallel connections pay
-//!     off; on raw loopback without the trickle the file would transfer
-//!     in milliseconds and the numbers would be noise. These are
-//!     **engine-parallelism numbers under a latency model, not
-//!     real-internet throughput**.
+//!     1 ms sleep *between* chunks — after every chunk except the last
+//!     of a response, never after the last one. That models a server
+//!     that drips data with per-chunk latency, which is what makes
+//!     parallel connections pay off; on raw loopback without the trickle
+//!     the file would transfer in milliseconds and the numbers would be
+//!     noise. These are **engine-parallelism numbers under a latency
+//!     model, not real-internet throughput**. The checkpointed path
+//!     fetches each 256 KiB engine segment with its own Range request,
+//!     so a 1-connection 64 MiB download is 256 responses of 4 trickle
+//!     chunks each: 256 × 3 = 768 sleeps, a ~768 ms floor on
+//!     direct/1-conn — not the 1024 ms a sleep-after-every-chunk
+//!     reading would imply.
 //!   * Everything runs on localhost against a fixture server in this
 //!     process. No real server, no real network, no IDM is involved:
 //!     a ThunderLoad-vs-IDM side-by-side needs a real Windows machine

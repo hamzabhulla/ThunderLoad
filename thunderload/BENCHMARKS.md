@@ -26,12 +26,17 @@ throughput number.
   `Last-Modified` validators so the resumable path accepts
   checkpoints.
 - **Trickle model:** the server writes every body in 64 KiB chunks
-  with a 1 ms sleep per chunk. That models a server that drips data
-  with per-chunk latency, which is what makes parallel connections pay
-  off; on raw loopback without the trickle the files would transfer in
-  milliseconds and the numbers would be noise. The measured quantity
-  is therefore **engine parallelism under a latency model**, not
-  internet throughput.
+  with a 1 ms sleep *between* chunks — after every chunk except the
+  last of a response, never after the last one. That models a server
+  that drips data with per-chunk latency, which is what makes parallel
+  connections pay off; on raw loopback without the trickle the files
+  would transfer in milliseconds and the numbers would be noise. The
+  measured quantity is therefore **engine parallelism under a latency
+  model**, not internet throughput. The checkpointed path fetches each
+  256 KiB engine segment with its own Range request, so a 1-connection
+  64 MiB download is 256 responses of 4 trickle chunks each: 256 × 3 =
+  768 sleeps, a ≈768 ms floor on `direct/1-conn` (measured 911.2 ms) —
+  not the 1024 ms a sleep-after-every-chunk reading would imply.
 - **Runs:** each bench runs 3 times by default; the median is
   reported (min/max shown by the binary).
 - **Files:** direct benches use a 64 MiB file; HLS/DASH use 32 x 1 MiB
