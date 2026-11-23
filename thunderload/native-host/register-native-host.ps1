@@ -49,12 +49,16 @@ function Register-ChromiumHost([string]$Browser, [string]$ExtensionId, [string]$
 }
 function Register-FirefoxHost([string]$ExtensionId) {
   if ([string]::IsNullOrWhiteSpace($ExtensionId)) { return }
-  # Same rule as the desktop's Firefox validation: an add-on ID is at
-  # most 128 characters of letters, digits and @ . _ + - (the fixed
-  # ThunderLoad ID is thunderload@example.com). A Chromium-style
-  # 32-character ID pasted here must fail loudly, not register a
-  # manifest Firefox will never match.
-  if ($ExtensionId.Length -gt 128 -or $ExtensionId -notmatch '^[A-Za-z0-9@._+-]+$') { throw "Firefox ID must be a valid add-on ID (for example thunderload@example.com)." }
+  # Same rule as the desktop's Firefox validation: an add-on ID is an
+  # email-like ID of at most 128 characters (letters, digits and
+  # @ . _ + -; the fixed ThunderLoad ID is thunderload@example.com)
+  # or a braced GUID {xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}. A
+  # Chromium-style 32-character a-p ID pasted here must fail loudly,
+  # not register a manifest Firefox will never match. -cmatch (not
+  # -match) keeps the rejection case-sensitive, exactly like the
+  # desktop's lowercase a-p check.
+  if ($ExtensionId -cmatch '^[a-p]{32}$') { throw "Firefox ID must be a valid add-on ID (for example thunderload@example.com). A 32-character a-p ID is a Chromium extension ID, not a Firefox add-on ID." }
+  if ($ExtensionId.Length -gt 128 -or ($ExtensionId -notmatch '^[A-Za-z0-9@._+-]+$' -and $ExtensionId -notmatch '^\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}$')) { throw "Firefox ID must be a valid add-on ID (for example thunderload@example.com)." }
   $ManifestPath = Join-Path $InstallDir "firefox-native-host.json"
   Write-Manifest @{ name="com.thunderload.host"; description="ThunderLoad local download engine"; path=$HostExe; type="stdio"; allowed_extensions=@($ExtensionId) } $ManifestPath
   $RegistryPath = "HKCU:\Software\Mozilla\NativeMessagingHosts\com.thunderload.host"
