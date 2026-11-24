@@ -8,7 +8,7 @@ members = ["engine", "native-host", "desktop/src-tauri"]
 # tauri.conf.json, extension manifests and UI version strings track
 # this version by hand — see thunderload/README.md.
 [workspace.package]
-version = "0.3.5"
+version = "0.3.6"
 license = "MIT"
 repository = "https://github.com/hamzabhulla/ThunderLoad"
 description = "ThunderLoad desktop download manager with browser extension"
