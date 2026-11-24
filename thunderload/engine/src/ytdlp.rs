@@ -467,10 +467,17 @@ async fn hash_tool_file(tool: YtDlpTool) -> Result<String> {
         .await
         .with_context(|| format!("Cannot read {}", tool_path(tool).display()))?;
     let mut hasher = Sha256::new();
-    let mut buf = [0u8; 65536];
+    // Boxed on purpose: a 64 KiB inline buffer lives in this async fn's
+    // state machine, and Tauri's IPC layers copy that future by value
+    // several times on the way to tokio::spawn. On Windows the main
+    // thread stack is 1 MiB; an inline buffer here made the spawned
+    // future ~396 KiB and overflowed it (STATUS_STACK_OVERFLOW opening
+    // Settings). A heap buffer keeps the future small with the same
+    // 64 KiB read chunks.
+    let mut buf = Box::new([0u8; 65536]);
     loop {
         let n = file
-            .read(&mut buf)
+            .read(&mut buf[..])
             .await
             .with_context(|| format!("Cannot read {}", tool_path(tool).display()))?;
         if n == 0 {
