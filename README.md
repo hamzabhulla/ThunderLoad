@@ -103,7 +103,7 @@ thunderload/
 
 ## Contributing
 
-Issues and pull requests are welcome. For anything large, open an issue first so the design can be agreed before code is written. A `CONTRIBUTING.md` with setup and review notes is on the way.
+Issues and pull requests are welcome. For anything large, open an issue first so the design can be agreed before code is written. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, testing, and review notes.
 
 ## Current limitations
 
