@@ -4,7 +4,7 @@ Report security issues privately through a GitHub Security Advisory in this repo
 
 ## Supported Versions
 
-ThunderLoad is pre-1.0 and under active development. Only the latest release (currently 0.3.5) receives security fixes; earlier releases are not supported.
+ThunderLoad is pre-1.0 and under active development. Only the latest release (currently 0.3.6) receives security fixes; earlier releases are not supported.
 
 ## Security Design
 - **100% local architecture:** ThunderLoad has no remote telemetry, analytics, or cloud backend. All media detection, session handoff, and download orchestration happen locally on the user's device. The extension itself loads no remote code — all of its JavaScript ships inside the submitted package. One exception, by explicit user action only: the desktop app or the extension can download the yt-dlp and Deno executables on demand from GitHub Releases (yt-dlp 2026.10.26 from `github.com/yt-dlp/yt-dlp/releases`, Deno 2.9.8 from `github.com/denoland/deno/releases`), only when the user clicks the Download button for that tool. A first install is SHA256-verified against a pinned hash before it is used. Updating yt-dlp is different: it downloads and installs the latest release unpinned, via `yt-dlp -U`, after asking for confirmation. The new binary's own hash is then recorded and used as tamper-evidence on later launches — not a pinned-release guarantee. Nothing else is fetched or executed from a remote source.
