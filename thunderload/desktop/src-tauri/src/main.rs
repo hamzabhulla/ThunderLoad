@@ -2195,6 +2195,8 @@ async fn ensure_ytdlp_tool(tool: String, app: tauri::AppHandle) -> Result<String
                 "downloaded": progress.downloaded,
                 "total": progress.total,
                 "percent": progress.percent,
+                "speedBps": progress.speed_bps,
+                "etaSecs": progress.eta_secs,
             }));
         }
     });
