@@ -578,6 +578,54 @@ async fn verify_tool_on_disk(tool: YtDlpTool) -> Result<()> {
     }
 }
 
+/// One in-process lock per tool, taken by `download_tool` for the
+/// whole download+install. Two callers in one process can ask for
+/// the same tool at once — the desktop Tauri command and the native
+/// host's `ytdlp.ensure_tool` handler (one per browser message) —
+/// and without it both would download into the same temp file.
+/// This stops same-process double-runs; it does NOT stop two
+/// processes (the desktop app and the native host are separate
+/// processes), which is why the temp file is also unique per
+/// attempt below.
+static TOOL_DOWNLOAD_LOCKS: std::sync::OnceLock<[tokio::sync::Mutex<()>; 2]> =
+    std::sync::OnceLock::new();
+
+fn tool_download_lock(tool: YtDlpTool) -> &'static tokio::sync::Mutex<()> {
+    let locks = TOOL_DOWNLOAD_LOCKS
+        .get_or_init(|| [tokio::sync::Mutex::new(()), tokio::sync::Mutex::new(())]);
+    &locks[tool as usize]
+}
+
+/// Counter for unique per-attempt names: a PID alone is not enough
+/// (one process can start two attempts), a counter alone is not
+/// enough (two processes share nothing) — together they are unique.
+static TOOL_TEMP_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// "pid-counter": unique per attempt in this process, and per
+/// process across the machine — the two halves of every per-attempt
+/// temp name (download temp file, Deno extract scratch dir).
+fn attempt_suffix() -> String {
+    let attempt = TOOL_TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}-{}", std::process::id(), attempt)
+}
+
+/// A temp path no other attempt can share. The old fixed name
+/// (`.deno.exe-download.tmp`) was the race: two overlapping Deno
+/// downloads — desktop Settings and the native host's
+/// `ytdlp.ensure_tool` — both `File::create` (truncate) the same
+/// file, so the bytes on disk interleave while each caller's
+/// in-memory hash still passes. Expand-Archive then reads the
+/// corrupt on-disk zip and fails with "Could not unpack the Deno
+/// download", even though the download itself was fine.
+fn unique_tool_temp_path(dir: &Path, tool: YtDlpTool) -> PathBuf {
+    dir.join(format!(
+        ".{}-download-{}.tmp",
+        tool.file_name(),
+        attempt_suffix()
+    ))
+}
+
 /// Fetch one tool's release file into `temp` with the engine's
 /// multi-connection segmented downloader — the same path normal
 /// downloads use — instead of a single sequential GET. A 22–41 MB
@@ -602,8 +650,11 @@ async fn verify_tool_on_disk(tool: YtDlpTool) -> Result<()> {
 /// this function knows the transfer is done.
 ///
 /// The caller hashes `temp` and installs it afterwards; this
-/// function only fetches. A half-fetched `temp` keeps its `.part` +
-/// `.meta.json` checkpoint, so a retry resumes instead of restarting.
+/// function only fetches. While the transfer runs, a half-fetched
+/// `temp` keeps its `.part` + `.meta.json` checkpoint; on any error
+/// the caller (`download_tool`) deletes the temp and the checkpoint
+/// with it — temp names are unique per attempt, so a retry gets a
+/// fresh path and could never resume the old checkpoint anyway.
 async fn download_tool_file(
     tool: YtDlpTool,
     url: &str,
@@ -669,72 +720,112 @@ async fn download_tool_file(
 
 /// Remove a tool download's scratch files: the temp file plus the
 /// resumable downloader's `.part` + `.meta.json` checkpoint next to
-/// it. Used when the fetched bytes fail verification — a corrupt
-/// checkpoint must not be resumed into the same corrupt bytes on
-/// the next attempt. A merely interrupted download keeps its
-/// checkpoint (resume), so this runs only on verification failure.
+/// it. Runs on ANY `download_tool` failure after the temp is
+/// created — download failure, hash failure, verification failure,
+/// install failure — so a failed attempt leaves nothing behind.
+/// (A corrupt checkpoint must not be resumed into the same corrupt
+/// bytes on the next attempt, and with unique per-attempt temp
+/// names a retry starts fresh regardless.)
 fn remove_tool_download_scratch(temp: &Path) {
     let _ = std::fs::remove_file(temp);
     let _ = std::fs::remove_file(partial_download_path(temp));
     let _ = std::fs::remove_file(partial_download_metadata_path(temp));
 }
 
+/// Download one tool (yt-dlp or Deno) and install it into the tools
+/// dir. Merged shape: the fetch is the segmented
+/// `download_tool_file` (8 connections, speed + ETA); the temp name
+/// is the per-attempt unique path, so two processes can never share
+/// a file; the Deno install is the scratch-dir `install_deno_zip`;
+/// and the whole download+install runs inside the wrapper below,
+/// which deletes the temp AND the resumable downloader's `.part` +
+/// `.meta.json` checkpoint on ANY error — a failed attempt leaves
+/// nothing behind.
 pub async fn download_tool(
     tool: YtDlpTool,
     progress_tx: Option<mpsc::UnboundedSender<ToolDownloadProgress>>,
 ) -> Result<PathBuf> {
+    // Serialize same-tool downloads inside this process; the guard
+    // is held until this function returns.
+    let _download_guard = tool_download_lock(tool).lock().await;
     let dir = tools_dir();
     tokio::fs::create_dir_all(&dir)
         .await
         .with_context(|| format!("Cannot create {}", dir.display()))?;
     let target = tool_path(tool);
-    let temp = dir.join(format!(".{}-download.tmp", tool.file_name()));
-    download_tool_file(tool, tool.download_url(), &temp, progress_tx).await?;
-    // The bytes are on disk now (the resumable downloader moved its
-    // .part file into place): hash the temp file the same way the
-    // installed tool is hashed on every launch, and verify against
-    // the pin before anything becomes the tool.
-    let digest = hash_file(&temp).await?;
-    if let Err(error) = verify_tool_digest(tool, &digest) {
+    // A concurrent downloader in another process may have installed
+    // the tool while this call waited on the lock (or before it was
+    // even made): a present, verified tool needs no second download.
+    if tool_present(tool) {
+        if verify_tool_on_disk(tool).await.is_ok() {
+            return Ok(target);
+        }
+        let _ = tokio::fs::remove_file(&target).await;
+        let _ = tokio::fs::remove_file(tool_hash_sidecar_path(tool)).await;
+    }
+    let temp = unique_tool_temp_path(&dir, tool);
+    // Everything after the temp is computed runs inside this block:
+    // if anything fails — the fetch, the hash, the install — the
+    // temp and its checkpoint go with the error. Temp names are
+    // unique per attempt, so no later attempt ever truncates or
+    // reuses a stale one; without this, every failed download leaks
+    // one hidden `.<tool>-download-<pid>-<counter>.tmp` plus its
+    // `.part` + `.meta.json` (up to ~41 MB).
+    let result: Result<PathBuf> = async {
+        download_tool_file(tool, tool.download_url(), &temp, progress_tx).await?;
+        // The bytes are on disk now (the resumable downloader moved
+        // its .part file into place): hash the temp file the same
+        // way the installed tool is hashed on every launch, and
+        // verify against the pin before anything becomes the tool.
+        let digest = hash_file(&temp).await?;
+        if let Err(error) = verify_tool_digest(tool, &digest) {
+            return Err(error);
+        }
+        match tool {
+            YtDlpTool::YtDlp => {
+                tokio::fs::rename(&temp, &target)
+                    .await
+                    .with_context(|| format!("Cannot install {}", temp.display()))?;
+                // Unix binaries need the executable bit: a freshly
+                // renamed download is 0644, and yt-dlp would fail to
+                // spawn with "permission denied" on every launch.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+                        .with_context(|| format!("Could not make {} executable", target.display()))?;
+                }
+                // The digest was just verified against the pin: record it
+                // so every later launch can re-verify this file.
+                write_tool_hash_sidecar(tool, &digest);
+            }
+            YtDlpTool::Deno => {
+                // `install_deno_zip` deletes the temp zip itself when
+                // the install fails (~41 MB leaked per failed attempt
+                // before); on success the caller deletes it, below.
+                install_deno_zip(&temp, &dir).await?;
+                let _ = tokio::fs::remove_file(&temp).await;
+                if !target.is_file() {
+                    return Err(anyhow!(
+                        "The Deno download unpacked but {} was not found in it",
+                        tool.file_name()
+                    ));
+                }
+                // The zip was verified; record the EXTRACTED exe's hash —
+                // the pin is the zip's hash, so only the sidecar can
+                // verify the exe on later launches.
+                if let Ok(exe_hash) = hash_tool_file(tool).await {
+                    write_tool_hash_sidecar(tool, &exe_hash);
+                }
+            }
+        }
+        Ok(target)
+    }
+    .await;
+    if result.is_err() {
         remove_tool_download_scratch(&temp);
-        return Err(error);
     }
-    match tool {
-        YtDlpTool::YtDlp => {
-            tokio::fs::rename(&temp, &target)
-                .await
-                .with_context(|| format!("Cannot install {}", temp.display()))?;
-            // Unix binaries need the executable bit: a freshly
-            // renamed download is 0644, and yt-dlp would fail to
-            // spawn with "permission denied" on every launch.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
-                    .with_context(|| format!("Could not make {} executable", target.display()))?;
-            }
-            // The digest was just verified against the pin: record it
-            // so every later launch can re-verify this file.
-            write_tool_hash_sidecar(tool, &digest);
-        }
-        YtDlpTool::Deno => {
-            extract_deno_zip(&temp, &dir).await?;
-            let _ = tokio::fs::remove_file(&temp).await;
-            if !target.is_file() {
-                return Err(anyhow!(
-                    "The Deno download unpacked but {} was not found in it",
-                    tool.file_name()
-                ));
-            }
-            // The zip was verified; record the EXTRACTED exe's hash —
-            // the pin is the zip's hash, so only the sidecar can
-            // verify the exe on later launches.
-            if let Ok(exe_hash) = hash_tool_file(tool).await {
-                write_tool_hash_sidecar(tool, &exe_hash);
-            }
-        }
-    }
-    Ok(target)
+    result
 }
 
 /// Escape one value for a PowerShell single-quoted string: a literal
@@ -747,14 +838,99 @@ fn powershell_quote(value: &str) -> String {
     value.replace('\'', "''")
 }
 
-/// Extract the verified Deno zip. Windows uses PowerShell's
-/// Expand-Archive (always present); elsewhere `unzip` is used. The
-/// zip holds the Deno binary at its top level (`deno.exe` on
-/// Windows, `deno` elsewhere).
+/// Install a verified Deno zip: extract it into a fresh scratch
+/// directory, then move the single binary into place.
+///
+/// Why the scratch directory: each attempt now has its own temp
+/// zip, but two attempts extracting straight into the tools dir
+/// would still race on the same `deno.exe` — Expand-Archive
+/// `-Force` overwriting a file another Expand-Archive is still
+/// writing. Extracting into a per-attempt directory and moving the
+/// one finished file into place keeps the race out of the shared
+/// folder entirely.
+///
+/// A leftover `deno.exe` from a crashed older unpack is removed
+/// before extracting, so a half-written exe can never be mistaken
+/// for the new one. If that delete fails the file is locked by a
+/// running process, and the error says so plainly instead of
+/// failing later inside the unpack.
+///
+/// On any failure the temp zip is deleted here — the caller only
+/// deletes it on success — so a failed attempt never leaks ~41 MB.
+async fn install_deno_zip(zip: &Path, dir: &Path) -> Result<()> {
+    let target = tool_path(YtDlpTool::Deno);
+    if target.is_file() {
+        if let Err(error) = tokio::fs::remove_file(&target).await {
+            let _ = tokio::fs::remove_file(zip).await;
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                return Err(anyhow!(
+                    "Could not install Deno: {} is in use by another process — a download may still be running. Close it and try again.",
+                    target.display()
+                ));
+            }
+            return Err(error).context("Could not remove the old Deno install");
+        }
+    }
+    let scratch = dir.join(format!(".deno-extract-{}", attempt_suffix()));
+    match install_deno_zip_from_scratch(zip, &scratch, &target).await {
+        Ok(()) => {
+            let _ = tokio::fs::remove_dir_all(&scratch).await;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = tokio::fs::remove_file(zip).await;
+            let _ = tokio::fs::remove_dir_all(&scratch).await;
+            Err(error)
+        }
+    }
+}
+
+/// Extract the zip into `scratch`, then move the binary into place
+/// (same directory, so the rename is atomic).
+async fn install_deno_zip_from_scratch(zip: &Path, scratch: &Path, target: &Path) -> Result<()> {
+    tokio::fs::create_dir_all(scratch)
+        .await
+        .with_context(|| format!("Cannot create {}", scratch.display()))?;
+    extract_deno_zip(zip, scratch).await?;
+    let extracted = scratch.join(YtDlpTool::Deno.file_name());
+    if !extracted.is_file() {
+        return Err(anyhow!(
+            "The Deno download unpacked but {} was not found in it",
+            YtDlpTool::Deno.file_name()
+        ));
+    }
+    tokio::fs::rename(&extracted, target)
+        .await
+        .with_context(|| format!("Could not install {}", target.display()))?;
+    Ok(())
+}
+
+/// The extractor's stderr, for the failure message: `": <stderr>"`,
+/// or empty when the extractor said nothing. Truncated — a wall of
+/// PowerShell text would bury the message in the Settings UI.
+fn unpack_error_detail(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let text = text.trim();
+    if text.is_empty() {
+        return String::new();
+    }
+    let text: String = text.chars().take(500).collect();
+    format!(": {text}")
+}
+
+/// Extract the verified Deno zip into `dir`. Windows uses
+/// PowerShell's Expand-Archive (always present); elsewhere `unzip`
+/// is used. The zip holds the Deno binary at its top level
+/// (`deno.exe` on Windows, `deno` elsewhere).
+///
+/// The extractor's stderr is captured and included in the failure:
+/// the old `.status()` call threw it away, so every unpack failure
+/// looked identical ("Could not unpack the Deno download") no matter
+/// the cause — a corrupt zip, a locked file, a missing tool.
 async fn extract_deno_zip(zip: &Path, dir: &Path) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
-        let status = hidden_tokio_command("powershell")
+        let output = hidden_tokio_command("powershell")
             .args([
                 "-NoProfile",
                 "-NonInteractive",
@@ -765,27 +941,33 @@ async fn extract_deno_zip(zip: &Path, dir: &Path) -> Result<()> {
                     powershell_quote(&dir.display().to_string())
                 ),
             ])
-            .status()
+            .output()
             .await
             .context("Could not unpack the Deno download")?;
-        if !status.success() {
-            return Err(anyhow!("Could not unpack the Deno download"));
+        if !output.status.success() {
+            return Err(anyhow!(
+                "Could not unpack the Deno download{}",
+                unpack_error_detail(&output.stderr)
+            ));
         }
         Ok(())
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let status = hidden_tokio_command("unzip")
+        let output = hidden_tokio_command("unzip")
             .args(["-o", "-j"])
             .arg(zip)
             .arg(YtDlpTool::Deno.file_name())
             .arg("-d")
             .arg(dir)
-            .status()
+            .output()
             .await
             .context("Could not unpack the Deno download (unzip is required)")?;
-        if !status.success() {
-            return Err(anyhow!("Could not unpack the Deno download"));
+        if !output.status.success() {
+            return Err(anyhow!(
+                "Could not unpack the Deno download{}",
+                unpack_error_detail(&output.stderr)
+            ));
         }
         Ok(())
     }
@@ -2561,6 +2743,100 @@ exec sleep 30
         assert_eq!(
             std::fs::read(dir.join(YtDlpTool::YtDlp.file_name())).unwrap(),
             before
+        );
+        std::env::remove_var("THUNDERLOAD_TOOLS_DIR");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn tool_temp_paths_are_unique_per_attempt() {
+        // The Deno unpack race: two overlapping downloads shared one
+        // fixed temp name. Two attempts must never get the same path.
+        let dir = PathBuf::from("/tmp/thunderload-tools-test");
+        let first = unique_tool_temp_path(&dir, YtDlpTool::Deno);
+        let second = unique_tool_temp_path(&dir, YtDlpTool::Deno);
+        assert_ne!(first, second);
+        assert!(first
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(".deno"));
+        assert!(first.extension().unwrap() == "tmp");
+    }
+
+    #[tokio::test]
+    async fn install_deno_zip_removes_temp_zip_on_unpack_failure() {
+        let _guard = TOOLS_DIR_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join("thunderload-deno-unpack-fail-test");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        std::env::set_var("THUNDERLOAD_TOOLS_DIR", &dir);
+        // Not a zip at all: the extractor fails, and the error must
+        // carry the extractor's own words, not just the generic line.
+        let zip = dir.join("deno-bad.zip");
+        std::fs::write(&zip, b"this is not a zip file").unwrap();
+        let error = install_deno_zip(&zip, &dir).await.unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("Could not unpack the Deno download"),
+            "opaque error, extractor detail lost: {message}"
+        );
+        assert!(
+            message.len() > "Could not unpack the Deno download".len(),
+            "extractor stderr was not included: {message}"
+        );
+        // The failed attempt leaks nothing: no temp zip, no scratch
+        // dir, no half-installed binary.
+        assert!(!zip.exists(), "temp zip leaked after unpack failure");
+        assert!(!tool_path(YtDlpTool::Deno).exists());
+        let leftovers: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+        assert!(
+            leftovers.is_empty(),
+            "scratch dir leaked after unpack failure: {leftovers:?}"
+        );
+        std::env::remove_var("THUNDERLOAD_TOOLS_DIR");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn install_deno_zip_installs_from_a_real_zip() {
+        let _guard = TOOLS_DIR_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join("thunderload-deno-unpack-ok-test");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        std::env::set_var("THUNDERLOAD_TOOLS_DIR", &dir);
+        // A real zip holding a fake `deno` at its top level.
+        let src = dir.join("zip-src");
+        tokio::fs::create_dir_all(&src).await.unwrap();
+        std::fs::write(src.join(YtDlpTool::Deno.file_name()), b"fake-deno").unwrap();
+        let zip = dir.join("deno.zip");
+        let packed = std::process::Command::new("zip")
+            .arg("-q")
+            .arg(&zip)
+            .arg(YtDlpTool::Deno.file_name())
+            .current_dir(&src)
+            .status()
+            .expect("zip CLI is required for this test");
+        assert!(packed.success(), "zip CLI could not pack the fake Deno");
+        // A leftover partial exe from an older crashed unpack must
+        // not survive the install.
+        std::fs::write(tool_path(YtDlpTool::Deno), b"half-written").unwrap();
+        install_deno_zip(&zip, &dir).await.unwrap();
+        assert_eq!(
+            std::fs::read(tool_path(YtDlpTool::Deno)).unwrap(),
+            b"fake-deno"
+        );
+        // Success leaves the zip for the caller to delete, and no
+        // scratch directory behind.
+        assert!(zip.exists(), "install must not delete the zip on success");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            leftovers.iter().all(|name| !name.starts_with(".deno-extract-")),
+            "scratch dir leaked after a successful install: {leftovers:?}"
         );
         std::env::remove_var("THUNDERLOAD_TOOLS_DIR");
         let _ = tokio::fs::remove_dir_all(&dir).await;
