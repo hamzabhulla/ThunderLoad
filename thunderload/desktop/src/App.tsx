@@ -335,7 +335,7 @@ export default function App() {
   // yt-dlp inspect becomes the download filename.
   const [videoTitle, setVideoTitle] = useState("");
   const [ytdlpTools, setYtdlpTools] = useState<{ ytdlp: { present: boolean; version?: string }; deno: { present: boolean; version?: string }; toolsDir: string } | null>(null);
-  const [ytdlpToolProgress, setYtdlpToolProgress] = useState<{ tool: string; percent?: number } | null>(null);
+  const [ytdlpToolProgress, setYtdlpToolProgress] = useState<{ tool: string; percent?: number; speedBps?: number; etaSecs?: number } | null>(null);
   const [ytdlpDownloading, setYtdlpDownloading] = useState<string | null>(null);
   const [ytdlpUpdateStatus, setYtdlpUpdateStatus] = useState("");
   const [ytdlpCheckingUpdate, setYtdlpCheckingUpdate] = useState(false);
@@ -410,6 +410,16 @@ export default function App() {
     const speed = jobSpeed(item);
     if (speed === null || speed === undefined || speed <= 0 || !item.total) return "–";
     return etaText(Math.max(0, item.total - item.downloaded) / speed);
+  }
+  // Speed + ETA suffix for the tool-download notice (" — 1.2 MB/s ·
+  // 12 s bacha"). Empty while the engine has no rate yet — the first
+  // 100 ms of a download carry neither, and a bare percent is what
+  // the notice showed before.
+  function toolSpeedEta(): string {
+    if (!ytdlpToolProgress) return "";
+    const speed = ytdlpToolProgress.speedBps !== undefined ? " — " + bytes(ytdlpToolProgress.speedBps) + "/s" : "";
+    const eta = ytdlpToolProgress.etaSecs !== undefined ? " · " + etaText(ytdlpToolProgress.etaSecs) + " bacha" : "";
+    return speed + eta;
   }
   // Closed status vocabulary for the tabs: terminal-but-cancelled jobs
   // sit with Completed, Failed/Interrupted sit with Failed, everything
@@ -780,8 +790,8 @@ export default function App() {
     let cleanup: Array<() => void> = [];
     (async () => {
       const listeners = await Promise.all([
-        listen<{ tool: string; downloaded: number; total?: number; percent?: number }>("ytdlp-tool-progress", ({ payload }) => {
-          setYtdlpToolProgress({ tool: payload.tool, percent: payload.percent });
+        listen<{ tool: string; downloaded: number; total?: number; percent?: number; speedBps?: number; etaSecs?: number }>("ytdlp-tool-progress", ({ payload }) => {
+          setYtdlpToolProgress({ tool: payload.tool, percent: payload.percent, speedBps: payload.speedBps, etaSecs: payload.etaSecs });
         }),
         listen<{ jobId: string; progress: Progress }>("download-progress", ({ payload }) => {
           // The shared sampler — the native poll feeds the same helper,
@@ -2080,12 +2090,12 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
               <div><strong>yt-dlp {ytdlpTools ? (ytdlpTools.ytdlp.present ? "· Installed" + (ytdlpTools.ytdlp.version ? " · " + ytdlpTools.ytdlp.version : "") : "· Not installed") : "· Checking…"}</strong><small>Extracts video formats from YouTube, Instagram, TikTok, X, Facebook, Reddit, Twitch and Vimeo.</small></div>
               <button className="secondary-button" onClick={() => void downloadYtDlpTool("ytdlp", "yt-dlp")} disabled={ytdlpDownloading !== null}>Download yt-dlp</button>
             </div>
-            {ytdlpToolProgress?.tool === "yt-dlp" && <div className="notice native-host-notice">yt-dlp download ho raha hai{ytdlpToolProgress.percent !== undefined ? " — " + Math.round(ytdlpToolProgress.percent) + "%" : "…"}</div>}
+            {ytdlpToolProgress?.tool === "yt-dlp" && <div className="notice native-host-notice">yt-dlp download ho raha hai{ytdlpToolProgress.percent !== undefined ? " — " + Math.round(ytdlpToolProgress.percent) + "%" : "…"}{toolSpeedEta()}</div>}
             <div className="setting-row">
               <div><strong>Deno {ytdlpTools ? (ytdlpTools.deno.present ? "· Installed" + (ytdlpTools.deno.version ? " · " + ytdlpTools.deno.version : "") : "· Not installed") : "· Checking…"}</strong><small>JavaScript runtime yt-dlp needs for YouTube's full quality. Without it, YouTube falls back to fewer formats.</small></div>
               <button className="secondary-button" onClick={() => void downloadYtDlpTool("deno", "Deno")} disabled={ytdlpDownloading !== null}>Download Deno</button>
             </div>
-            {ytdlpToolProgress?.tool === "Deno" && <div className="notice native-host-notice">Deno download ho raha hai{ytdlpToolProgress.percent !== undefined ? " — " + Math.round(ytdlpToolProgress.percent) + "%" : "…"}</div>}
+            {ytdlpToolProgress?.tool === "Deno" && <div className="notice native-host-notice">Deno download ho raha hai{ytdlpToolProgress.percent !== undefined ? " — " + Math.round(ytdlpToolProgress.percent) + "%" : "…"}{toolSpeedEta()}</div>}
             {ytdlpUpdateStatus && <div className="notice native-host-notice">{ytdlpUpdateStatus}</div>}
             <div className="setting-row">
               <div><strong>Update yt-dlp</strong><small>YouTube changes often — an extractor error usually means yt-dlp needs an update. This downloads and installs the latest release.</small></div>
