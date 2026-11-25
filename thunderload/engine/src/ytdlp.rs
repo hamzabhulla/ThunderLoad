@@ -32,7 +32,11 @@
 //! fragment downloading — that is Slice 4's work, duplicated.
 
 use anyhow::{anyhow, Context, Result};
-use crate::download::{DownloadControl, DownloadOutcome, DownloadProgress};
+use crate::download::{
+    download_url_resumable_with_connections, partial_download_metadata_path,
+    partial_download_path, DownloadControl, DownloadOutcome, DownloadProgress,
+    GlobalRateLimiter, DEFAULT_RESUMABLE_CONNECTIONS,
+};
 use crate::session::SessionHeaders;
 use crate::video::{SubtitleVariant, VideoVariant};
 use serde::{Deserialize, Serialize};
@@ -388,7 +392,10 @@ async fn run_tool_version(tool: YtDlpTool) -> Option<String> {
 
 /// One progress event while a tool downloads. The UI renders the
 /// tool's plain name with these numbers ("yt-dlp download ho raha
-/// hai — 45%"); the event itself carries the wire id.
+/// hai — 45% — 1.2 MB/s · 12 s bacha"); the event itself carries the
+/// wire id. Speed and ETA come from the engine (see
+/// `ToolSpeedTracker`): the desktop used to show a bare percent,
+/// which reads as "stuck" on a slow connection.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolDownloadProgress {
@@ -396,6 +403,60 @@ pub struct ToolDownloadProgress {
     pub downloaded: u64,
     pub total: Option<u64>,
     pub percent: Option<f64>,
+    /// Average bytes per second since the download started. None
+    /// for the first 100 ms — one chunk in one millisecond would
+    /// otherwise read as gigabytes per second.
+    pub speed_bps: Option<u64>,
+    /// Whole seconds left at the current average speed. None when
+    /// the total is unknown or the speed is not known yet; 0 when
+    /// the download is complete.
+    pub eta_secs: Option<u64>,
+}
+
+/// Speed + ETA for a tool download, from the AVERAGE rate since the
+/// download started — not an instantaneous sample. The average is
+/// one steady number the user can sanity-check against the bytes
+/// moved, instead of a figure that jumps with every chunk. It is a
+/// plain struct over explicit instants (`update_at`) so tests can
+/// drive it without sleeping.
+struct ToolSpeedTracker {
+    started_at: std::time::Instant,
+}
+
+impl ToolSpeedTracker {
+    fn new() -> Self {
+        Self {
+            started_at: std::time::Instant::now(),
+        }
+    }
+
+    /// Speed + ETA for a progress event at this moment.
+    fn update(&self, downloaded: u64, total: Option<u64>) -> (Option<u64>, Option<u64>) {
+        self.update_at(downloaded, total, std::time::Instant::now())
+    }
+
+    fn update_at(
+        &self,
+        downloaded: u64,
+        total: Option<u64>,
+        now: std::time::Instant,
+    ) -> (Option<u64>, Option<u64>) {
+        let elapsed = now.duration_since(self.started_at);
+        if elapsed < std::time::Duration::from_millis(100) || downloaded == 0 {
+            return (None, None);
+        }
+        let speed = downloaded as f64 / elapsed.as_secs_f64();
+        if speed <= 0.0 {
+            return (None, None);
+        }
+        let speed_bps = Some(speed as u64);
+        let eta_secs = match total {
+            Some(total) if total <= downloaded => Some(0),
+            Some(total) => Some(((total - downloaded) as f64 / speed).ceil() as u64),
+            None => None,
+        };
+        (speed_bps, eta_secs)
+    }
 }
 
 /// Download one tool with SHA256 verification. The caller must have
@@ -460,32 +521,37 @@ fn write_tool_hash_sidecar(tool: YtDlpTool, hash: &str) {
     let _ = std::fs::write(tool_hash_sidecar_path(tool), hash);
 }
 
-/// Stream-hash a tool file without loading it whole into memory.
-async fn hash_tool_file(tool: YtDlpTool) -> Result<String> {
+/// Stream-hash a file at an arbitrary path without loading it whole
+/// into memory. The buffer is boxed on purpose: a 64 KiB inline
+/// buffer lives in this async fn's state machine, and Tauri's IPC
+/// layers copy that future by value several times on the way to
+/// tokio::spawn. On Windows the main thread stack is 1 MiB; an inline
+/// buffer here made the spawned future ~396 KiB and overflowed it
+/// (STATUS_STACK_OVERFLOW opening Settings). A heap buffer keeps the
+/// future small with the same 64 KiB read chunks.
+async fn hash_file(path: &Path) -> Result<String> {
     use tokio::io::AsyncReadExt;
-    let mut file = tokio::fs::File::open(tool_path(tool))
+    let mut file = tokio::fs::File::open(path)
         .await
-        .with_context(|| format!("Cannot read {}", tool_path(tool).display()))?;
+        .with_context(|| format!("Cannot read {}", path.display()))?;
     let mut hasher = Sha256::new();
-    // Boxed on purpose: a 64 KiB inline buffer lives in this async fn's
-    // state machine, and Tauri's IPC layers copy that future by value
-    // several times on the way to tokio::spawn. On Windows the main
-    // thread stack is 1 MiB; an inline buffer here made the spawned
-    // future ~396 KiB and overflowed it (STATUS_STACK_OVERFLOW opening
-    // Settings). A heap buffer keeps the future small with the same
-    // 64 KiB read chunks.
     let mut buf = Box::new([0u8; 65536]);
     loop {
         let n = file
             .read(&mut buf[..])
             .await
-            .with_context(|| format!("Cannot read {}", tool_path(tool).display()))?;
+            .with_context(|| format!("Cannot read {}", path.display()))?;
         if n == 0 {
             break;
         }
         hasher.update(&buf[..n]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Stream-hash a tool file without loading it whole into memory.
+async fn hash_tool_file(tool: YtDlpTool) -> Result<String> {
+    hash_file(&tool_path(tool)).await
 }
 
 /// Verify the tool on disk before it is executed. Missing → the typed
@@ -512,6 +578,107 @@ async fn verify_tool_on_disk(tool: YtDlpTool) -> Result<()> {
     }
 }
 
+/// Fetch one tool's release file into `temp` with the engine's
+/// multi-connection segmented downloader — the same path normal
+/// downloads use — instead of a single sequential GET. A 22–41 MB
+/// tool file over one connection crawls on a slow link and the UI
+/// showed only a percent, so the download read as "stuck"; segmented
+/// downloads use 8 connections and the progress events below carry
+/// speed + ETA, so it reads as a download again.
+///
+/// Fallback: `download_url_resumable_with_connections` itself falls
+/// back to its sequential checkpointed path when the server does not
+/// support byte ranges (or the object is under 2 MiB) — the caller
+/// does not choose. GitHub releases (the download source) support
+/// ranges, so the segmented path is the normal case.
+///
+/// The transfer runs in a spawned task so its future lives on the
+/// heap: awaiting the resumable downloader inline would inline its
+/// state machine into this future, which Tauri copies by value on
+/// the way to spawn — the same shape that overflowed the Windows
+/// main-thread stack in the Settings crash (PR #47). Progress is
+/// drained here and translated to `ToolDownloadProgress` events;
+/// the channel closes when the transfer returns, which is also how
+/// this function knows the transfer is done.
+///
+/// The caller hashes `temp` and installs it afterwards; this
+/// function only fetches. A half-fetched `temp` keeps its `.part` +
+/// `.meta.json` checkpoint, so a retry resumes instead of restarting.
+async fn download_tool_file(
+    tool: YtDlpTool,
+    url: &str,
+    temp: &Path,
+    progress_tx: Option<mpsc::UnboundedSender<ToolDownloadProgress>>,
+) -> Result<()> {
+    // No cancel path exists for tool downloads (the button tap is
+    // the consent and the transfer is one-shot), so the control
+    // channel stays Running for the whole transfer. The sender is
+    // kept alive until the task returns: dropping it mid-transfer
+    // would read as a host disconnect, not a cancel.
+    let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
+    // A fresh limiter, not the jobs' shared one: the user's speed
+    // limit is for downloads, and a one-time ~63 MB tools fetch
+    // must not be throttled by it — fast tools are the point.
+    let rate_limiter = Arc::new(GlobalRateLimiter::new());
+    let (engine_tx, mut engine_rx) = mpsc::unbounded_channel::<DownloadProgress>();
+    let url = url.to_string();
+    let temp_path = temp.to_path_buf();
+    let fetch = tokio::spawn(async move {
+        download_url_resumable_with_connections(
+            &url,
+            &temp_path,
+            None,
+            DEFAULT_RESUMABLE_CONNECTIONS,
+            control_rx,
+            rate_limiter,
+            engine_tx,
+        )
+        .await
+    });
+    let tracker = ToolSpeedTracker::new();
+    while let Some(event) = engine_rx.recv().await {
+        if let Some(tx) = &progress_tx {
+            let (speed_bps, eta_secs) = tracker.update(event.downloaded, event.total);
+            let _ = tx.send(ToolDownloadProgress {
+                tool,
+                downloaded: event.downloaded,
+                total: event.total,
+                percent: event.percent,
+                speed_bps,
+                eta_secs,
+            });
+        }
+    }
+    drop(control_tx);
+    let outcome = fetch
+        .await
+        .context("Tool download task failed")?
+        .with_context(|| format!("Could not download {}", tool.display_name()))?;
+    match outcome {
+        DownloadOutcome::Completed => Ok(()),
+        DownloadOutcome::Paused => Err(anyhow!(
+            "The {} download was paused",
+            tool.display_name()
+        )),
+        DownloadOutcome::Cancelled => Err(anyhow!(
+            "The {} download was cancelled",
+            tool.display_name()
+        )),
+    }
+}
+
+/// Remove a tool download's scratch files: the temp file plus the
+/// resumable downloader's `.part` + `.meta.json` checkpoint next to
+/// it. Used when the fetched bytes fail verification — a corrupt
+/// checkpoint must not be resumed into the same corrupt bytes on
+/// the next attempt. A merely interrupted download keeps its
+/// checkpoint (resume), so this runs only on verification failure.
+fn remove_tool_download_scratch(temp: &Path) {
+    let _ = std::fs::remove_file(temp);
+    let _ = std::fs::remove_file(partial_download_path(temp));
+    let _ = std::fs::remove_file(partial_download_metadata_path(temp));
+}
+
 pub async fn download_tool(
     tool: YtDlpTool,
     progress_tx: Option<mpsc::UnboundedSender<ToolDownloadProgress>>,
@@ -522,58 +689,14 @@ pub async fn download_tool(
         .with_context(|| format!("Cannot create {}", dir.display()))?;
     let target = tool_path(tool);
     let temp = dir.join(format!(".{}-download.tmp", tool.file_name()));
-    let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 ThunderLoad/0.1")
-        .connect_timeout(std::time::Duration::from_secs(15))
-        .read_timeout(std::time::Duration::from_secs(30))
-        .redirect(crate::session::validated_redirect_policy())
-        .dns_resolver(std::sync::Arc::new(
-            crate::session::ValidatingResolver::from_env(),
-        ))
-        .build()
-        .context("Could not build the download client")?;
-    let response = client
-        .get(tool.download_url())
-        .send()
-        .await
-        .with_context(|| format!("Could not download {}", tool.display_name()))?
-        .error_for_status()
-        .with_context(|| format!("The {} download was refused", tool.display_name()))?;
-    let total = response.content_length();
-    let mut file = tokio::fs::File::create(&temp)
-        .await
-        .with_context(|| format!("Cannot write {}", temp.display()))?;
-    let mut hasher = Sha256::new();
-    let mut downloaded: u64 = 0;
-    let mut stream = response.bytes_stream();
-    use futures_util::StreamExt;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.with_context(|| format!("The {} download was interrupted", tool.display_name()))?;
-        hasher.update(&chunk);
-        file.write_all(&chunk)
-            .await
-            .with_context(|| format!("Cannot write {}", temp.display()))?;
-        downloaded += chunk.len() as u64;
-        if let Some(tx) = &progress_tx {
-            let _ = tx.send(ToolDownloadProgress {
-                tool,
-                downloaded,
-                total,
-                percent: total.map(|total| {
-                    if total == 0 {
-                        0.0
-                    } else {
-                        downloaded as f64 / total as f64 * 100.0
-                    }
-                }),
-            });
-        }
-    }
-    file.flush().await.ok();
-    drop(file);
-    let digest = format!("{:x}", hasher.finalize());
+    download_tool_file(tool, tool.download_url(), &temp, progress_tx).await?;
+    // The bytes are on disk now (the resumable downloader moved its
+    // .part file into place): hash the temp file the same way the
+    // installed tool is hashed on every launch, and verify against
+    // the pin before anything becomes the tool.
+    let digest = hash_file(&temp).await?;
     if let Err(error) = verify_tool_digest(tool, &digest) {
-        let _ = tokio::fs::remove_file(&temp).await;
+        remove_tool_download_scratch(&temp);
         return Err(error);
     }
     match tool {
@@ -2743,5 +2866,322 @@ printf 'partial content' > "$stem.part"
             );
         }
         assert!(text.contains("session\tabc"));
+    }
+
+    // Tool downloads through the multi-connection engine (2026-11-25).
+
+    #[test]
+    fn tool_speed_tracker_reports_average_speed_and_eta() {
+        let start = std::time::Instant::now();
+        let tracker = ToolSpeedTracker { started_at: start };
+        // 1 MB in 1 s, 10 MB total: 1 MB/s, 9 s left.
+        let (speed, eta) =
+            tracker.update_at(1_000_000, Some(10_000_000), start + Duration::from_secs(1));
+        assert_eq!(speed, Some(1_000_000));
+        assert_eq!(eta, Some(9));
+        // 5 MB in 2 s: 2.5 MB/s, 2 s left.
+        let (speed, eta) =
+            tracker.update_at(5_000_000, Some(10_000_000), start + Duration::from_secs(2));
+        assert_eq!(speed, Some(2_500_000));
+        assert_eq!(eta, Some(2));
+    }
+
+    #[test]
+    fn tool_speed_tracker_withholds_speed_while_too_early_or_empty() {
+        let start = std::time::Instant::now();
+        let tracker = ToolSpeedTracker { started_at: start };
+        // First 100 ms: no rate yet, however many bytes arrived —
+        // one chunk in one millisecond would read as GB/s.
+        assert_eq!(
+            tracker.update_at(1_000_000, Some(10_000_000), start + Duration::from_millis(50)),
+            (None, None)
+        );
+        // Nothing downloaded yet: no rate even after the window.
+        assert_eq!(
+            tracker.update_at(0, Some(10_000_000), start + Duration::from_secs(1)),
+            (None, None)
+        );
+        // Unknown total: speed yes, ETA no.
+        assert_eq!(
+            tracker.update_at(2_000_000, None, start + Duration::from_secs(1)),
+            (Some(2_000_000), None)
+        );
+        // Complete: ETA is 0, not a division by zero.
+        assert_eq!(
+            tracker.update_at(10_000_000, Some(10_000_000), start + Duration::from_secs(5)),
+            (Some(2_000_000), Some(0))
+        );
+    }
+
+    // A local HTTP server serving one fixed body, modeled on the
+    // resumable downloader's `spawn_range_server` but with the knobs
+    // these tests need: range support on or off, and a per-chunk drip
+    // so a transfer lasts long enough for progress events to carry
+    // speed. Each connection runs on its own thread — the resumable
+    // harness serves connections inline, which would serialize the
+    // segments and hide the parallelism this test observes.
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    struct ToolServerStats {
+        /// Peak simultaneous in-flight Range GETs.
+        max_range_in_flight: AtomicUsize,
+        range_in_flight: AtomicUsize,
+        /// 206 responses served.
+        partial_responses: AtomicUsize,
+    }
+
+    fn tool_test_body(size: usize) -> Vec<u8> {
+        // Offset-dependent bytes, so a wrong range corrupts the file
+        // instead of passing silently.
+        (0..size).map(|i| (i % 251) as u8).collect()
+    }
+
+    fn spawn_tool_server(
+        body_size: usize,
+        range_support: bool,
+        chunk_size: usize,
+        chunk_delay: Duration,
+    ) -> (String, Arc<ToolServerStats>, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = Arc::new(tool_test_body(body_size));
+        let stats = Arc::new(ToolServerStats {
+            max_range_in_flight: AtomicUsize::new(0),
+            range_in_flight: AtomicUsize::new(0),
+            partial_responses: AtomicUsize::new(0),
+        });
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = shutdown.clone();
+        let thread_stats = stats.clone();
+        let handle = thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::Relaxed) {
+                let (stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(3));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let _ = stream.set_nonblocking(false);
+                let body = body.clone();
+                let stats = thread_stats.clone();
+                thread::spawn(move || {
+                    serve_tool_connection(
+                        stream,
+                        &body,
+                        range_support,
+                        chunk_size,
+                        chunk_delay,
+                        &stats,
+                    );
+                });
+            }
+        });
+        (format!("http://{address}/tool.bin"), stats, shutdown, handle)
+    }
+
+    fn serve_tool_connection(
+        mut stream: std::net::TcpStream,
+        body: &[u8],
+        range_support: bool,
+        chunk_size: usize,
+        chunk_delay: Duration,
+        stats: &ToolServerStats,
+    ) {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) | Err(_) => return,
+                Ok(count) => {
+                    request.extend_from_slice(&buffer[..count]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+            }
+        }
+        let request = String::from_utf8_lossy(&request);
+        let mut lines = request.lines();
+        let first = lines.next().unwrap_or_default();
+        let is_head = first.starts_with("HEAD ");
+        let range = request.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("range")
+                .then(|| value.trim().to_string())
+        });
+        let if_range = request.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("if-range")
+                .then(|| value.trim().to_string())
+        });
+        const ETAG: &str = "\"tool-v1\"";
+        let total = body.len();
+        if is_head {
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nETag: {ETAG}\r\n{}Connection: close\r\n\r\n",
+                if range_support {
+                    "Accept-Ranges: bytes\r\n"
+                } else {
+                    ""
+                }
+            );
+            let _ = stream.write_all(headers.as_bytes());
+            return;
+        }
+        // Parse "bytes=START-" / "bytes=START-END".
+        let parsed_range = range.as_deref().and_then(|value| {
+            let value = value.strip_prefix("bytes=")?;
+            let (start, end) = value.split_once('-')?;
+            let start: usize = start.parse().ok()?;
+            let end: usize = if end.is_empty() {
+                total - 1
+            } else {
+                end.parse().ok()?
+            };
+            (start <= end && end < total).then_some((start, end))
+        });
+        let can_range = range_support
+            && parsed_range.is_some()
+            && if_range.as_deref().is_none_or(|value| value == ETAG);
+        if can_range {
+            let (start, end) = parsed_range.unwrap();
+            let payload = &body[start..=end];
+            stats.partial_responses.fetch_add(1, Ordering::Relaxed);
+            let in_flight = stats.range_in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+            stats
+                .max_range_in_flight
+                .fetch_max(in_flight, Ordering::Relaxed);
+            let headers = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nETag: {ETAG}\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {start}-{end}/{total}\r\nConnection: close\r\n\r\n",
+                payload.len()
+            );
+            if stream.write_all(headers.as_bytes()).is_err() {
+                stats.range_in_flight.fetch_sub(1, Ordering::Relaxed);
+                return;
+            }
+            for chunk in payload.chunks(chunk_size) {
+                if stream.write_all(chunk).is_err() {
+                    break;
+                }
+                thread::sleep(chunk_delay);
+            }
+            stats.range_in_flight.fetch_sub(1, Ordering::Relaxed);
+        } else {
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nETag: {ETAG}\r\n{}Connection: close\r\n\r\n",
+                if range_support {
+                    "Accept-Ranges: bytes\r\n"
+                } else {
+                    ""
+                }
+            );
+            if stream.write_all(headers.as_bytes()).is_err() {
+                return;
+            }
+            for chunk in body.chunks(chunk_size) {
+                if stream.write_all(chunk).is_err() {
+                    break;
+                }
+                thread::sleep(chunk_delay);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_download_uses_segments_against_range_server() {
+        let body_size = 4 * 1024 * 1024;
+        let (url, stats, shutdown, handle) =
+            spawn_tool_server(body_size, true, 32 * 1024, Duration::from_millis(40));
+        let dir = std::env::temp_dir()
+            .join(format!("thunderload-tool-segments-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let temp = dir.join(".tool-download.tmp");
+        let expected = tool_test_body(body_size);
+        download_tool_file(YtDlpTool::YtDlp, &url, &temp, None)
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&temp).await.unwrap(), expected);
+        // Segments really ran in parallel: more than one Range GET
+        // was in flight at once, and the server served 206s.
+        assert!(
+            stats.max_range_in_flight.load(Ordering::Relaxed) >= 2,
+            "segmented path must overlap Range requests, max in flight was {}",
+            stats.max_range_in_flight.load(Ordering::Relaxed)
+        );
+        assert!(stats.partial_responses.load(Ordering::Relaxed) >= 2);
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn tool_download_falls_back_without_range_support() {
+        // 3 MiB is over the 2 MiB segmentation threshold, so a
+        // range-capable server WOULD segment it — the fallback is
+        // the server's doing, not the size's.
+        let body_size = 3 * 1024 * 1024;
+        let (url, stats, shutdown, handle) =
+            spawn_tool_server(body_size, false, 128 * 1024, Duration::from_millis(2));
+        let dir = std::env::temp_dir()
+            .join(format!("thunderload-tool-fallback-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let temp = dir.join(".tool-download.tmp");
+        let expected = tool_test_body(body_size);
+        download_tool_file(YtDlpTool::YtDlp, &url, &temp, None)
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&temp).await.unwrap(), expected);
+        // No Range was ever honored: the sequential path served the
+        // whole body with plain 200s.
+        assert_eq!(stats.partial_responses.load(Ordering::Relaxed), 0);
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn tool_download_progress_carries_speed_and_eta() {
+        let body_size = 4 * 1024 * 1024;
+        let (url, _stats, shutdown, handle) =
+            spawn_tool_server(body_size, true, 32 * 1024, Duration::from_millis(50));
+        let dir = std::env::temp_dir()
+            .join(format!("thunderload-tool-progress-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let temp = dir.join(".tool-download.tmp");
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<ToolDownloadProgress>();
+        let download = tokio::spawn(async move {
+            download_tool_file(YtDlpTool::YtDlp, &url, &temp, Some(progress_tx)).await
+        });
+        let mut events = Vec::new();
+        while let Some(event) = progress_rx.recv().await {
+            events.push(event);
+        }
+        download.await.unwrap().unwrap();
+        assert!(!events.is_empty(), "a download must emit progress");
+        assert!(
+            events.iter().any(|event| event.speed_bps.is_some()),
+            "at least one event must carry speed, got {} events: {events:?}",
+            events.len()
+        );
+        assert!(
+            events.iter().any(|event| event.eta_secs.is_some()),
+            "at least one event must carry ETA, got {} events: {events:?}",
+            events.len()
+        );
+        let last = events.last().unwrap();
+        assert_eq!(last.percent, Some(100.0));
+        assert_eq!(last.downloaded, body_size as u64);
+        assert_eq!(last.total, Some(body_size as u64));
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

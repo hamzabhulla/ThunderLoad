@@ -1214,7 +1214,7 @@ async fn main() -> Result<()> {
                     let tx_progress = tx.clone();
                     let progress_handle = tokio::spawn(async move {
                         while let Some(progress) = progress_rx.recv().await {
-                            let _ = tx_progress.send(json!({"event": "ytdlp.tool_progress", "tool": progress.tool.id(), "downloaded": progress.downloaded, "total": progress.total, "percent": progress.percent}));
+                            let _ = tx_progress.send(json!({"event": "ytdlp.tool_progress", "tool": progress.tool.id(), "downloaded": progress.downloaded, "total": progress.total, "percent": progress.percent, "speedBps": progress.speed_bps, "etaSecs": progress.eta_secs}));
                         }
                     });
                     match ensure_tool(tool, Some(progress_tx)).await {
