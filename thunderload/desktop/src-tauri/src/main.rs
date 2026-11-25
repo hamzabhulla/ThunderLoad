@@ -3167,13 +3167,15 @@ mod scheduler_tests {
 #[cfg(test)]
 mod native_host_tests {
     use super::{
-        chrome_extension_origin, describe_host_install_error, install_native_host_binary,
-        is_chrome_key_browser, manifest_allowed_origins, manifest_host_path,
-        merged_chrome_key_origins, native_browser_family, native_host_binary_name,
-        native_host_content_hash, native_host_locked_message, native_host_manifest,
-        native_host_manifest_chromium, native_host_manifest_matches, remove_chrome_key_origin,
-        validate_native_extension_id, NativeBrowserFamily,
+        chrome_extension_origin, chrome_key_origin_must_stay, describe_host_install_error,
+        install_native_host_binary, is_chrome_key_browser, manifest_allowed_origins,
+        manifest_host_path, merged_chrome_key_origins, native_browser_family,
+        native_host_binary_name, native_host_content_hash, native_host_locked_message,
+        native_host_manifest, native_host_manifest_chromium, native_host_manifest_matches,
+        remove_chrome_key_origin, validate_native_extension_id, ConnectedBrowser,
+        NativeBrowserFamily,
     };
+    use serde_json::json;
     use std::path::Path;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::path::PathBuf;
