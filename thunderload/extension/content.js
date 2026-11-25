@@ -633,7 +633,13 @@
   // reports the result — granted, denied, or the manual steps — and
   // stays in the panel so the user can retry or follow the steps.
   // Returns a fragment (button + note) for the caller to append.
-  function connectButton() {
+  // onGranted (optional) runs after a successful grant only — e.g.
+  // to re-run the inspect that failed for lack of the permission,
+  // so the panel re-renders from the fresh result instead of
+  // leaving the stale error on screen next to the "connected"
+  // note. A denied or failed grant never runs it: the manual
+  // steps stay, unchanged.
+  function connectButton(onGranted) {
     const connect = document.createElement("button");
     connect.type = "button";
     connect.className = "p-connect";
@@ -649,9 +655,12 @@
       note.classList.remove("show");
       try {
         const result = await api.runtime.sendMessage({ type: "REQUEST_NATIVE_PERMISSION" });
-        applyConnectNote(result?.granted
-          ? "Desktop app connected. You can download now."
-          : MANUAL_PERMISSION_STEPS);
+        if (result?.granted) {
+          applyConnectNote("Desktop app connected. You can download now.");
+          if (typeof onGranted === "function") onGranted();
+        } else {
+          applyConnectNote(MANUAL_PERMISSION_STEPS);
+        }
       } catch (_) {
         applyConnectNote(MANUAL_PERMISSION_STEPS);
       } finally {
@@ -821,7 +830,13 @@
       empty.className = "p-empty";
       empty.textContent = panelYtDlp.error;
       panel.append(empty);
-      panel.append(connectButton());
+      // A successful grant re-runs the inspect for this panel — the
+      // same onDone pattern as the tool-download fragment — so the
+      // stale permission error clears and the formats load. The
+      // "connected" note survives the re-render via lastConnectNote.
+      panel.append(connectButton(() => {
+        if (panelTarget) openYtDlpPanel(panelTarget);
+      }));
     } else {
       const variants = panelYtDlp.variants || [];
       const scroll = document.createElement("div");
@@ -1043,7 +1058,13 @@
       scroll.append(details);
     }
     if (scroll.childElementCount) panel.append(scroll);
-    panel.append(connectButton());
+    // Same stale-error pattern as the yt-dlp panel: a manifest
+    // inspect that failed for lack of the permission leaves its
+    // error text here, so a successful grant re-runs that inspect —
+    // only when an inspect error is actually showing.
+    panel.append(connectButton(() => {
+      if (panelInspectError && panelPrimary && panelTarget) inspectPanelVariants(panelPrimary, panelTarget);
+    }));
     appendInterceptNote(panel);
     status?.classList.remove("show");
     panel.classList.add("show");
