@@ -46,6 +46,28 @@ function readNativeIds(): Record<string, string> {
   } catch { return {}; }
 }
 
+// Browsers the desktop can connect, in the order the Settings form
+// offers them. The connected list below renders in this order too, so
+// Chrome always comes first (it seeds the shared Chrome/Opera manifest
+// deterministically — see the startup check).
+const NATIVE_BROWSERS: Array<{ id: string; name: string }> = [
+  { id: "chrome", name: "Google Chrome" },
+  { id: "edge", name: "Microsoft Edge" },
+  { id: "brave", name: "Brave" },
+  { id: "opera", name: "Opera" },
+  { id: "vivaldi", name: "Vivaldi" },
+  { id: "firefox", name: "Firefox" },
+];
+function nativeBrowserName(browser: string): string {
+  return NATIVE_BROWSERS.find((item) => item.id === browser)?.name || browser;
+}
+
+// Connected browsers, in NATIVE_BROWSERS order, from the saved IDs.
+function listNativeBrowsers(): Array<{ browser: string; extensionId: string }> {
+  const ids = readNativeIds();
+  return NATIVE_BROWSERS.filter((item) => ids[item.id]).map((item) => ({ browser: item.id, extensionId: ids[item.id] }));
+}
+
 // Refusal shown when a pasted URL inspects as a webpage instead of a
 // direct media file — the same wording as the Format support note on the
 // Video page. (YouTube/social pages never reach this: they route to the
@@ -301,6 +323,19 @@ export default function App() {
   const [nativeExtensionId, setNativeExtensionId] = useState(() => readNativeIds()["chrome"] || "");
   const [nativeSetupStatus, setNativeSetupStatus] = useState("");
   const [nativeSettingUp, setNativeSettingUp] = useState(false);
+  // Connected browsers, with an Add form. Several browsers can stay
+  // connected at once — each one registers its own native host and its
+  // extension talks to its own host process, so downloads from any of
+  // them work at the same time. The form starts open when nothing is
+  // connected yet (the old first-run experience) and stays shut once
+  // at least one browser is in the list.
+  const [connectedBrowsers, setConnectedBrowsers] = useState(listNativeBrowsers);
+  // The browser a removal is in flight for, or null. While one removal
+  // runs, every Remove button (and Add/Connect) is disabled: two rapid
+  // Removes would interleave read-modify-write on the saved IDs and
+  // resurrect the first one.
+  const [removingNativeBrowser, setRemovingNativeBrowser] = useState<string | null>(null);
+  const [showAddBrowser, setShowAddBrowser] = useState(() => Object.keys(readNativeIds()).length === 0);
   // Non-blocking startup prompt: "missing-id" when no extension ID was
   // ever saved, "register-failed" when a saved ID could not be
   // re-registered. Dismissal is persisted per kind (see
@@ -1668,6 +1703,8 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       const ids = readNativeIds();
       ids[nativeBrowser] = extensionId;
       localStorage.setItem(NATIVE_IDS_KEY, JSON.stringify(ids));
+      setConnectedBrowsers(listNativeBrowsers());
+      setShowAddBrowser(false);
       setNativeBanner(null);
       // P1-23: the connection is fixed — a dismissal stored for the
       // old banner must not hide a future one.
@@ -1677,6 +1714,55 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       setNativeSetupStatus(String(error));
     } finally {
       setNativeSettingUp(false);
+    }
+  }
+  // Opens the Add form on the first browser that is not connected yet,
+  // with a fresh ID field (Firefox keeps its fixed ID).
+  function openAddBrowser() {
+    const connected = new Set(connectedBrowsers.map((item) => item.browser));
+    const next = NATIVE_BROWSERS.find((item) => !connected.has(item.id));
+    if (!next) return;
+    setNativeBrowser(next.id);
+    setNativeExtensionId(next.id === "firefox" ? "thunderload@example.com" : "");
+    setShowAddBrowser(true);
+  }
+  async function removeNativeBrowser(browser: string) {
+    // One removal at a time — the buttons are disabled while one runs,
+    // and this guard covers a second click before the state update lands.
+    if (removingNativeBrowser) return;
+    const entry = connectedBrowsers.find((item) => item.browser === browser);
+    if (!entry) return;
+    const name = nativeBrowserName(browser);
+    setRemovingNativeBrowser(browser);
+    setNativeSetupStatus(`Removing ${name}…`);
+    try {
+      // The backend decides whether the registration must stay: only
+      // Chrome and Opera on Windows share one, and the frontend cannot
+      // tell that from two browsers that merely loaded the same
+      // unpacked folder (same extension ID, separate registrations).
+      // The still-connected list comes from storage, not state, so a
+      // click before a state update cannot see a stale list.
+      const remainingBrowsers = Object.entries(readNativeIds())
+        .filter(([itemBrowser]) => itemBrowser !== browser)
+        .map(([itemBrowser, extensionId]) => ({ browser: itemBrowser, extensionId }));
+      const result = await invoke<{ message: string; registrationKept: boolean }>("unregister_native_host", {
+        browser,
+        extensionId: entry.extensionId,
+        remainingBrowsers,
+      });
+      const ids = readNativeIds();
+      delete ids[browser];
+      localStorage.setItem(NATIVE_IDS_KEY, JSON.stringify(ids));
+      const remaining = listNativeBrowsers();
+      setConnectedBrowsers(remaining);
+      if (!remaining.length) setNativeBanner("missing-id");
+      setNativeSetupStatus(result.registrationKept
+        ? `${name} removed. Its browser registration stays — another connected browser uses the same extension ID.`
+        : `${name} removed.`);
+    } catch (error) {
+      setNativeSetupStatus(String(error));
+    } finally {
+      setRemovingNativeBrowser(null);
     }
   }
   async function downloadExtensionFile(kind: "chromium" | "firefox") {
@@ -2044,23 +2130,34 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
           </div>
           <div className="rule" />
           <div className="settings-section">
-            <div><h2>Browser connection</h2><p>Register the optional local engine for adaptive video downloads. Direct file downloads work without this connection.</p></div>
-            <div className="native-host-grid">
-              <label><span>Browser</span><select className="select-field" value={nativeBrowser} onChange={(event) => {
-                const next = event.target.value;
-                setNativeBrowser(next);
-                setNativeExtensionId(readNativeIds()[next] || (next === "firefox" ? "thunderload@example.com" : ""));
-              }}>
-                <option value="chrome">Google Chrome</option>
-                <option value="edge">Microsoft Edge</option>
-                <option value="brave">Brave</option>
-                <option value="opera">Opera</option>
-                <option value="vivaldi">Vivaldi</option>
-                <option value="firefox">Firefox</option>
-              </select></label>
-              <label><span>Extension ID</span><input className="field" value={nativeExtensionId} onChange={(event) => setNativeExtensionId(event.target.value)} placeholder={nativeBrowser === "firefox" ? "thunderload@example.com" : "32 characters a–p"} /></label>
-              <button className="secondary-button" onClick={registerNativeHost} disabled={nativeSettingUp}>{nativeSettingUp ? "Registering…" : "Connect browser"}</button>
-            </div>
+            <div><h2>Browser connection</h2><p>Register the optional local engine for adaptive video downloads. Direct file downloads work without this connection. Connect as many browsers as you like — each one stays connected and can send downloads at the same time.</p></div>
+            {connectedBrowsers.map((item) => (
+              <div className="setting-row" key={item.browser}>
+                <div><strong>{nativeBrowserName(item.browser)}</strong><small>Extension ID {item.extensionId}</small></div>
+                <button className="quiet-button" disabled={removingNativeBrowser !== null} onClick={() => removeNativeBrowser(item.browser)}>{removingNativeBrowser === item.browser ? "Removing…" : "Remove"}</button>
+              </div>
+            ))}
+            {connectedBrowsers.length < NATIVE_BROWSERS.length && !showAddBrowser && (
+              <div className="setting-row">
+                <div><strong>Add another browser</strong><small>Chrome, Edge, Brave, Opera, Vivaldi or Firefox — each one works at the same time.</small></div>
+                <button className="secondary-button" disabled={removingNativeBrowser !== null} onClick={openAddBrowser}>Add browser</button>
+              </div>
+            )}
+            {showAddBrowser && (
+              <div className="native-host-grid">
+                <label><span>Browser</span><select className="select-field" value={nativeBrowser} onChange={(event) => {
+                  const next = event.target.value;
+                  setNativeBrowser(next);
+                  setNativeExtensionId(readNativeIds()[next] || (next === "firefox" ? "thunderload@example.com" : ""));
+                }}>
+                  {NATIVE_BROWSERS.filter((item) => !connectedBrowsers.some((entry) => entry.browser === item.id)).map((item) => (
+                    <option key={item.id} value={item.id}>{item.name}</option>
+                  ))}
+                </select></label>
+                <label><span>Extension ID</span><input className="field" value={nativeExtensionId} onChange={(event) => setNativeExtensionId(event.target.value)} placeholder={nativeBrowser === "firefox" ? "thunderload@example.com" : "32 characters a–p"} /></label>
+                <button className="secondary-button" onClick={registerNativeHost} disabled={nativeSettingUp || removingNativeBrowser !== null}>{nativeSettingUp ? "Registering…" : "Connect browser"}</button>
+              </div>
+            )}
             {nativeSetupStatus && <div className="notice native-host-notice">{nativeSetupStatus}</div>}
             <ol className="setup-steps">
               <li><strong>Install the extension first</strong> — download it below in Browser extension files and load it in your browser (Chromium: Load unpacked in developer mode; Firefox: Install Add-on From File).</li>

@@ -7,7 +7,7 @@
 use std::{collections::HashMap, path::{Path, PathBuf}, process::Command, sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex, OnceLock}, time::{Duration, Instant}};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{Emitter, Manager};
 use thunderload_engine::{check_ytdlp_update as engine_check_ytdlp_update, dash_output_extension, dash_work_dir, default_download_dir, download_dash_resumable, download_hls_live, download_hls_resumable, download_hls_subtitles, download_page, download_url_resumable_with_connections, ensure_tool, error_text, grab_page_media as engine_grab_page_media, hls_output_extension, hls_work_dir, inspect_page, inspect_video, partial_download_metadata_path, partial_download_path, reserve_download_path, safe_filename, store_file_name, tool_status, tools_dir, with_extension, DownloadControl, DownloadOutcome, DownloadProgress, GlobalRateLimiter, HlsSelection, JobKind, JobOrigin, JobRecord, JobState, JobStore, PageMediaList, SessionHeaders, ToolDownloadProgress, ToolStatus, ToolsMissing, YtDlpTool};
@@ -1435,6 +1435,60 @@ fn merged_chrome_key_origins(
     origins
 }
 
+/// `path` recorded in a manifest file on disk, if the file exists and
+/// parses; anything else reads as "no host recorded". Never fails: a
+/// corrupt or missing file simply contributes nothing.
+/// Windows-only in production; the tests below exercise the removal.
+#[cfg(any(target_os = "windows", test))]
+fn manifest_host_path(manifest_path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(manifest_path).ok()?;
+    let manifest: Value = serde_json::from_str(&text).ok()?;
+    manifest["path"].as_str().map(str::to_string)
+}
+
+/// `allowed_origins` of a manifest minus one extension's origin, sorted
+/// and de-duplicated. The shared Chrome-key manifest cannot tell which
+/// browser an origin belongs to, so callers must only remove an origin
+/// no other connected browser still uses — `unregister_native_host`
+/// checks the browsers that stay connected (see
+/// `chrome_key_origin_must_stay`) before calling this.
+/// Windows-only in production; the tests below exercise the removal.
+#[cfg(any(target_os = "windows", test))]
+fn remove_chrome_key_origin(manifest_path: &Path, extension_id: &str) -> Vec<String> {
+    let drop = chrome_extension_origin(extension_id);
+    let mut origins: Vec<String> = manifest_allowed_origins(manifest_path)
+        .into_iter()
+        .filter(|origin| origin != &drop)
+        .collect();
+    origins.sort();
+    origins.dedup();
+    origins
+}
+
+/// Whether the removed browser's origin must stay in the shared
+/// Chrome-key manifest: only when another still-connected browser that
+/// registers through the same shared key (Chrome or Opera on Windows)
+/// uses the same extension ID. Every other same-ID case has its own
+/// registration — two browsers loading the same unpacked folder get the
+/// same Chromium extension ID, but Edge, Brave, Vivaldi and Firefox
+/// each have their own key and manifest — so the removed browser's
+/// registration must go. The frontend cannot make this call: it does
+/// not know the platform or the shared-key layout, and a same ID alone
+/// says nothing about sharing.
+/// Windows-only in production; the tests below exercise the decision.
+#[cfg(any(target_os = "windows", test))]
+fn chrome_key_origin_must_stay(
+    browser: &str,
+    extension_id: &str,
+    remaining_browsers: &[ConnectedBrowser],
+) -> bool {
+    is_chrome_key_browser(browser)
+        && remaining_browsers.iter().any(|other| {
+            let other_browser = other.browser.trim().to_ascii_lowercase();
+            is_chrome_key_browser(&other_browser) && other.extension_id.trim() == extension_id
+        })
+}
+
 /// Where a browser looks for native-messaging manifests (Linux).
 #[cfg(target_os = "linux")]
 fn native_manifest_dir(browser: &str, home: &Path) -> Option<PathBuf> {
@@ -1828,6 +1882,151 @@ async fn check_native_host(browser: String, extension_id: String) -> Result<bool
     {
         let _ = (browser, extension_id);
         Err("Browser native-host setup is not supported on this platform.".into())
+    }
+}
+
+/// One browser that stays connected, as the Settings UI reports it:
+/// the browser id and the extension ID it was connected with.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectedBrowser {
+    browser: String,
+    extension_id: String,
+}
+
+/// What `unregister_native_host` did. The frontend needs more than a
+/// message: when the registration genuinely has to stay — another
+/// still-connected browser shares it — the UI must say so instead of
+/// claiming the browser was fully removed.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UnregisterResult {
+    message: String,
+    registration_kept: bool,
+}
+
+/// Removes one browser's native-host registration: the manifest entry
+/// and the registry key (Windows) or the manifest file (Linux/macOS).
+/// The host binary itself is never removed — another connected browser
+/// may still use it — and neither are the tools or the user's downloads.
+/// Chrome and Opera share one Windows registry key and one manifest, so
+/// removing one of them only drops its origin from the shared manifest;
+/// the key and the manifest go away only when no origin is left — unless
+/// another still-connected Chrome-key browser uses the same extension
+/// ID, in which case the origin (and the key and manifest behind it)
+/// must stay. The caller passes the browsers that stay connected so the
+/// backend can make that call: it knows the platform and the shared-key
+/// layout, and the frontend cannot tell a genuinely shared registration
+/// from two browsers that merely loaded the same unpacked folder (same
+/// extension ID, separate registrations). An unparseable shared manifest
+/// reads as no origins (see `manifest_allowed_origins`), so a corrupt
+/// file also loses its key here — the startup re-register rewrites it
+/// from the remaining browser's saved ID. Removing a registration that
+/// is already gone succeeds: a missing key or manifest is not an error.
+#[tauri::command]
+async fn unregister_native_host(
+    browser: String,
+    extension_id: String,
+    remaining_browsers: Vec<ConnectedBrowser>,
+) -> Result<UnregisterResult, String> {
+    let browser = browser.trim().to_ascii_lowercase();
+    let extension_id = extension_id.trim();
+    #[cfg(target_os = "windows")]
+    {
+        validate_native_extension_id(
+            native_browser_family(&browser).ok_or_else(|| {
+                "Choose Chrome, Edge, Brave, Opera, Vivaldi or Firefox.".to_string()
+            })?,
+            extension_id,
+        )?;
+        let registry_path = windows_native_registry_path(&browser)
+            .ok_or_else(|| "Choose Chrome, Edge, Brave, Opera, Vivaldi or Firefox.".to_string())?;
+        let local_app_data = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .ok_or_else(|| "LOCALAPPDATA is not available.".to_string())?;
+        let install_dir = local_app_data.join("ThunderLoad").join("native-host");
+        if is_chrome_key_browser(&browser) {
+            // Shared manifest: drop only this browser's origin — unless
+            // another still-connected Chrome-key browser uses the same
+            // extension ID, in which case the origin must stay.
+            if chrome_key_origin_must_stay(&browser, extension_id, &remaining_browsers) {
+                return Ok(UnregisterResult {
+                    message: format!(
+                        "{browser} native host registration kept for another connected browser."
+                    ),
+                    registration_kept: true,
+                });
+            }
+            let shared_path = chrome_key_manifest_path(&install_dir);
+            let remaining = remove_chrome_key_origin(&shared_path, extension_id);
+            if remaining.is_empty() {
+                let _ = std::fs::remove_file(&shared_path);
+                delete_registry_key(registry_path)?;
+            } else {
+                // The manifest still authorises other origins, so it
+                // must be rewritten — a manifest with origins but no
+                // recorded host path is damaged (the app always writes
+                // one), and silently leaving it would keep this
+                // browser's origin authorised. Fail instead: closing
+                // and reopening ThunderLoad repairs the manifest from
+                // the remaining browser's saved ID.
+                let host = manifest_host_path(&shared_path).ok_or_else(|| {
+                    "The shared browser manifest is damaged (no host path recorded), so the registration was left in place. Close and reopen ThunderLoad to repair it, then try removing this browser again.".to_string()
+                })?;
+                let manifest = native_host_manifest_chromium(&remaining, Path::new(&host));
+                let bytes =
+                    serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?;
+                std::fs::write(&shared_path, bytes)
+                    .map_err(|error| format!("Could not write native host manifest: {error}"))?;
+            }
+        } else {
+            let manifest_path = install_dir.join(format!("{browser}-native-host.json"));
+            let _ = std::fs::remove_file(&manifest_path);
+            delete_registry_key(registry_path)?;
+        }
+        Ok(UnregisterResult {
+            message: format!("{browser} native host unregistered."),
+            registration_kept: false,
+        })
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        validate_native_extension_id(
+            native_browser_family(&browser).ok_or_else(|| {
+                "Choose Chrome, Edge, Brave, Opera, Vivaldi or Firefox.".to_string()
+            })?,
+            extension_id,
+        )?;
+        // Every browser has its own manifest dir here, so the browsers
+        // that stay connected never share this one's registration.
+        let _ = &remaining_browsers;
+        let home = home_dir()?;
+        let manifest_dir = native_manifest_dir(&browser, &home)
+            .ok_or_else(|| "Choose Chrome, Edge, Brave, Opera, Vivaldi or Firefox.".to_string())?;
+        let _ = std::fs::remove_file(manifest_dir.join("com.thunderload.host.json"));
+        Ok(UnregisterResult {
+            message: format!("{browser} native host unregistered."),
+            registration_kept: false,
+        })
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (browser, extension_id, remaining_browsers);
+        Err("Browser native-host setup is not supported on this platform.".into())
+    }
+}
+
+/// Deletes one Windows registry key. `reg delete` exits 1 when the key
+/// is already gone — that is not a failure. Any other non-zero exit is.
+#[cfg(target_os = "windows")]
+fn delete_registry_key(registry_path: &str) -> Result<(), String> {
+    let status = hidden_command("reg")
+        .args(["delete", registry_path, "/f"])
+        .status()
+        .map_err(|error| format!("Could not remove native host registration: {error}"))?;
+    match status.code() {
+        Some(0) | Some(1) => Ok(()),
+        _ => Err("Windows refused to remove the ThunderLoad native host registration.".into()),
     }
 }
 
@@ -2825,7 +3024,7 @@ fn main() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![inspect_video_url, grab_page_media, start_download, pause_download, cancel_download, set_speed_limit, schedule_app_wake, cancel_app_wake, start_hls_download, start_hls_live_download, download_subtitles, start_dash_download, inspect_ytdlp_url, start_ytdlp_download, get_ytdlp_tools_status, ensure_ytdlp_tool, check_ytdlp_update, open_ytdlp_release_page, open_tools_folder, get_ffmpeg_path, set_ffmpeg_path, get_native_downloads, control_native_download, dismiss_native_download, handover_native_download, register_native_host, check_native_host, open_download_folder, save_extension_file, get_jobs, sync_jobs, remove_job, cancel_queued_job])
+        .invoke_handler(tauri::generate_handler![inspect_video_url, grab_page_media, start_download, pause_download, cancel_download, set_speed_limit, schedule_app_wake, cancel_app_wake, start_hls_download, start_hls_live_download, download_subtitles, start_dash_download, inspect_ytdlp_url, start_ytdlp_download, get_ytdlp_tools_status, ensure_ytdlp_tool, check_ytdlp_update, open_ytdlp_release_page, open_tools_folder, get_ffmpeg_path, set_ffmpeg_path, get_native_downloads, control_native_download, dismiss_native_download, handover_native_download, register_native_host, check_native_host, unregister_native_host, open_download_folder, save_extension_file, get_jobs, sync_jobs, remove_job, cancel_queued_job])
         .run(tauri::generate_context!())
         .expect("error while running ThunderLoad desktop app");
 }
@@ -2968,12 +3167,15 @@ mod scheduler_tests {
 #[cfg(test)]
 mod native_host_tests {
     use super::{
-        describe_host_install_error, install_native_host_binary, is_chrome_key_browser,
-        manifest_allowed_origins, merged_chrome_key_origins, native_browser_family,
+        chrome_extension_origin, chrome_key_origin_must_stay, describe_host_install_error,
+        install_native_host_binary, is_chrome_key_browser, manifest_allowed_origins,
+        manifest_host_path, merged_chrome_key_origins, native_browser_family,
         native_host_binary_name, native_host_content_hash, native_host_locked_message,
         native_host_manifest, native_host_manifest_chromium, native_host_manifest_matches,
-        validate_native_extension_id, NativeBrowserFamily,
+        remove_chrome_key_origin, validate_native_extension_id, ConnectedBrowser,
+        NativeBrowserFamily,
     };
+    use serde_json::json;
     use std::path::Path;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::path::PathBuf;
@@ -3234,6 +3436,161 @@ mod native_host_tests {
         let corrupt = dir.join("corrupt.json");
         std::fs::write(&corrupt, b"{not json").unwrap();
         assert!(manifest_allowed_origins(&corrupt).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_chrome_key_origin_drops_only_the_named_origin() {
+        // Removing one browser from the shared Chrome-key manifest must
+        // keep the other browser's origin, and removing an unknown ID
+        // must change nothing.
+        let dir = std::env::temp_dir().join("thunderload-remove-origin-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = dir.join("chrome-native-host.json");
+        let host = dir.join("thunderload-host.exe");
+        std::fs::write(&host, b"fake-host").unwrap();
+        let chrome = "abcdefghijklmnopabcdefghijklmnop";
+        let opera = "ponmlkjihgfedcbaponmlkjihgfedcba";
+        std::fs::write(
+            &manifest,
+            serde_json::to_vec_pretty(&native_host_manifest_chromium(
+                &[
+                    chrome_extension_origin(chrome),
+                    chrome_extension_origin(opera),
+                ],
+                &host,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        // Removing Chrome keeps Opera's origin.
+        assert_eq!(
+            remove_chrome_key_origin(&manifest, chrome),
+            vec![chrome_extension_origin(opera)]
+        );
+        // Removing Opera keeps Chrome's origin.
+        assert_eq!(
+            remove_chrome_key_origin(&manifest, opera),
+            vec![chrome_extension_origin(chrome)]
+        );
+        // An ID that was never registered changes nothing.
+        assert_eq!(
+            remove_chrome_key_origin(&manifest, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            vec![
+                chrome_extension_origin(chrome),
+                chrome_extension_origin(opera),
+            ]
+        );
+        // The recorded host path survives, so the rewritten manifest
+        // still points at the same binary.
+        assert_eq!(
+            manifest_host_path(&manifest),
+            Some(host.to_string_lossy().to_string())
+        );
+        assert_eq!(manifest_host_path(&dir.join("does-not-exist.json")), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chrome_key_origin_stays_only_for_a_same_id_chrome_key_survivor() {
+        // The audit defect: the old frontend skipped the backend call
+        // whenever ANY other browser shared the extension ID. Only a
+        // still-connected Chrome-key browser (Chrome or Opera) sharing
+        // the same ID keeps the origin — every other same-ID pair has
+        // its own registration and must be removed.
+        let staying = |browser: &str, id: &str| ConnectedBrowser {
+            browser: browser.to_string(),
+            extension_id: id.to_string(),
+        };
+        let chrome_id = "abcdefghijklmnopabcdefghijklmnop";
+        let opera_id = "ponmlkjihgfedcbaponmlkjihgfedcba";
+        // Chrome removed, Opera stays with the same ID: the origin stays.
+        assert!(chrome_key_origin_must_stay(
+            "chrome",
+            chrome_id,
+            &[staying("opera", chrome_id)]
+        ));
+        // Opera removed, Chrome stays with the same ID: the origin stays.
+        assert!(chrome_key_origin_must_stay(
+            "opera",
+            chrome_id,
+            &[staying("chrome", chrome_id)]
+        ));
+        // Chrome removed, Edge stays with the same ID (same unpacked
+        // folder): Edge has its own key and manifest, so the origin goes.
+        assert!(!chrome_key_origin_must_stay(
+            "chrome",
+            chrome_id,
+            &[staying("edge", chrome_id)]
+        ));
+        // Edge removed, Brave stays with the same ID: both have their
+        // own registrations, so Edge's goes.
+        assert!(!chrome_key_origin_must_stay(
+            "edge",
+            chrome_id,
+            &[staying("brave", chrome_id)]
+        ));
+        // Chrome removed, Opera stays with a different ID: nothing
+        // shares the removed origin.
+        assert!(!chrome_key_origin_must_stay(
+            "chrome",
+            chrome_id,
+            &[staying("opera", opera_id)]
+        ));
+        // Chrome removed, nobody stays: the origin goes (and with it
+        // the manifest and the key, once no origin is left).
+        assert!(!chrome_key_origin_must_stay("chrome", chrome_id, &[]));
+        // Vivaldi removed, Chrome stays with the same ID: Vivaldi has
+        // its own key, so its registration goes.
+        assert!(!chrome_key_origin_must_stay(
+            "vivaldi",
+            chrome_id,
+            &[staying("chrome", chrome_id)]
+        ));
+        // Firefox never uses the shared manifest.
+        assert!(!chrome_key_origin_must_stay(
+            "firefox",
+            "thunderload@example.com",
+            &[staying("firefox", "thunderload@example.com")]
+        ));
+    }
+
+    #[test]
+    fn shared_manifest_with_origins_but_no_host_path_is_visible() {
+        // MINOR 1: a manifest that parses and still authorises origins
+        // but records no host path used to make the removal silently
+        // succeed without rewriting it — the origin stayed authorised
+        // while the UI reported the browser removed. The backend now
+        // errors in that case; the precondition is pinned here.
+        let dir = std::env::temp_dir().join("thunderload-no-path-manifest-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = dir.join("chrome-native-host.json");
+        let chrome = "abcdefghijklmnopabcdefghijklmnop";
+        let opera = "ponmlkjihgfedcbaponmlkjihgfedcba";
+        std::fs::write(
+            &manifest,
+            serde_json::to_vec_pretty(&json!({
+                "name": "com.thunderload.host",
+                "description": "ThunderLoad local download engine",
+                "type": "stdio",
+                "allowed_origins": [
+                    chrome_extension_origin(chrome),
+                    chrome_extension_origin(opera),
+                ],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // Origins remain after dropping Chrome's, so the removal must
+        // rewrite the manifest — but there is no host path to rewrite
+        // with.
+        assert_eq!(
+            remove_chrome_key_origin(&manifest, chrome),
+            vec![chrome_extension_origin(opera)]
+        );
+        assert_eq!(manifest_host_path(&manifest), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
