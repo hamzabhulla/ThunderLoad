@@ -654,14 +654,20 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ ok: true, variants: cached.variants, title: cached.title, cached: true });
         return;
       }
-      // 65 s: the engine allows 60 s for a slow inspect; the default
+      // 90 s: the engine allows 60 s for a slow inspect, and the
+      // extension must wait LONGER than that — dispatch, permission
+      // verify, spawn, kill and response overhead on a cold Windows
+      // machine (Defender scan, first launch) eats a 5 s margin, so
+      // the old 65 s timer fired first, the pending request was
+      // deleted, and the engine's on-time answer was dropped as
+      // unknown. 30 s of margin covers that overhead; the default
       // 30 s requestNative timeout would cut a 30–60 s inspect off in
       // the extension even though the engine would succeed.
       // Slice 5: the page URL is also the referer — yt-dlp passes it
       // to the site, so a login-walled video inspects with the session
       // instead of 403ing. (Cookies + UA were already attached by
       // requestNative; only the referer was missing here.)
-      const result = await requestNative("ytdlp.inspect", { url: pageUrl, referer: pageUrl }, 65000);
+      const result = await requestNative("ytdlp.inspect", { url: pageUrl, referer: pageUrl }, 90000);
       if (!result?.ok) {
         sendResponse({ ok: false, error: result?.error || "yt-dlp could not inspect this page.", toolsMissing: normalizeMissingTool(result?.toolsMissing) });
         return;
@@ -694,7 +700,7 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ ok: true, variants: cached.variants, title: cached.title, cached: true, generic: true });
         return;
       }
-      const result = await requestNative("ytdlp.inspect", { url: pageUrl, referer: pageUrl, generic: true }, 65000);
+      const result = await requestNative("ytdlp.inspect", { url: pageUrl, referer: pageUrl, generic: true }, 90000);
       if (!result?.ok) {
         sendResponse({ ok: false, error: result?.error || "yt-dlp could not inspect this page.", toolsMissing: normalizeMissingTool(result?.toolsMissing) });
         return;
