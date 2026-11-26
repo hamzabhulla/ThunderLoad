@@ -292,6 +292,20 @@
   // resolving after a click does not wipe the feedback.
   let lastConnectNote = "";
 
+  // The note a successful permission grant writes. Compared by
+  // value, not by re-reading the DOM: a stale inspect error shown
+  // next to this note is contradictory — the app IS connected, the
+  // inspect just failed — so the button below reads "Try again"
+  // instead of "Connect desktop app" in that state.
+  const CONNECTED_NOTE = "Desktop app connected. You can download now.";
+
+  // Mirror of background.js isNativeConnectionError: a permission /
+  // disconnect / timeout failure is a connection failure, not a
+  // media failure, and the connect button is the way out of it.
+  function isNativeConnectionError(message) {
+    return /permission has not been granted|disconnected|timed out|native messaging host not found/i.test(String(message || ""));
+  }
+
   // Pushes a connect result to the live note (if any) as well as
   // remembering it: covers a re-render landing mid-click, when the
   // note the handler closed over is already detached.
@@ -639,11 +653,11 @@
   // leaving the stale error on screen next to the "connected"
   // note. A denied or failed grant never runs it: the manual
   // steps stay, unchanged.
-  function connectButton(onGranted) {
+  function connectButton(onGranted, label) {
     const connect = document.createElement("button");
     connect.type = "button";
     connect.className = "p-connect";
-    connect.textContent = "Connect desktop app";
+    connect.textContent = label || "Connect desktop app";
     const note = document.createElement("div");
     note.className = "p-note";
     if (lastConnectNote) {
@@ -656,7 +670,7 @@
       try {
         const result = await api.runtime.sendMessage({ type: "REQUEST_NATIVE_PERMISSION" });
         if (result?.granted) {
-          applyConnectNote("Desktop app connected. You can download now.");
+          applyConnectNote(CONNECTED_NOTE);
           if (typeof onGranted === "function") onGranted();
         } else {
           applyConnectNote(MANUAL_PERMISSION_STEPS);
@@ -834,9 +848,12 @@
       // same onDone pattern as the tool-download fragment — so the
       // stale permission error clears and the formats load. The
       // "connected" note survives the re-render via lastConnectNote.
+      // When the error is itself a connection failure (e.g. a timed-out
+      // inspect) and the note already says connected, the app IS
+      // connected — the button reads "Try again", same click behaviour.
       panel.append(connectButton(() => {
         if (panelTarget) openYtDlpPanel(panelTarget);
-      }));
+      }, isNativeConnectionError(panelYtDlp.error) && lastConnectNote === CONNECTED_NOTE ? "Try again" : undefined));
     } else {
       const variants = panelYtDlp.variants || [];
       const scroll = document.createElement("div");
@@ -1061,10 +1078,13 @@
     // Same stale-error pattern as the yt-dlp panel: a manifest
     // inspect that failed for lack of the permission leaves its
     // error text here, so a successful grant re-runs that inspect —
-    // only when an inspect error is actually showing.
+    // only when an inspect error is actually showing. And as there:
+    // a connection error shown next to the connected note gets
+    // "Try again", not "Connect desktop app" for an app that is
+    // already connected.
     panel.append(connectButton(() => {
       if (panelInspectError && panelPrimary && panelTarget) inspectPanelVariants(panelPrimary, panelTarget);
-    }));
+    }, isNativeConnectionError(panelInspectError) && lastConnectNote === CONNECTED_NOTE ? "Try again" : undefined));
     appendInterceptNote(panel);
     status?.classList.remove("show");
     panel.classList.add("show");
