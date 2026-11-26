@@ -2040,7 +2040,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
         <div className="engine-line"><i />Local engine</div>
         <button title="Settings" aria-label="Settings" className={"nav-item " + (page === "settings" ? "selected" : "")} onClick={() => goTo("settings")}><span>⚙</span>Settings</button>
         {/* Version shown here is display-only; the release version lives in thunderload/Cargo.toml [workspace.package]. */}
-        <div className="version">ThunderLoad · 0.3.7</div>
+        <div className="version">ThunderLoad · 0.3.8</div>
       </div>
     </aside>
 
@@ -2209,7 +2209,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
             <p className="footnote">Tools folder: {ytdlpTools ? ytdlpTools.toolsDir : "…"}</p>
           </div>
           <div className="rule" />
-          <div className="settings-section"><div><h2>About</h2><p>Local desktop transfer engine · Version 0.3.7</p>{/* Display-only; the release version lives in thunderload/Cargo.toml [workspace.package]. */}</div><div className="about-line"><span>Supported media</span><strong>Direct files · HLS VOD · Live HLS recording · Static DASH VOD · YouTube &amp; social (yt-dlp)</strong></div><div className="about-line"><span>Direct downloads</span><strong>Pause · Resume · Cancel · Speed limit · Schedule</strong></div><div className="about-line"><span>Still in development</span><strong>Live DASH</strong></div></div>
+          <div className="settings-section"><div><h2>About</h2><p>Local desktop transfer engine · Version 0.3.8</p>{/* Display-only; the release version lives in thunderload/Cargo.toml [workspace.package]. */}</div><div className="about-line"><span>Supported media</span><strong>Direct files · HLS VOD · Live HLS recording · Static DASH VOD · YouTube &amp; social (yt-dlp)</strong></div><div className="about-line"><span>Direct downloads</span><strong>Pause · Resume · Cancel · Speed limit · Schedule</strong></div><div className="about-line"><span>Still in development</span><strong>Live DASH</strong></div></div>
         </section>}
 
       </div>

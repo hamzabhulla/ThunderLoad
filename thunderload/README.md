@@ -1,4 +1,4 @@
-# ThunderLoad 0.3.7 — Cross-platform desktop + browser extension
+# ThunderLoad 0.3.8 — Cross-platform desktop + browser extension
 
 The release version's single source is `Cargo.toml` `[workspace.package]` — the desktop `package.json`, `tauri.conf.json`, extension manifests and UI version strings track it (those JSON files cannot carry a comment saying so).
 
