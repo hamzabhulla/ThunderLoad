@@ -2359,7 +2359,21 @@ async fn ensure_segmented_part(part: &Path, total: u64) -> Result<()> {
 
 /// Runs a segmented checkpoint, allowing exactly one clean restart if a
 /// segment discovers mid-flight that the object changed. A second change
-/// is a real error, not a race to chase.
+/// is NOT immediately a real error: two consecutive fresh validators
+/// both failing proves the validator itself is unstable per request
+/// (rotating ETag / per-node CDN variance — a static object does not
+/// change twice within seconds), so one last run goes ahead with the
+/// validator dropped (Range without If-Range). Per-segment
+/// Content-Range and total validation still apply, so size changes
+/// are still caught; only the header-validator check is dropped for
+/// that run. If even the validator-less run sees a change (the server
+/// ignores Range and answers 200), THAT is the real error.
+///
+/// SAFETY (accepted residual risk): a same-size content swap
+/// mid-download goes undetected in the validator-less run. Accepted
+/// because (1) the objects are static CDN media, effectively immutable
+/// per URL, (2) Content-Range/total checks still guard size changes,
+/// and (3) the sequential path already accepts the same risk.
 #[allow(clippy::too_many_arguments)]
 async fn run_segmented_with_restart(
     client: &Client,
@@ -2436,9 +2450,46 @@ async fn run_segmented_with_restart(
                 write_resume_metadata(metadata_path, &metadata).await?;
             }
             SegmentedRun::ValidatorChanged => {
-                return Err(anyhow!(
-                    "The download changed on the server while resuming; restart it to try again"
-                ));
+                // Second fresh validator failed too: the validator
+                // carries no signal for this host (see the doc comment
+                // above), so one last run drops it entirely — fresh
+                // part + fresh metadata with etag and last_modified
+                // cleared, so segments send Range WITHOUT If-Range.
+                // A 200 here can only mean the server truly ignored
+                // the range; that keeps the existing error.
+                let _ = fs::remove_file(part).await;
+                let _ = fs::remove_file(metadata_path).await;
+                metadata.etag = None;
+                metadata.last_modified = None;
+                ensure_segmented_part(part, total).await?;
+                write_resume_metadata(metadata_path, &metadata).await?;
+                let checkpoint = Arc::new(AsyncMutex::new(SegmentCheckpoint {
+                    metadata_path: metadata_path.to_path_buf(),
+                    metadata: metadata.clone(),
+                    last_write: Instant::now(),
+                }));
+                match run_segmented_download(
+                    client,
+                    url,
+                    target,
+                    part,
+                    &checkpoint,
+                    total,
+                    None,
+                    session,
+                    control.clone(),
+                    rate_limiter.clone(),
+                    progress_tx.clone(),
+                )
+                .await?
+                {
+                    SegmentedRun::Finished(outcome) => return Ok(outcome),
+                    SegmentedRun::ValidatorChanged => {
+                        return Err(anyhow!(
+                            "The download changed on the server while resuming; restart it to try again"
+                        ));
+                    }
+                }
             }
         }
     }
@@ -5648,6 +5699,191 @@ mod segmented_resumable_tests {
         assert_eq!(bytes, body_for(2, LARGE_BODY));
         assert!(!tokio::fs::try_exists(&part).await.unwrap());
         assert!(!tokio::fs::try_exists(partial_download_metadata_path(&target)).await.unwrap());
+        fixture.stop();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    /// A server whose ETag rotates on EVERY response — the body never
+    /// changes, only the validator. Any If-Range the client sends was
+    /// minted by an earlier response, so it can never match the etag
+    /// minted for the current one, and a ranged GET with If-Range is
+    /// always answered 200 (as a real rotating-ETag CDN does). A
+    /// ranged GET without If-Range is answered 206. This is the
+    /// Instagram failure: two fresh validators both failing, then
+    /// the validator-less run completing.
+    struct RotatingEtagFixture {
+        url: String,
+        range_requests: Arc<AtomicUsize>,
+        range_206: Arc<AtomicUsize>,
+        shutdown: Arc<AtomicBool>,
+        handle: thread::JoinHandle<()>,
+    }
+
+    impl RotatingEtagFixture {
+        fn stop(self) {
+            self.shutdown.store(true, Ordering::Relaxed);
+            self.handle.join().unwrap();
+        }
+    }
+
+    fn spawn_rotating_etag_server(body_size: usize) -> RotatingEtagFixture {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let etag_counter = Arc::new(AtomicUsize::new(0));
+        let range_requests = Arc::new(AtomicUsize::new(0));
+        let range_206 = Arc::new(AtomicUsize::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let body = Arc::new(body_for(1, body_size));
+        let thread_counter = etag_counter.clone();
+        let thread_requests = range_requests.clone();
+        let thread_206 = range_206.clone();
+        let thread_shutdown = shutdown.clone();
+        let handle = thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => {
+                        let _ = connection.0.set_nonblocking(false);
+                        connection
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let body = body.clone();
+                let counter = thread_counter.clone();
+                let requests = thread_requests.clone();
+                let served_206 = thread_206.clone();
+                thread::spawn(move || loop {
+                    let mut raw = Vec::new();
+                    let mut buffer = [0_u8; 1024];
+                    let head_complete = loop {
+                        match stream.read(&mut buffer) {
+                            Ok(0) => break false,
+                            Ok(count) => {
+                                raw.extend_from_slice(&buffer[..count]);
+                                if raw.windows(4).any(|window| window == b"\r\n\r\n") {
+                                    break true;
+                                }
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(_) => break false,
+                        }
+                    };
+                    if !head_complete {
+                        return;
+                    }
+                    let request = String::from_utf8_lossy(&raw);
+                    let method = request.split_whitespace().next().unwrap_or("");
+                    let header = |name: &str| {
+                        request.lines().find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.eq_ignore_ascii_case(name)
+                                .then(|| value.trim().to_string())
+                        })
+                    };
+                    // Fresh validator per response: no If-Range value
+                    // minted earlier can ever equal this one.
+                    let etag = format!("\"rot-{}\"", counter.fetch_add(1, Ordering::Relaxed));
+                    if method == "HEAD" {
+                        let headers = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {body_size}\r\nETag: {etag}\r\nAccept-Ranges: bytes\r\n\r\n"
+                        );
+                        if stream.write_all(headers.as_bytes()).is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                    let range = header("range");
+                    let if_range = header("if-range");
+                    if range.is_some() {
+                        requests.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let bounds = range.as_deref()
+                        .and_then(|value| value.strip_prefix("bytes="))
+                        .and_then(|value| value.split_once('-'))
+                        .and_then(|(start, end)| {
+                            Some((start.parse::<usize>().ok()?, end.parse::<usize>().ok()?))
+                        });
+                    // Honored only without If-Range: with one, the
+                    // rotating validator never matches, so the full
+                    // body comes back with 200.
+                    let honored = bounds.is_some_and(|(start, end)| {
+                        start <= end && end < body_size && if_range.is_none()
+                    });
+                    let (status, payload_range) = if honored {
+                        let (start, end) = bounds.unwrap();
+                        served_206.fetch_add(1, Ordering::Relaxed);
+                        (
+                            "206 Partial Content",
+                            Some((start, end, format!("Content-Range: bytes {start}-{end}/{body_size}\r\n"))),
+                        )
+                    } else {
+                        ("200 OK", None)
+                    };
+                    let (start, end) = payload_range
+                        .as_ref()
+                        .map(|(start, end, _)| (*start, *end))
+                        .unwrap_or((0, body_size - 1));
+                    let extra = payload_range
+                        .as_ref()
+                        .map(|(_, _, range)| range.clone())
+                        .unwrap_or_default();
+                    let payload_len = end - start + 1;
+                    let headers = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {payload_len}\r\nETag: {etag}\r\n{extra}\r\n"
+                    );
+                    if stream.write_all(headers.as_bytes()).is_err() {
+                        return;
+                    }
+                    if stream.write_all(&body[start..=end]).is_err() {
+                        return;
+                    }
+                });
+            }
+        });
+        RotatingEtagFixture {
+            url: format!("http://{address}/file.bin"),
+            range_requests,
+            range_206,
+            shutdown,
+            handle,
+        }
+    }
+
+    #[tokio::test]
+    async fn segmented_resumable_rotating_etag_completes_without_validator() {
+        // The object never changes — only its ETag rotates per
+        // response. Both validated attempts must fail with
+        // ValidatorChanged, and the validator-less run must then
+        // complete with exact bytes instead of erroring with
+        // "The download changed on the server while resuming".
+        let fixture = spawn_rotating_etag_server(SMALL_BODY);
+        let directory = temp_dir("seg-resume-rotating-etag");
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("file.bin")).await.unwrap();
+        let outcome = resume(&fixture.url, &target, 4).await;
+        assert_eq!(outcome, DownloadOutcome::Completed);
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(bytes, body_for(1, SMALL_BODY));
+        assert!(!tokio::fs::try_exists(partial_download_path(&target)).await.unwrap());
+        assert!(!tokio::fs::try_exists(partial_download_metadata_path(&target)).await.unwrap());
+        // Only the validator-less run can serve 206s (every validated
+        // range request got 200), and it must have served every chunk.
+        assert_eq!(
+            fixture.range_206.load(Ordering::Relaxed),
+            super::chunk_ranges(SMALL_BODY as u64).len(),
+            "the validator-less run must serve every chunk as 206"
+        );
+        assert!(
+            fixture.range_requests.load(Ordering::Relaxed)
+                > super::chunk_ranges(SMALL_BODY as u64).len(),
+            "the validated attempts must have issued range requests before failing"
+        );
         fixture.stop();
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
