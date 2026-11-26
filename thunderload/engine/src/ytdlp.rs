@@ -618,11 +618,20 @@ fn attempt_suffix() -> String {
 /// in-memory hash still passes. Expand-Archive then reads the
 /// corrupt on-disk zip and fails with "Could not unpack the Deno
 /// download", even though the download itself was fine.
+///
+/// The extension is per tool, not cosmetic: Deno's temp MUST end
+/// in `.zip` because Windows unpacks it with PowerShell
+/// `Expand-Archive`, which only accepts `.zip` files — a `.tmp`
+/// temp fails with "NotSupportedArchiveFileExtension" no matter
+/// how good the bytes are. yt-dlp is an exe, never unpacked, so
+/// its temp keeps the plain `.tmp` suffix.
 fn unique_tool_temp_path(dir: &Path, tool: YtDlpTool) -> PathBuf {
+    let extension = if tool == YtDlpTool::Deno { "zip" } else { "tmp" };
     dir.join(format!(
-        ".{}-download-{}.tmp",
+        ".{}-download-{}.{}",
         tool.file_name(),
-        attempt_suffix()
+        attempt_suffix(),
+        extension
     ))
 }
 
@@ -769,7 +778,8 @@ pub async fn download_tool(
     // temp and its checkpoint go with the error. Temp names are
     // unique per attempt, so no later attempt ever truncates or
     // reuses a stale one; without this, every failed download leaks
-    // one hidden `.<tool>-download-<pid>-<counter>.tmp` plus its
+    // one hidden `.<tool>-download-<pid>-<counter>.tmp` (`.zip` for
+    // Deno — Expand-Archive only accepts `.zip`) plus its
     // `.part` + `.meta.json` (up to ~41 MB).
     let result: Result<PathBuf> = async {
         download_tool_file(tool, tool.download_url(), &temp, progress_tx).await?;
@@ -2761,7 +2771,11 @@ exec sleep 30
             .unwrap()
             .to_string_lossy()
             .starts_with(".deno"));
-        assert!(first.extension().unwrap() == "tmp");
+        // Deno's temp must end in `.zip`: Windows unpacks it with
+        // Expand-Archive, which rejects any other extension.
+        assert!(first.extension().unwrap() == "zip");
+        let ytdlp_first = unique_tool_temp_path(&dir, YtDlpTool::YtDlp);
+        assert!(ytdlp_first.extension().unwrap() == "tmp");
     }
 
     #[tokio::test]
