@@ -37,19 +37,19 @@ function Copy-Allowlisted {
   New-Item -ItemType Directory -Force -Path $Destination | Out-Null
   foreach ($relative in $CommonFiles) {
     $source = Join-Path $Extension ($relative -replace "/", [System.IO.Path]::DirectorySeparatorChar)
-    if (-not (Test-Path $source -PathType Leaf)) { throw "Allowlisted extension file is missing: $relative" }
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Allowlisted extension file is missing: $relative" }
     $target = Join-Path $Destination ($relative -replace "/", [System.IO.Path]::DirectorySeparatorChar)
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
-    Copy-Item $source $target -Force
+    Copy-Item -LiteralPath $source $target -Force
   }
   $manifestSource = Join-Path $Extension $ManifestFile
-  if (-not (Test-Path $manifestSource -PathType Leaf)) { throw "Allowlisted extension file is missing: $ManifestFile" }
-  Copy-Item $manifestSource (Join-Path $Destination $ManifestArchiveName) -Force
+  if (-not (Test-Path -LiteralPath $manifestSource -PathType Leaf)) { throw "Allowlisted extension file is missing: $ManifestFile" }
+  Copy-Item -LiteralPath $manifestSource (Join-Path $Destination $ManifestArchiveName) -Force
 }
 
 function New-ForwardSlashZip {
   param([string]$SourceDir, [string]$DestinationPath)
-  if (Test-Path $DestinationPath) { Remove-Item $DestinationPath -Force }
+  if (Test-Path -LiteralPath $DestinationPath) { Remove-Item -LiteralPath $DestinationPath -Force }
   $zip = [System.IO.Compression.ZipFile]::Open($DestinationPath, [System.IO.Compression.ZipArchiveMode]::Create)
   try {
     # Fixed 1980-01-01 timestamps (same as package-extensions.mjs) so
@@ -64,7 +64,7 @@ function New-ForwardSlashZip {
     $FixedTime = [System.DateTime]::new(1980, 1, 1, 0, 0, 0, [System.DateTimeKind]::Local)
     $dirEntry = $zip.CreateEntry("icons/", [System.IO.Compression.CompressionLevel]::NoCompression)
     $dirEntry.LastWriteTime = $FixedTime
-    $files = Get-ChildItem -Path $SourceDir -Recurse -File | Sort-Object FullName
+    $files = Get-ChildItem -LiteralPath $SourceDir -Recurse -File | Sort-Object FullName
     foreach ($file in $files) {
       # Forward slashes only: GetRelativePath returns the OS
       # separator (backslash on Windows), which must never reach
@@ -103,6 +103,6 @@ try {
   # An .xpi is a ZIP with a different extension; the desktop app serves the
   # .xpi for Firefox (see save_extension_file). The Tauri bundler lists the
   # .xpi as a resource, so it must exist before the installer build runs.
-  Copy-Item (Join-Path $Output "ThunderLoad-Firefox.zip") (Join-Path $Output "ThunderLoad-Firefox.xpi") -Force
+  Copy-Item -LiteralPath (Join-Path $Output "ThunderLoad-Firefox.zip") (Join-Path $Output "ThunderLoad-Firefox.xpi") -Force
   Write-Host "Extension packages written to $Output"
-} finally { Remove-Item $Stage -Recurse -Force -ErrorAction SilentlyContinue }
+} finally { Remove-Item -LiteralPath $Stage -Recurse -Force -ErrorAction SilentlyContinue }
