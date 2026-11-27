@@ -719,12 +719,15 @@
     tryGenericInspect(target);
   }
 
+  let ytdlpInspectRun = 0;
   async function tryGenericInspect(target) {
+    const run = ++ytdlpInspectRun;
+    const inspectedUrl = location.href;
     let result;
     try {
-      result = await api.runtime.sendMessage({ type: "YTDLP_INSPECT_GENERIC", pageUrl: location.href });
+      result = await api.runtime.sendMessage({ type: "YTDLP_INSPECT_GENERIC", pageUrl: inspectedUrl });
     } catch (_) { return; }
-    if (panelTarget !== target || panelPrimary !== null || !panelEl()?.classList.contains("show")) return;
+    if (run !== ytdlpInspectRun || location.href !== inspectedUrl || panelTarget !== target || panelPrimary !== null || !panelEl()?.classList.contains("show")) return;
     if (!result?.ok) return;
     const variants = (result.variants || []).filter((item) => item?.downloadable && item?.url);
     if (!variants.length) return;
@@ -902,10 +905,12 @@
     ytdlpDenoMissing = false;
     ytdlpToolProgressText = "";
     renderYtDlpPanel();
+    const run = ++ytdlpInspectRun;
+    const inspectedUrl = location.href;
     (async () => {
       try {
-        const result = await api.runtime.sendMessage({ type: "YTDLP_INSPECT", pageUrl: location.href });
-        if (panelTarget !== target || !panelEl()?.classList.contains("show")) return;
+        const result = await api.runtime.sendMessage({ type: "YTDLP_INSPECT", pageUrl: inspectedUrl });
+        if (run !== ytdlpInspectRun || location.href !== inspectedUrl || panelTarget !== target || !panelEl()?.classList.contains("show")) return;
         if (!result?.ok) {
           const missingTool = normalizeMissingTool(result?.toolsMissing);
           panelYtDlp = missingTool
@@ -930,13 +935,14 @@
             // download right here instead of failing silently.
             try {
               const toolStatus = await api.runtime.sendMessage({ type: "YTDLP_TOOLS_STATUS" });
+              if (run !== ytdlpInspectRun || location.href !== inspectedUrl || panelTarget !== target) return;
               if (toolStatus?.ok && toolStatus.deno && toolStatus.deno.present === false) ytdlpDenoMissing = true;
             } catch (_) { /* Tools status is best-effort here. */ }
           }
         }
         if (panelEl()?.classList.contains("show")) renderYtDlpPanel();
       } catch (_) {
-        if (panelTarget !== target) return;
+        if (run !== ytdlpInspectRun || location.href !== inspectedUrl || panelTarget !== target) return;
         panelYtDlp = { error: "Could not inspect this page." };
         // Slice 6 fix (MINOR 1): a failed inspect is not the end —
         // try the GenericIE fallback before settling on the error.
