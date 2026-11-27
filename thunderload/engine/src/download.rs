@@ -418,8 +418,12 @@ async fn download_segmented(
             let mut stream = response.bytes_stream();
             let mut file = fs::File::create(&part_path).await?;
             let mut local_bytes = 0_u64;
+            let expected_len = end - start + 1;
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk?;
+                if chunk.len() as u64 > expected_len.saturating_sub(local_bytes) {
+                    return Err(anyhow!("Server returned more bytes than requested for segment"));
+                }
                 file.write_all(&chunk).await?;
                 local_bytes += chunk.len() as u64;
                 let wait = rate_limiter.reserve(chunk.len() as u64).await;
@@ -857,13 +861,24 @@ impl GlobalRateLimiter {
         }
         if limit == 0 || bytes == 0 { return std::time::Duration::ZERO; }
         let now = Instant::now();
-        let spent_until = state.epoch + std::time::Duration::from_secs_f64(state.reserved as f64 / limit as f64);
-        if spent_until < now {
+        let secs_for = |b: u64| -> std::time::Duration {
+            let s = (b as f64 / limit as f64).min(3600.0);
+            std::time::Duration::try_from_secs_f64(s).unwrap_or(std::time::Duration::from_secs(3600))
+        };
+        let spent_until = state.epoch.checked_add(secs_for(state.reserved)).unwrap_or(now);
+        if spent_until <= now {
             state.epoch = now;
             state.reserved = 0;
+        } else if now > state.epoch {
+            let elapsed_secs = now.saturating_duration_since(state.epoch).as_secs_f64();
+            let consumed = (elapsed_secs * limit as f64).floor() as u64;
+            if consumed > 0 {
+                state.epoch = now;
+                state.reserved = state.reserved.saturating_sub(consumed);
+            }
         }
         state.reserved = state.reserved.saturating_add(bytes);
-        let target = state.epoch + std::time::Duration::from_secs_f64(state.reserved as f64 / limit as f64);
+        let target = state.epoch.checked_add(secs_for(state.reserved)).unwrap_or(now);
         target.saturating_duration_since(Instant::now())
     }
 }
@@ -1207,10 +1222,11 @@ pub(crate) fn direct_checkpoint_info(path: &Path) -> Option<(String, Option<u64>
 }
 
 async fn write_resume_metadata(path: &Path, metadata: &ResumeMetadata) -> Result<()> {
-    // Unique tmp name (pid + uuid, as the job store does): two writers
+    // Unique tmp name (short random id): two writers
     // to the same checkpoint must never share one `meta.tmp`.
     let mut tmp_name = path.as_os_str().to_owned();
-    tmp_name.push(format!(".{}.{}.tmp", std::process::id(), Uuid::new_v4()));
+    let short_id = &Uuid::new_v4().simple().to_string()[..8];
+    tmp_name.push(format!(".{}.tmp", short_id));
     let temporary = PathBuf::from(tmp_name);
     let bytes = serde_json::to_vec(metadata)?;
     let mut options = fs::OpenOptions::new();
@@ -1856,14 +1872,16 @@ async fn download_chunk_worker(
                 }
             }
         };
-        {
-            let mut guard = shared.queue.lock().unwrap();
-            guard.current[slot] = None;
-        }
         match outcome {
             Ok(SegmentOutcome::Completed) => {
                 if let Err(error) = mark_segment_done(&shared.checkpoint, index).await {
+                    let mut guard = shared.queue.lock().unwrap();
+                    guard.current[slot] = None;
                     return WorkerResult { terminal: None, error: Some(error), stats };
+                }
+                {
+                    let mut guard = shared.queue.lock().unwrap();
+                    guard.current[slot] = None;
                 }
                 // Slice 7b: only after the checkpoint marks the chunk
                 // done — the live count never claims a chunk the resume
@@ -1879,8 +1897,16 @@ async fn download_chunk_worker(
                     0.5 * stats.ewma_bytes_per_sec + 0.5 * rate
                 };
             }
-            Ok(other) => return WorkerResult { terminal: Some(other), error: None, stats },
-            Err(error) => return WorkerResult { terminal: None, error: Some(error), stats },
+            Ok(other) => {
+                let mut guard = shared.queue.lock().unwrap();
+                guard.current[slot] = None;
+                return WorkerResult { terminal: Some(other), error: None, stats };
+            }
+            Err(error) => {
+                let mut guard = shared.queue.lock().unwrap();
+                guard.current[slot] = None;
+                return WorkerResult { terminal: None, error: Some(error), stats };
+            }
         }
     }
 }
