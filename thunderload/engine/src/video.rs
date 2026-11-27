@@ -1413,7 +1413,7 @@ fn join_dash_resource(base: &Url, reference: &str) -> Result<Url> {
     // a BaseURL query string. RFC-style path joining drops the base query, so
     // propagate it only when the child resource did not provide its own query.
     if reference.split('#').next().unwrap_or(reference).contains('?') == false {
-        if resolved.query().is_none() {
+        if resolved.query().is_none() && resolved.origin() == base.origin() {
             if let Some(query) = base.query() {
                 resolved.set_query(Some(query));
             }
@@ -2256,15 +2256,23 @@ fn parse_hls_media_playlist_inner(body: &str, base: &Url, live: bool) -> Result<
             // sequence number as its IV (RFC 8216 §4.3.2.4): the number
             // is the playlist's MEDIA-SEQUENCE plus this segment's
             // position in the list, as a 16-byte big-endian integer.
-            let key = current_key.clone().map(|key_ref| {
-                let iv = key_ref.iv.unwrap_or_else(|| {
-                    let sequence = media_sequence + segments.len() as u64;
-                    let mut iv = [0u8; 16];
-                    iv[8..].copy_from_slice(&sequence.to_be_bytes());
-                    iv
-                });
-                HlsKeyRef { uri: key_ref.uri, iv: Some(iv) }
-            });
+            let key = match current_key.clone() {
+                Some(key_ref) => {
+                    let iv = match key_ref.iv {
+                        Some(explicit) => explicit,
+                        None => {
+                            let sequence = media_sequence
+                                .checked_add(segments.len() as u64)
+                                .ok_or_else(|| anyhow!("HLS EXT-X-MEDIA-SEQUENCE overflow"))?;
+                            let mut iv = [0u8; 16];
+                            iv[8..].copy_from_slice(&sequence.to_be_bytes());
+                            iv
+                        }
+                    };
+                    Some(HlsKeyRef { uri: key_ref.uri, iv: Some(iv) })
+                }
+                None => None,
+            };
             let discontinuity = std::mem::take(&mut pending_discontinuity);
             segments.push(HlsSegmentRef { url, range, key, init: current_init.clone().map(Box::new), discontinuity });
         }
@@ -2644,7 +2652,7 @@ async fn fetch_hls_segment_inner(
     let key = match &segment.key {
         Some(key_ref) => Some((
             fetch_hls_key(client, &key_ref.uri, session, key_cache).await?,
-            key_ref.iv.expect("HlsKeyRef always carries a resolved IV after parsing"),
+            key_ref.iv.ok_or_else(|| anyhow!("Missing AES-128 IV for HLS segment"))?,
         )),
         None => None,
     };
@@ -4014,7 +4022,7 @@ async fn download_dash_track(
         // promptly instead of after the in-flight segment finishes.
         // A closed control channel interrupts here too — the finished
         // segments stay on disk for Resume, only the temp files go.
-        if tasks.len() >= connections {
+        while tasks.len() >= connections {
             match join_next_or_control(&mut tasks, &mut control_watch).await {
                 JoinNextOutcome::Interrupted => {
                     tasks.abort_all();
@@ -4030,9 +4038,16 @@ async fn download_dash_track(
                         return Err(error);
                     }
                 }
-                JoinNextOutcome::ControlChanged => {}
+                JoinNextOutcome::ControlChanged => {
+                    match *control.borrow() {
+                        DownloadControl::Paused => { stopped = Some(DownloadControl::Paused); break; }
+                        DownloadControl::Cancelled => { stopped = Some(DownloadControl::Cancelled); break; }
+                        DownloadControl::Running => {}
+                    }
+                }
             }
         }
+        if stopped.is_some() { break; }
     }
     if let Some(stopped) = stopped {
         tasks.abort_all();
