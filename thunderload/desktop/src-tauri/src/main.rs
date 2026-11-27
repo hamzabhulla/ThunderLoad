@@ -539,8 +539,11 @@ async fn schedule_app_wake(
         let script_dir = app.path().app_config_dir().map_err(|error| error.to_string())?.join("scheduled");
         tokio::fs::create_dir_all(&script_dir).await.map_err(|error| error.to_string())?;
         let script_path = script_dir.join(format!("wake-{job_id}.ps1"));
+        let proc_name = powershell_literal(
+            std::env::current_exe().ok().and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned())).as_deref().unwrap_or("thunderload-desktop")
+        );
         let script = format!(
-            "$exe = '{executable}'\nif (-not (Get-Process -Name 'ThunderLoad' -ErrorAction SilentlyContinue)) {{ Start-Process -FilePath $exe }}\n"
+            "\u{FEFF}$exe = '{executable}'\nif (-not (Get-Process -Name '{proc_name}' -ErrorAction SilentlyContinue)) {{ Start-Process -FilePath $exe }}\n"
         );
         tokio::fs::write(&script_path, script).await.map_err(|error| error.to_string())?;
 
@@ -1860,9 +1863,10 @@ async fn check_native_host(browser: String, extension_id: String) -> Result<bool
             .args(["query", registry_path, "/ve"])
             .output()
             .map_err(|error| format!("Could not read native host registration: {error}"))?;
+        let stdout_lower = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+        let wanted_lower = manifest_path.to_string_lossy().to_ascii_lowercase();
         Ok(output.status.success()
-            && String::from_utf8_lossy(&output.stdout)
-                .contains(&manifest_path.to_string_lossy().into_owned()))
+            && stdout_lower.lines().any(|line| line.trim().ends_with(&wanted_lower)))
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
@@ -2548,9 +2552,16 @@ async fn get_native_downloads() -> Result<Vec<Value>, String> {
         .collect();
     with_job_store(|store| {
         for job in &jobs {
-            if let Some(record) = native_value_to_record(job) {
-                if store.get(&record.id).is_some_and(|existing| existing.origin == JobOrigin::Desktop) {
-                    continue;
+            if let Some(mut record) = native_value_to_record(job) {
+                if let Some(existing) = store.get(&record.id) {
+                    if existing.origin == JobOrigin::Desktop {
+                        continue;
+                    }
+                    if record.session.is_none() && existing.session.is_some()
+                        && !matches!(record.state, JobState::Completed | JobState::Cancelled)
+                    {
+                        record.session = existing.session.clone();
+                    }
                 }
                 let _ = store.upsert(record);
             }
