@@ -165,8 +165,15 @@ function ensureNativePort() {
   });
   nativePort.onDisconnect.addListener(() => {
     nativePort = null;
+    const disconnectError = api.runtime.lastError?.message || "Native host disconnected";
+    for (const [jobId, tabId] of jobTabById) {
+      api.tabs?.sendMessage?.(tabId, {
+        type: "NATIVE_EVENT",
+        event: { event: "download.error", jobId, error: disconnectError }
+      })?.catch?.(() => {});
+    }
     jobTabById.clear();
-    for (const [id, resolve] of pendingRequests) resolve({ id, ok: false, error: api.runtime.lastError?.message || "Native host disconnected" });
+    for (const [id, resolve] of pendingRequests) resolve({ id, ok: false, error: disconnectError });
     pendingRequests.clear();
     for (const timer of pendingRequestTimers.values()) clearTimeout(timer);
     pendingRequestTimers.clear();
@@ -325,7 +332,7 @@ async function quickDownloadMedia({ url, kind, pageUrl, filename, selectedVarian
 // downloads stay with the browser.
 const INTERCEPT_SETTING_KEY = "interceptBrowserDownloads";
 let interceptEnabled = true;
-api.storage?.local?.get({ [INTERCEPT_SETTING_KEY]: true })
+const interceptReady = (api.storage?.local?.get({ [INTERCEPT_SETTING_KEY]: true }) || Promise.resolve({}))
   .then((stored) => { interceptEnabled = stored?.[INTERCEPT_SETTING_KEY] !== false; })
   .catch(() => {});
 api.storage?.onChanged?.addListener((changes, area) => {
@@ -346,12 +353,14 @@ function cleanDownloadFilename(name, fallback) {
   return cleaned || fallback;
 }
 async function interceptDownload(downloadItem) {
+  await interceptReady;
   if (!interceptEnabled) return;
   if (!downloadItem || typeof downloadItem.id !== "number") return;
   if (downloadItem.byExtensionId && downloadItem.byExtensionId === api.runtime.id) return;
   if (!/^https?:\/\//i.test(downloadItem.url || "")) return;
   if (downloadItem.state === "complete") return;
   if (downloadItem.incognito) return;
+  if (!(await hasNativePermission())) return;
   const fromItem = String(downloadItem.filename || "").split(/[\\/]/).pop() || "";
   const filename = cleanDownloadFilename(fromItem, safeFilenameFromUrl(downloadItem.url, "download.bin"));
   try { await downloadsCancel(downloadItem.id); } catch (_) { /* Already finished or gone. */ }
@@ -796,7 +805,7 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return false;
 });
 
-api.tabs.onRemoved.addListener((tabId) => { sourcesByTab.delete(tabId); truncatedByTab.delete(tabId); ytdlpByTab.delete(tabId); for (const [jobId, tid] of jobTabById) { if (tid === tabId) jobTabById.delete(jobId); } removePersistedTabSources(tabId); });
+api.tabs.onRemoved.addListener((tabId) => { lastTabBaseUrl.delete(tabId); sourcesByTab.delete(tabId); truncatedByTab.delete(tabId); ytdlpByTab.delete(tabId); for (const [jobId, tid] of jobTabById) { if (tid === tabId) jobTabById.delete(jobId); } removePersistedTabSources(tabId); });
 
 // IDM-style network backstop: catch media the DOM scan cannot see
 // (fetch/XHR-loaded streams, cross-origin iframes). Observation only —
@@ -1160,7 +1169,22 @@ if (api.webRequest?.onHeadersReceived) {
     }
   }, { urls: ["<all_urls>"], types: ["xmlhttprequest", "media", "other"] }, ["responseHeaders"]);
 }
-api.tabs.onUpdated.addListener((tabId, changeInfo) => { if (changeInfo.status === "loading") { sourcesByTab.delete(tabId); truncatedByTab.delete(tabId); ytdlpByTab.delete(tabId); removePersistedTabSources(tabId); } });
+const lastTabBaseUrl = new Map();
+api.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  let spaChanged = false;
+  if (typeof changeInfo.url === "string") {
+    const base = changeInfo.url.split("#")[0];
+    const prev = lastTabBaseUrl.get(tabId);
+    lastTabBaseUrl.set(tabId, base);
+    if (prev && prev !== base) spaChanged = true;
+  }
+  if (changeInfo.status === "loading" || spaChanged) {
+    sourcesByTab.delete(tabId);
+    truncatedByTab.delete(tabId);
+    ytdlpByTab.delete(tabId);
+    removePersistedTabSources(tabId);
+  }
+});
 api.commands?.onCommand.addListener(async (command) => {
   if (command !== "scan-media") return;
   const [tab] = await api.tabs.query({ active: true, currentWindow: true });
