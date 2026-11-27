@@ -100,7 +100,8 @@ jobs:
           Copy-Item "release-assets-linux/*" $Out
           Copy-Item "release-assets-macos/*" $Out
           $Checksums = Join-Path $Out "SHA256SUMS.txt"
-          Get-ChildItem $Out -File | ForEach-Object {
+          $Files = @(Get-ChildItem -LiteralPath $Out -File | Where-Object { $_.Name -ne "SHA256SUMS.txt" })
+          $Files | ForEach-Object {
             $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
             "$hash  $($_.Name)" | Add-Content $Checksums
           }
