@@ -330,7 +330,27 @@ impl JobStore {
             let _ = fs::remove_file(&temporary);
             return Err(error);
         }
-        match fs::rename(&temporary, &self.path) {
+        let rename_result = {
+            #[cfg(target_os = "windows")]
+            {
+                let mut last_err = None;
+                let mut ok = false;
+                for delay in [0_u64, 20, 50, 100, 200] {
+                    if delay > 0 { std::thread::sleep(std::time::Duration::from_millis(delay)); }
+                    match fs::rename(&temporary, &self.path) {
+                        Ok(()) => { ok = true; break; }
+                        Err(e) if e.kind() == io::ErrorKind::PermissionDenied || matches!(e.raw_os_error(), Some(5) | Some(32)) => { last_err = Some(e); }
+                        Err(e) => { last_err = Some(e); break; }
+                    }
+                }
+                if ok { Ok(()) } else { Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "rename failed"))) }
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                fs::rename(&temporary, &self.path)
+            }
+        };
+        match rename_result {
             Ok(()) => {
                 #[cfg(unix)]
                 if let Some(parent) = self.path.parent() {
@@ -544,22 +564,35 @@ impl JobStore {
         if job.segments_done == Some(done) && job.segments_total == Some(total) {
             return Ok(false);
         }
+        let prev = (job.segments_done, job.segments_total, job.updated_at_ms);
         job.segments_done = Some(done);
         job.segments_total = Some(total);
         job.updated_at_ms = now_ms();
-        self.save()?;
+        if let Err(err) = self.save() {
+            if let Some(job) = self.jobs.iter_mut().find(|j| j.id == id) {
+                job.segments_done = prev.0;
+                job.segments_total = prev.1;
+                job.updated_at_ms = prev.2;
+            }
+            return Err(err);
+        }
         Ok(true)
     }
 
     /// Deletes a row. Returns false when the id was unknown.
     pub fn remove(&mut self, id: &str) -> io::Result<bool> {
-        let before = self.jobs.len();
-        self.jobs.retain(|job| job.id != id);
-        if self.jobs.len() == before {
+        let Some(pos) = self.jobs.iter().position(|job| job.id == id) else {
             return Ok(false);
+        };
+        let removed_job = self.jobs.remove(pos);
+        let removed_ts = self.last_progress_save.remove(id);
+        if let Err(err) = self.save() {
+            self.jobs.insert(pos, removed_job);
+            if let Some(ts) = removed_ts {
+                self.last_progress_save.insert(id.to_string(), ts);
+            }
+            return Err(err);
         }
-        self.last_progress_save.remove(id);
-        self.save()?;
         Ok(true)
     }
 
@@ -569,6 +602,7 @@ impl JobStore {
     /// Queued, Paused, Failed, Completed and Cancelled rows are
     /// untouched. Returns how many rows were flipped.
     pub fn mark_interrupted_on_startup(&mut self) -> io::Result<usize> {
+        let snapshot = self.jobs.clone();
         let mut flipped = 0;
         for job in self.jobs.iter_mut() {
             if job.state == JobState::Downloading {
@@ -579,7 +613,10 @@ impl JobStore {
             }
         }
         if flipped > 0 {
-            self.save()?;
+            if let Err(err) = self.save() {
+                self.jobs = snapshot;
+                return Err(err);
+            }
         }
         Ok(flipped)
     }
@@ -651,9 +688,29 @@ impl JobStore {
 
     fn has_target(&self, target: &Path) -> bool {
         let wanted = target.to_string_lossy().to_string();
-        self.jobs
-            .iter()
-            .any(|job| job.target_path.as_deref() == Some(wanted.as_str()))
+        #[cfg(target_os = "windows")]
+        let norm_win = |raw: &str| -> String {
+            let s = raw.replace('/', "\\");
+            let stripped = if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
+                format!(r"\\{unc}")
+            } else {
+                s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
+            };
+            stripped.trim_end_matches('\\').to_ascii_lowercase()
+        };
+        #[cfg(target_os = "windows")]
+        let wanted_norm = norm_win(&wanted);
+        self.jobs.iter().any(|job| {
+            let Some(existing) = job.target_path.as_deref() else { return false; };
+            #[cfg(target_os = "windows")]
+            {
+                norm_win(existing) == wanted_norm
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                existing == wanted.as_str()
+            }
+        })
     }
 
     /// Builds an Interrupted row from one checkpoint sidecar. Returns
