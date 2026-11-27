@@ -11,6 +11,7 @@ let sources = [];
 // (about:addons toggle) — content scripts and webRequest silently
 // stop, so the popup must say so instead of "No media found".
 let hostPermissionGranted = true;
+let scanRun = 0;
 // Slice 7c (Gemini claim 8): the background caps the list at
 // MAX_SOURCES_PER_TAB and reports it as `truncated` — the popup must
 // say so instead of silently showing a partial list.
@@ -540,9 +541,12 @@ async function autoInspectPrimary() {
   } catch (_) { /* Primary button falls back to downloadOne. */ }
 }
 async function scanActiveTab() {
+  const run = ++scanRun;
+  rescanBtn.disabled = true;
   sourceList.replaceChildren(el("div", "empty", "Scanning this tab…"));
   try {
     const result = await api.runtime.sendMessage({ type: "GET_ACTIVE_SOURCES" });
+    if (run !== scanRun) return;
     if (!result?.ok) throw new Error(result?.error || "Cannot scan this page");
     pageUrl = result.pageUrl || "";
     activeTabId = result.tabId ?? null;
@@ -586,8 +590,11 @@ async function scanActiveTab() {
       if (!sources.length) void inspectGenericPage(++genericInspectRun);
     }
   } catch (error) {
+    if (run !== scanRun) return;
     sources = []; sourcesTruncated = false; render();
     showToast(error.message || String(error));
+  } finally {
+    if (run === scanRun) rescanBtn.disabled = false;
   }
 }
 // Slice 6: the GenericIE fallback inspect for the popup. Runs only

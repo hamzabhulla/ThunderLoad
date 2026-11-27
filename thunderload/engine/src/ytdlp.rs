@@ -1743,7 +1743,15 @@ pub async fn download_page(
     // to guess the container up front. The reservation creates an
     // empty file — remove it before spawning, or yt-dlp sees an
     // existing file and skips the download as "already downloaded".
-    let stem = target.with_extension("");
+    let stem = if target
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| MEDIA_EXTENSIONS.iter().any(|m| m.eq_ignore_ascii_case(e)))
+    {
+        target.with_extension("")
+    } else {
+        target.to_path_buf()
+    };
     if let Ok(metadata) = tokio::fs::metadata(&target).await {
         if metadata.len() == 0 {
             let _ = tokio::fs::remove_file(&target).await;
@@ -2054,7 +2062,11 @@ async fn produced_file_for_stem(stem: &Path) -> Option<PathBuf> {
             continue;
         }
         if let Some(file_stem) = Path::new(&name).file_stem().and_then(|s| s.to_str()) {
-            if file_stem == wanted {
+            #[cfg(target_os = "windows")]
+            let matched = file_stem.eq_ignore_ascii_case(wanted);
+            #[cfg(not(target_os = "windows"))]
+            let matched = file_stem == wanted;
+            if matched {
                 found.push(entry.path());
             }
         }

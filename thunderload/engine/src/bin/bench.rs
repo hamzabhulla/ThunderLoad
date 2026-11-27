@@ -875,13 +875,16 @@ fn distinct_payload(size: usize) -> Vec<u8> {
     (0..size).map(|index| (index % 251) as u8).collect()
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> anyhow::Result<()> {
-    // Localhost exemption (P1-3): the engine's SSRF validator and
-    // validating resolver block loopback by default; this binary runs
-    // its fixtures on 127.0.0.1, so it opts in via the env-gated
-    // allowlist instead of the old `cfg(test)` exemption.
+fn main() -> anyhow::Result<()> {
+    // Set before starting the multi-thread Tokio runtime (no UB data race).
     std::env::set_var("THUNDERLOAD_ALLOW_LOCALHOST", "1");
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     let args = parse_args()?;
     if args.list {
         for name in ALL_BENCHES {

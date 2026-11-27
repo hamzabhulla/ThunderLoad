@@ -119,6 +119,7 @@ FunctionEnd
   ; data" checkbox is ticked; force it on so jobs and settings go with
   ; the components, whatever the checkbox shows.
   StrCpy $DeleteAppDataCheckboxState 1
+  nsExec::ExecToLog 'powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -Command "Get-ScheduledTask -TaskName $\'ThunderLoad-*$\' -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$$false"'
   DetailPrint "Removing ThunderLoad components (tools, native host, app data)..."
   ; The script fails loudly on its own when a removal fails; here its
   ; exit code is only observed, never fatal to the uninstall.

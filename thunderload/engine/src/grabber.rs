@@ -333,24 +333,22 @@ pub fn extract_page_media(html: &str, base_url: &str) -> PageMediaList {
 /// were re-established on every grab. `Client::clone` is cheap and
 /// shares the pool. (The fallback only runs if the fixed builder
 /// somehow fails; it is deliberately degraded rather than a panic.)
-fn shared_client() -> reqwest::Client {
+fn shared_client() -> Result<reqwest::Client> {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            reqwest::Client::builder()
-                .user_agent("Mozilla/5.0 ThunderLoad/0.1")
-                .redirect(crate::session::validated_redirect_policy())
-                .dns_resolver(std::sync::Arc::new(
-                    crate::session::ValidatingResolver::from_env(),
-                ))
-                // A hung server must not hang the Tauri command forever (F4):
-                // 15 s to connect, 30 s for the whole fetch including the body.
-                .connect_timeout(std::time::Duration::from_secs(15))
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new())
-        })
-        .clone()
+    if let Some(client) = CLIENT.get() {
+        return Ok(client.clone());
+    }
+    let built = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 ThunderLoad/0.1")
+        .redirect(crate::session::validated_redirect_policy())
+        .dns_resolver(std::sync::Arc::new(
+            crate::session::ValidatingResolver::from_env(),
+        ))
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("Could not construct validated HTTP client for page grabber")?;
+    Ok(CLIENT.get_or_init(|| built).clone())
 }
 
 /// Fetch a page and extract its media links (desktop grabber path).
@@ -373,7 +371,7 @@ pub async fn grab_page_media_with_session(
     session: Option<&SessionHeaders>,
 ) -> Result<PageMediaList> {
     crate::session::validate_public_http_url(page_url)?;
-    let client = shared_client();
+    let client = shared_client()?;
     let request = crate::session::apply_session(session, client.get(page_url), page_url);
     let response = request
         .send()

@@ -100,7 +100,7 @@ function buildZip(entries) {
     centralHeader.writeUInt16LE(0, 32); // comment
     centralHeader.writeUInt16LE(0, 34); // disk
     centralHeader.writeUInt16LE(0, 36); // internal attrs
-    centralHeader.writeUInt32LE(0, 38); // external attrs
+    centralHeader.writeUInt32LE(entry.directory ? 0x10 : 0, 38); // external attrs (DOS dir bit)
     centralHeader.writeUInt32LE(offset, 42);
     central.push(centralHeader, part.nameBuffer);
     offset += part.header.length + part.nameBuffer.length + part.compressed.length;

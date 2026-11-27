@@ -142,7 +142,7 @@ async fn save_native_job_state(state: &Value) -> Result<()> {
     tokio::fs::create_dir_all(&root).await?;
     let id = safe_filename(state.get("id").and_then(Value::as_str).unwrap_or("job"), "job");
     let destination = root.join(format!("{id}.json"));
-    let temporary = root.join(format!("{id}.json.tmp"));
+    let temporary = root.join(format!("{id}.{}.json.tmp", uuid::Uuid::new_v4().simple()));
     let status = state.get("status").and_then(Value::as_str);
     // MC2: the browser session is the resume credential. Scrub it only
     // on the two truly-terminal states — Completed (nothing left to
@@ -184,7 +184,29 @@ async fn save_native_job_state(state: &Value) -> Result<()> {
     // removed the destination first, leaving a microsecond window in
     // which the desktop's 1.5 s poll saw the file missing and dropped
     // the native items for one cycle (Gemini claim 13 flicker).
-    tokio::fs::rename(&temporary, &destination).await?;
+    #[cfg(target_os = "windows")]
+    {
+        let mut last_err = None;
+        for delay in [0_u64, 20, 50, 100, 200] {
+            if delay > 0 { tokio::time::sleep(std::time::Duration::from_millis(delay)).await; }
+            match tokio::fs::rename(&temporary, &destination).await {
+                Ok(()) => { last_err = None; break; }
+                Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied || matches!(err.raw_os_error(), Some(5) | Some(32)) => { last_err = Some(err); }
+                Err(err) => { let _ = tokio::fs::remove_file(&temporary).await; return Err(err.into()); }
+            }
+        }
+        if let Some(err) = last_err {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(err.into());
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Err(err) = tokio::fs::rename(&temporary, &destination).await {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(err.into());
+        }
+    }
     Ok(())
 }
 
@@ -542,6 +564,7 @@ async fn main() -> Result<()> {
                 }
                 let _ = save_native_job_state(&state).await;
                 let _ = outgoing_tx.send(json!({"id": id, "ok": true, "data": {"accepted": true, "jobId": job_id}}));
+                job_handles.retain(|h| !h.is_finished());
                 job_handles.push(tokio::spawn(async move {
                     'job: loop {
                         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
@@ -714,6 +737,7 @@ async fn main() -> Result<()> {
                     continue;
                 }
                 let tx = outgoing_tx.clone();
+                job_handles.retain(|h| !h.is_finished());
                 job_handles.push(tokio::spawn(async move {
                     // Resolve the playlist first so the reserved target gets
                     // the right extension (ts for plain TS playlists, mp4 for
@@ -985,6 +1009,7 @@ async fn main() -> Result<()> {
                     continue;
                 }
                 let tx = outgoing_tx.clone();
+                job_handles.retain(|h| !h.is_finished());
                 job_handles.push(tokio::spawn(async move {
                     let extension = match dash_output_extension(&url, &representation_id, audio_representation_id.as_deref(), session.as_ref()).await {
                         Ok(extension) => extension,
@@ -1294,6 +1319,7 @@ async fn main() -> Result<()> {
                 }
                 let _ = save_native_job_state(&state).await;
                 let _ = outgoing_tx.send(json!({"id": id, "ok": true, "data": {"accepted": true, "jobId": job_id}}));
+                job_handles.retain(|h| !h.is_finished());
                 job_handles.push(tokio::spawn(async move {
                     'job: loop {
                         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();

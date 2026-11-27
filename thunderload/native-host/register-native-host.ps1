@@ -14,7 +14,7 @@ param(
 $ErrorActionPreference = "Stop"
 $InstallDir = Join-Path $env:LOCALAPPDATA "ThunderLoad\native-host"
 $HostSource = Join-Path $PSScriptRoot "thunderload-host.exe"
-if (!(Test-Path $HostSource)) { throw "thunderload-host.exe was not found beside this script. Use the native-host setup package." }
+if (!(Test-Path -LiteralPath $HostSource)) { throw "thunderload-host.exe was not found beside this script. Use the native-host setup package." }
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 # Content-addressed install (same reason as the desktop app): Windows locks
 # a running executable's file, so copying over a fixed thunderload-host.exe
@@ -41,7 +41,7 @@ function Write-Manifest($Manifest, [string]$Path) {
 }
 function Register-ChromiumHost([string]$Browser, [string]$ExtensionId, [string]$RegistryPath) {
   if ([string]::IsNullOrWhiteSpace($ExtensionId)) { return }
-  if ($ExtensionId -notmatch '^[a-p]{32}$') { throw "$Browser ID must be the exact 32-character store/unpacked extension ID." }
+  if ($ExtensionId -cnotmatch '^[a-p]{32}$') { throw "$Browser ID must be the exact 32-character store/unpacked extension ID." }
   $ManifestPath = Join-Path $InstallDir "$Browser-native-host.json"
   Write-Manifest @{ name="com.thunderload.host"; description="ThunderLoad local download engine"; path=$HostExe; type="stdio"; allowed_origins=@("chrome-extension://$ExtensionId/") } $ManifestPath
   New-Item -Path $RegistryPath -Force | Out-Null
@@ -83,7 +83,7 @@ function Register-ChromeKeyHost([string]$ChromeId, [string]$OperaId) {
   $Origins = @()
   foreach ($Id in @($ChromeId, $OperaId)) {
     if ([string]::IsNullOrWhiteSpace($Id)) { continue }
-    if ($Id -notmatch '^[a-p]{32}$') { throw "Chrome/Opera ID must be the exact 32-character store/unpacked extension ID." }
+    if ($Id -cnotmatch '^[a-p]{32}$') { throw "Chrome/Opera ID must be the exact 32-character store/unpacked extension ID." }
     $Origins += "chrome-extension://$Id/"
   }
   if ($Origins.Count -eq 0) { return }
@@ -120,7 +120,7 @@ if (-not [string]::IsNullOrWhiteSpace($FirefoxExtensionId)) { Register-FirefoxHo
 # under the dead Opera key (see above): it points at an old manifest
 # no Opera build reads.
 $LegacyOperaKey = "HKCU:\Software\Opera Software\NativeMessagingHosts\com.thunderload.host"
-if (Test-Path $LegacyOperaKey) { Remove-Item -Path $LegacyOperaKey -Recurse -Force }
+if (Test-Path $LegacyOperaKey) { Remove-Item -LiteralPath $LegacyOperaKey -Recurse -Force }
 # Prune versioned host binaries older than the one just installed — but
 # ONLY ones no manifest still points at. Each browser registers on its
 # own schedule, so a Chrome-only run after an upgrade must not delete
@@ -139,7 +139,7 @@ $PruneBlocked = $false
 Get-ChildItem -LiteralPath $InstallDir -Filter "*-native-host.json" -File -ErrorAction SilentlyContinue | ForEach-Object {
   $ManifestPath = $_.FullName
   try {
-    $Manifest = Get-Content -LiteralPath $ManifestPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    $Manifest = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
     if ($Manifest.path) { [void]$ReferencedHosts.Add($Manifest.path) }
   } catch {
     Write-Warning "Could not read $ManifestPath; skipping binary pruning this run so no in-use host is deleted."
