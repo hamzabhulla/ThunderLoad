@@ -18,14 +18,14 @@ $Keys = @(
   "HKCU:\Software\Mozilla\NativeMessagingHosts\com.thunderload.host"
 )
 foreach ($Key in $Keys) {
-  if (Test-Path $Key) {
-    try { Remove-Item -Path $Key -Recurse -Force -ErrorAction Stop }
+  if (Test-Path -LiteralPath $Key) {
+    try { Remove-Item -LiteralPath $Key -Recurse -Force -ErrorAction Stop }
     catch { $Failures += "$Key : $($_.Exception.Message)" }
   }
 }
 $InstallDir = Join-Path $env:LOCALAPPDATA "ThunderLoad\native-host"
-if (Test-Path $InstallDir) {
-  try { Remove-Item -Path $InstallDir -Recurse -Force -ErrorAction Stop }
+if (Test-Path -LiteralPath $InstallDir) {
+  try { Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction Stop }
   catch { $Failures += "$InstallDir : $($_.Exception.Message)" }
 }
 if ($Failures.Count -gt 0) {
