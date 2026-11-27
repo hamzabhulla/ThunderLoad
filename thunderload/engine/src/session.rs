@@ -348,6 +348,7 @@ pub fn is_blocked_ipv4(ip: Ipv4Addr) -> bool {
         || ip.is_private()
         || ip.is_link_local()
         || ip.is_unspecified()
+        || octets[0] == 0
         || (octets[0] == 100 && (64..=127).contains(&octets[1]))
         || (224..=239).contains(&octets[0])
         || octets == [255, 255, 255, 255]
@@ -380,6 +381,8 @@ pub fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
             && segments[3] == 0
             && segments[4] == 0
             && segments[5] == 0)
+        || (segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2] == 0x0001)
+        || (segments[0] & 0xffc0) == 0xfec0
 }
 
 /// True when an IP address (v4 or v6) is not a public address.
