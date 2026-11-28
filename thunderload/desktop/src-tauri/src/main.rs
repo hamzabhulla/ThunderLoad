@@ -2947,11 +2947,18 @@ async fn handover_native_download(job_id: String) -> Result<(), String> {
     }
     with_job_store(|store| {
         if let Some(mut record) = store.get(&job_id).or_else(|| store.get(bare_id)).cloned() {
+            let old_id = record.id.clone();
+            record.id = job_id.clone();
             record.origin = JobOrigin::Desktop;
             record.state = JobState::Queued;
             record.detail = "Recovering browser checkpoint in desktop engine".to_string();
             record.error = None;
-            let _ = store.upsert(record);
+            // The old row is removed only after the re-identified row
+            // is safely stored: if the save fails, the original row
+            // must survive, or the download is lost with no record.
+            if store.upsert(record).is_ok() && old_id != job_id {
+                let _ = store.remove(&old_id);
+            }
         }
     });
     let directory = default_download_dir().join(".native-jobs");

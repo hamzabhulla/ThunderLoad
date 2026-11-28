@@ -56,6 +56,30 @@ fn url_identity(url: &str) -> String {
     }
 }
 
+/// Find the single item whose `url_identity` matches `wanted_id`.
+/// An exact URL match is tried by the caller first; this is the
+/// fallback for a playlist re-sign, where the query (signature)
+/// rotated but the media is the same file. Returns `None` when
+/// nothing matches — or when several items share one identity:
+/// signed CDN URLs differing only by query must not collapse to
+/// the first match, so the caller keeps its error instead.
+fn find_unique_by_identity<'a, T>(
+    items: &'a [T],
+    wanted_id: &str,
+    url_of: impl Fn(&'a T) -> &'a str,
+) -> Option<&'a T> {
+    let mut found: Option<&'a T> = None;
+    for item in items {
+        if url_identity(url_of(item)) == wanted_id {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(item);
+        }
+    }
+    found
+}
+
 /// One subtitle track as the source carries it: the language tag, the
 /// display name, the URL, and the container — "vtt" for a direct
 /// WebVTT file, "m3u8" for an HLS subtitle media playlist whose
@@ -2296,6 +2320,12 @@ fn parse_hls_iv(value: &str) -> Result<[u8; 16]> {
 }
 
 async fn fetch_text_with(client: &Client, url: &str, session: Option<&SessionHeaders>) -> Result<String> {
+    // Deliberately no SSRF validation here: this fetches manifests,
+    // including the entry manifest — the user's own URL. DASH
+    // manifests have no inspect step, so validating here would
+    // refuse legitimate LAN manifests outright. The SSRF check
+    // lives where playlist-derived URLs are fetched (fetch_hls_key
+    // after its cache lookups, fetch_hls_segment_inner).
     let request = apply_session(session, client.get(url), url);
     // A 401/403 here is an auth failure, not a fetch failure: the
     // manifest fetch is the first request that meets the login wall,
@@ -2346,13 +2376,17 @@ async fn resolve_hls_plan(playlist_url: &str, selection: &HlsSelection, session:
         // the plan is that playlist alone, with no video track and no
         // second audio track. This is how the "Audio" row downloads.
         if let Some(wanted) = selection.media_url.as_deref() {
-            if let Some(rendition) = renditions.iter().find(|rendition| rendition.uri == wanted) {
+            let wanted_id = url_identity(wanted);
+            if let Some(rendition) = renditions.iter().find(|rendition| rendition.uri == wanted)
+                .or_else(|| find_unique_by_identity(&renditions, &wanted_id, |rendition| &rendition.uri))
+            {
                 (rendition.uri.clone(), None)
             } else {
                 // The selected variant, or the first (highest) when the caller
                 // made no choice. A selection that no longer matches the master
                 // is an error: the playlist changed under the user.
                 let variant = variants.iter().find(|variant| variant.url == wanted)
+                    .or_else(|| find_unique_by_identity(&variants, &wanted_id, |variant| &variant.url))
                     .ok_or_else(|| anyhow!("The selected HLS quality is no longer listed in the master playlist"))?;
                 let media_url = variant.url.clone();
                 // The audio rendition for the variant: the explicitly selected
@@ -2531,6 +2565,14 @@ async fn fetch_hls_key(client: &Client, uri: &str, session: Option<&SessionHeade
     if let Some(key) = locked.get(uri) {
         return Ok(key.clone());
     }
+    // SSRF: the key URI comes from the playlist, not the user, so it
+    // is validated — but only here, after both cache lookups. A
+    // cached key for a private/local URL must not error when no
+    // fetch would occur, and a key for a LAN host is refused only
+    // when a real fetch is about to happen.
+    // (THUNDERLOAD_ALLOW_LOCALHOST=1 is the escape hatch, same as
+    // the entry-point check in inspect_video.)
+    crate::session::validate_public_http_url(uri)?;
     let mut response = apply_session(session, client.get(uri), uri)
         .send().await
         .with_context(|| format!("Could not fetch the HLS AES-128 key at {uri}"))?
@@ -2645,6 +2687,11 @@ async fn fetch_hls_segment_inner(
     rate_limiter: &Arc<GlobalRateLimiter>,
     key_cache: &HlsKeyCache,
 ) -> Result<u64> {
+    // SSRF: the segment URL comes from the playlist, not the user.
+    // HLS masters already pass the entry-point check in
+    // inspect_video, so a private/local segment here can only come
+    // from a playlist pointing at internal hosts.
+    crate::session::validate_public_http_url(&segment.url)?;
     // The key is fetched BEFORE the segment: a refused key aborts before
     // bandwidth is spent, and the key fetch itself can trigger the
     // signed-URL refresh (its 403 is classified exactly like a segment
@@ -3279,10 +3326,15 @@ async fn resolve_hls_live_media_url(playlist_url: &str, selection: &HlsSelection
     }
     let renditions = parse_hls_audio_renditions(&body, &base);
     if let Some(wanted) = selection.media_url.as_deref() {
-        if let Some(rendition) = renditions.iter().find(|rendition| rendition.uri == wanted) {
+        let wanted_id = url_identity(wanted);
+        if let Some(rendition) = renditions.iter().find(|rendition| rendition.uri == wanted)
+            .or_else(|| find_unique_by_identity(&renditions, &wanted_id, |rendition| &rendition.uri))
+        {
             return Ok(rendition.uri.clone());
         }
-        if let Some(variant) = variants.iter().find(|variant| variant.url == wanted) {
+        if let Some(variant) = variants.iter().find(|variant| variant.url == wanted)
+            .or_else(|| find_unique_by_identity(&variants, &wanted_id, |variant| &variant.url))
+        {
             return Ok(variant.url.clone());
         }
         return Err(anyhow!("The selected HLS quality is no longer listed in the master playlist"));
@@ -3717,6 +3769,10 @@ async fn fetch_dash_range_bytes(
     range: (u64, u64),
     session: Option<&SessionHeaders>,
 ) -> Result<Vec<u8>> {
+    // Deliberately no SSRF validation here: DASH manifests have no
+    // inspect step, so this URL may be the user's own LAN manifest
+    // (which works today). Validating it would refuse legitimate
+    // LAN DASH downloads mid-stream.
     let (start, end) = range;
     // The span is untrusted manifest data (`0-u64::MAX` is a legal
     // parse): reject an overflowing or over-cap span before any bytes
@@ -4938,7 +4994,7 @@ mod tests {
         dash_mux_extension, fetch_dash_range_bytes, live_window_skip,
         parse_hls_audio_renditions, select_hls_audio_rendition, DashCheckpointTrack,
         DashJobState, DownloadControl, DownloadOutcome, partial_download_metadata_path,
-        SessionHeaders, DEFAULT_RESUMABLE_CONNECTIONS,
+        SessionHeaders, DEFAULT_RESUMABLE_CONNECTIONS, find_unique_by_identity, url_identity,
     };
     use crate::download::{reserve_download_path, GlobalRateLimiter};
     use std::collections::{HashMap, HashSet};
@@ -4949,6 +5005,27 @@ mod tests {
     // The concurrency tracker/barrier are generic test-server helpers
     // defined in hls_download_tests; the DASH fixture reuses them.
     use super::hls_download_tests::{ConcurrencyBarrier, InFlightTracker};
+
+    #[test]
+    fn find_unique_by_identity_needs_one_match() {
+        // Signed CDN URLs differ only by query: one identity match
+        // resolves the re-sign, but several sharing one identity
+        // must not collapse to the first.
+        let items = vec![
+            "https://cdn.example.test/v/720p.m3u8?sig=aaa".to_string(),
+            "https://cdn.example.test/v/720p.m3u8?sig=bbb".to_string(),
+            "https://cdn.example.test/v/480p.m3u8?sig=ccc".to_string(),
+        ];
+        let wanted = url_identity("https://cdn.example.test/v/720p.m3u8?sig=zzz");
+        assert!(find_unique_by_identity(&items, &wanted, |u| u.as_str()).is_none());
+        let wanted = url_identity("https://cdn.example.test/v/480p.m3u8?sig=zzz");
+        assert_eq!(
+            find_unique_by_identity(&items, &wanted, |u| u.as_str()),
+            Some(&"https://cdn.example.test/v/480p.m3u8?sig=ccc".to_string())
+        );
+        let wanted = url_identity("https://cdn.example.test/v/1080p.m3u8?sig=zzz");
+        assert!(find_unique_by_identity(&items, &wanted, |u| u.as_str()).is_none());
+    }
 
     #[test]
     fn hls_master_exposes_quality_options_highest_first() {

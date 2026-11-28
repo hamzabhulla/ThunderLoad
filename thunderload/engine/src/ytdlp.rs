@@ -517,8 +517,10 @@ fn read_expected_tool_hash(tool: YtDlpTool) -> Option<String> {
     }
 }
 
-fn write_tool_hash_sidecar(tool: YtDlpTool, hash: &str) {
-    let _ = std::fs::write(tool_hash_sidecar_path(tool), hash);
+fn write_tool_hash_sidecar(tool: YtDlpTool, hash: &str) -> Result<()> {
+    let path = tool_hash_sidecar_path(tool);
+    std::fs::write(&path, hash)
+        .with_context(|| format!("Could not write tool hash sidecar at {}", path.display()))
 }
 
 /// Stream-hash a file at an arbitrary path without loading it whole
@@ -572,7 +574,7 @@ async fn verify_tool_on_disk(tool: YtDlpTool) -> Result<()> {
         None => {
             // Deno, no sidecar yet: trust on first use, then record
             // the hash so any later swap is caught.
-            write_tool_hash_sidecar(tool, &hash);
+            let _ = write_tool_hash_sidecar(tool, &hash);
             Ok(())
         }
     }
@@ -806,8 +808,13 @@ pub async fn download_tool(
                         .with_context(|| format!("Could not make {} executable", target.display()))?;
                 }
                 // The digest was just verified against the pin: record it
-                // so every later launch can re-verify this file.
-                write_tool_hash_sidecar(tool, &digest);
+                // so every later launch can re-verify this file. The
+                // binary itself is already installed at this point, so
+                // a failure here must say so instead of reporting the
+                // install as failed.
+                write_tool_hash_sidecar(tool, &digest).context(
+                    "Could not record the hash of the installed tool binary; the binary itself may already be installed",
+                )?;
             }
             YtDlpTool::Deno => {
                 // `install_deno_zip` deletes the temp zip itself when
@@ -823,9 +830,13 @@ pub async fn download_tool(
                 }
                 // The zip was verified; record the EXTRACTED exe's hash —
                 // the pin is the zip's hash, so only the sidecar can
-                // verify the exe on later launches.
+                // verify the exe on later launches. Deno itself is
+                // already installed at this point, so a failure here
+                // must say so instead of reporting the install as failed.
                 if let Ok(exe_hash) = hash_tool_file(tool).await {
-                    write_tool_hash_sidecar(tool, &exe_hash);
+                    write_tool_hash_sidecar(tool, &exe_hash).context(
+                        "Could not record the hash of the installed Deno binary; Deno itself may already be installed",
+                    )?;
                 }
             }
         }
@@ -1032,10 +1043,16 @@ pub async fn check_ytdlp_update() -> Result<String> {
         // later launches still verify, and report the version that
         // is actually installed now. Re-verify the new binary against
         // the hash just recorded before running it — the update
-        // itself is the window a swap would use.
-        if let Ok(hash) = hash_tool_file(YtDlpTool::YtDlp).await {
-            write_tool_hash_sidecar(YtDlpTool::YtDlp, &hash);
-        }
+        // itself is the window a swap would use. The binary itself
+        // is already replaced at this point, so a hashing or
+        // recording failure must say so instead of reporting the
+        // update as failed.
+        let hash = hash_tool_file(YtDlpTool::YtDlp).await.context(
+            "Could not hash the updated yt-dlp binary; the binary itself may already be updated",
+        )?;
+        write_tool_hash_sidecar(YtDlpTool::YtDlp, &hash).context(
+            "Could not record the hash of the updated yt-dlp binary; the binary itself may already be updated",
+        )?;
         verify_tool_on_disk(YtDlpTool::YtDlp).await
             .context("The yt-dlp update produced a binary that failed verification")?;
         let on_disk = run_tool_version(YtDlpTool::YtDlp)
@@ -1620,17 +1637,28 @@ pub fn parse_progress_line(line: &str) -> Option<DownloadProgress> {
     if parts.len() < 3 {
         return None;
     }
-    let percent_text = parts[0].strip_suffix('%')?;
-    let percent: f64 = percent_text.trim().parse().ok()?;
-    if !(0.0..=100.0).contains(&percent) {
+    // A missing percent (yt-dlp reports N/A or Unknown while it
+    // sizes the download) is a real progress sample with no percent,
+    // not a dropped line — the UI keeps the row's last percent for
+    // a sample that carries none.
+    let p0 = parts[0].trim();
+    let percent: Option<f64> = if let Some(percent_text) = p0.strip_suffix('%') {
+        let value: f64 = percent_text.trim().parse().ok()?;
+        if !(0.0..=100.0).contains(&value) {
+            return None;
+        }
+        Some(value)
+    } else if p0.eq_ignore_ascii_case("N/A") || p0.eq_ignore_ascii_case("NA") || p0.eq_ignore_ascii_case("Unknown") {
+        None
+    } else {
         return None;
-    }
+    };
     let downloaded: u64 = parts[1].parse().ok()?;
     let total: Option<u64> = parts[2].parse().ok();
     Some(DownloadProgress {
         downloaded,
         total,
-        percent: Some(percent),
+        percent,
         phase: "Downloading".into(),
         // yt-dlp reports bytes only — no segment counts (Slice 7b).
         segments_done: None,
@@ -2200,6 +2228,14 @@ mod tests {
         assert!(parse_progress_line("").is_none());
         assert!(parse_progress_line("download: not-a-number|1|2").is_none());
         assert!(parse_progress_line("download: 150%|1|2").is_none());
+        // A missing percent is a real sample with no percent, not a
+        // dropped line — the UI keeps the row's last percent.
+        let unknown = parse_progress_line("download: N/A|12345|234567").unwrap();
+        assert_eq!(unknown.percent, None);
+        assert_eq!(unknown.downloaded, 12345);
+        let unknown = parse_progress_line("download: Unknown|12345|").unwrap();
+        assert_eq!(unknown.percent, None);
+        assert_eq!(unknown.total, None);
         // Total unknown: yt-dlp can report a bare downloaded count.
         let no_total = parse_progress_line("download: 10.0%|500|").unwrap();
         assert_eq!(no_total.total, None);
