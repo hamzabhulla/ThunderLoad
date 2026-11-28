@@ -11,6 +11,11 @@ let sources = [];
 // (about:addons toggle) — content scripts and webRequest silently
 // stop, so the popup must say so instead of "No media found".
 let hostPermissionGranted = true;
+// False when the desktop app is not connected: either the native
+// messaging permission is missing, or the native host does not
+// answer its ping. The note stays up in both cases, with a button
+// to retry from here.
+let nativePermissionGranted = true;
 let scanRun = 0;
 // Slice 7c (Gemini claim 8): the background caps the list at
 // MAX_SOURCES_PER_TAB and reports it as `truncated` — the popup must
@@ -183,6 +188,42 @@ function appendInterceptNote() {
       ? "1 download is waiting for the desktop app."
       : pendingIntercepts.length + " downloads are waiting for the desktop app."));
 }
+// When the desktop app is not connected, the popup names the cause
+// and offers a connect tap. The flag is set only after a ping proves
+// the native host answers: if the ping fails (host not running or
+// not registered), the button is re-enabled and the note stays, so
+// the user can retry from here without reopening the popup.
+function appendNativePermissionNote() {
+  if (nativePermissionGranted) return;
+  const note = el("div", "intercept-note", "ThunderLoad desktop app is not connected yet. Allow Native messaging so your browser can hand downloads to the desktop engine.");
+  const button = el("button", "primary primary-btn", "Connect desktop app");
+  button.style.marginTop = "8px";
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    try {
+      const granted = await api.permissions.request({ permissions: ["nativeMessaging"] });
+      if (!granted) {
+        showToast("Native messaging permission was not granted.");
+        button.disabled = false;
+        return;
+      }
+      const ping = await api.runtime.sendMessage({ type: "NATIVE_REQUEST", action: "ping", payload: {} });
+      if (ping?.ok) {
+        nativePermissionGranted = true;
+        showToast("Connected to ThunderLoad desktop app.");
+        await scanActiveTab();
+      } else {
+        showToast(nativeErrorMessage(ping?.error || "Could not reach ThunderLoad native host. Complete Browser setup in the desktop app."));
+        button.disabled = false;
+      }
+    } catch (error) {
+      showToast(nativeErrorMessage(error));
+      button.disabled = false;
+    }
+  });
+  note.append(button);
+  sourceList.append(note);
+}
 // H7: when host access was revoked, detection is silently dead —
 // the notice names the cause and offers a re-enable tap. The request
 // runs directly from this click handler first, so the user gesture
@@ -268,6 +309,7 @@ function renderOtherMedia(others) {
 }
 function render() {
   sourceList.replaceChildren();
+  appendNativePermissionNote();
   appendHostPermissionNote();
   primarySource = null;
   primaryVariants = null;
@@ -545,6 +587,25 @@ async function scanActiveTab() {
   rescanBtn.disabled = true;
   sourceList.replaceChildren(el("div", "empty", "Scanning this tab…"));
   try {
+    // The desktop connection is the permission AND a host that
+    // answers: the permission alone does not prove the app is
+    // reachable, so a failed ping keeps the note up and the user
+    // can retry from it. (The host answers ping itself, so this
+    // is a fast round-trip, not an engine inspect.)
+    if (typeof api.permissions?.contains === "function") {
+      try {
+        nativePermissionGranted = await api.permissions.contains({ permissions: ["nativeMessaging"] });
+      } catch (_) {}
+    }
+    if (nativePermissionGranted) {
+      try {
+        const ping = await api.runtime.sendMessage({ type: "NATIVE_REQUEST", action: "ping", payload: {} });
+        if (!ping?.ok) nativePermissionGranted = false;
+      } catch (_) {
+        nativePermissionGranted = false;
+      }
+    }
+    if (run !== scanRun) return;
     const result = await api.runtime.sendMessage({ type: "GET_ACTIVE_SOURCES" });
     if (run !== scanRun) return;
     if (!result?.ok) throw new Error(result?.error || "Cannot scan this page");

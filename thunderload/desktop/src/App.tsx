@@ -415,6 +415,13 @@ export default function App() {
   // context-menu Remove and keyboard Delete stay disabled until the
   // call settles, so a second Remove cannot race the first.
   const [busyIds, setBusyIds] = useState<string[]>([]);
+  // The busy guard for remove() reads this ref, not the state: two
+  // Removes racing across renders must see the same list
+  // synchronously, or both pass the stale-closure check. The effect
+  // keeps the ref in step with the state (event handlers and
+  // cancel() clear ids through the state).
+  const busyIdsRef = useRef<string[]>([]);
+  useEffect(() => { busyIdsRef.current = busyIds; }, [busyIds]);
   // Schedule wake-ups tick every 15 s, not every second — the 1 s clock
   // below exists only for speed/ETA staleness.
   const [scheduleTick, setScheduleTick] = useState(() => Date.now());
@@ -1363,8 +1370,22 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     finally { setBusyIds((current) => current.filter((id) => id !== item.id)); }
   }
   async function remove(id: string) {
-    const item = items.find((entry) => entry.id === id);
-    if (!item) return;
+    // Fully ref-based busy guard: the state value in this closure may
+    // be stale (a second × / Delete press from another render), but
+    // the ref is written synchronously here, so the second call sees
+    // it and bails. The ref is cleared on every exit below.
+    if (busyIdsRef.current.includes(id)) return;
+    busyIdsRef.current = [...busyIdsRef.current, id];
+    setBusyIds(busyIdsRef.current);
+    const release = () => {
+      busyIdsRef.current = busyIdsRef.current.filter((entry) => entry !== id);
+      setBusyIds(busyIdsRef.current);
+    };
+    let item = itemsRef.current.find((entry) => entry.id === id) || items.find((entry) => entry.id === id);
+    if (!item) {
+      release();
+      return;
+    }
     // Removing a row with a saved checkpoint deletes the partial file
     // (via cancel_download below) — destructive and irreversible, so
     // Paused/Failed/Interrupted/Queued rows with a target ask first.
@@ -1377,11 +1398,19 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
       } catch {
         ok = window.confirm("Remove \"" + item.name + "\"? This deletes the saved partial file and the download cannot be resumed.");
       }
-      if (!ok) return;
+      if (!ok) {
+        release();
+        return;
+      }
     }
-    // Mark the row busy until remove settles, so a second × / Delete /
-    // context-menu Remove cannot race this one.
-    setBusyIds((current) => current.includes(id) ? current : [...current, id]);
+    // Re-read after the confirm: the row's status may have changed
+    // while the dialog was open (a started download must not be
+    // removed from under its own cancel).
+    item = itemsRef.current.find((entry) => entry.id === id);
+    if (!item || ["Downloading", "Pausing", "Cancelling"].includes(item.status)) {
+      release();
+      return;
+    }
     if (item?.scheduledAt) {
       await invoke("cancel_app_wake", { jobId: item.id }).catch(() => {});
     }
@@ -1394,7 +1423,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     if (item?.source === "native" && !item.live
         && ["Downloading", "Pausing", "Paused", "Failed"].includes(item.status)) {
       await cancel(item);
-      setBusyIds((current) => current.filter((entry) => entry !== id));
+      release();
       return;
     }
     if (item?.source === "native") {
@@ -1427,7 +1456,7 @@ listen<{ jobId: string; error: string; targetPath?: string }>("download-error", 
     // removing the row while the backend is still cancelling would leave
     // the cancel event with no row to land on.
     setItems((current) => current.filter((entry) => entry.id !== id || entry.status === "Downloading" || entry.status === "Pausing" || entry.status === "Cancelling"));
-    setBusyIds((current) => current.filter((entry) => entry !== id));
+    release();
   }
   function retry(item: Item) {
     // A live recording has no checkpoint — a retry is a FRESH recording
