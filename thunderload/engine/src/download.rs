@@ -1204,6 +1204,32 @@ fn resume_identity_matches(
     }
 }
 
+/// Returns true only when a validator present on BOTH sides disagrees.
+/// A validator missing on either side is unverifiable, not a change:
+/// servers routinely send ETag on the 200 but omit it on 206 range
+/// responses (or send Last-Modified only on retry), and treating that
+/// as "file changed" false-fails legitimate resumes. `resume_identity_matches`
+/// stays strict on purpose — its existing call sites use a false result
+/// only as "don't trust the checkpoint", never as an error — so this
+/// helper carries the lenient rule for the retry loop's error paths.
+fn resume_validators_conflict(
+    saved: &ResumeMetadata,
+    etag: Option<&str>,
+    last_modified: Option<&str>,
+) -> bool {
+    if let (Some(old), Some(new)) = (saved.etag.as_deref(), etag) {
+        if old != new {
+            return true;
+        }
+    }
+    if let (Some(old), Some(new)) = (saved.last_modified.as_deref(), last_modified) {
+        if old != new {
+            return true;
+        }
+    }
+    false
+}
+
 async fn read_resume_metadata(path: &Path) -> Option<ResumeMetadata> {
     let bytes = fs::read(path).await.ok()?;
     serde_json::from_slice(&bytes).ok()
@@ -3182,6 +3208,31 @@ async fn download_sequential_resumable(
                         Ok(retry_response) => {
                             match retry_response.status() {
                                 StatusCode::PARTIAL_CONTENT => {
+                                    if response_is_webpage(retry_response.headers()) {
+                                        return Err(anyhow!(WEBPAGE_NOT_MEDIA_MESSAGE));
+                                    }
+                                    let retry_etag = retry_response
+                                        .headers()
+                                        .get(header::ETAG)
+                                        .and_then(|v| v.to_str().ok())
+                                        .filter(|v| !v.trim_start().starts_with("W/"));
+                                    let retry_modified = retry_response
+                                        .headers()
+                                        .get(header::LAST_MODIFIED)
+                                        .and_then(|v| v.to_str().ok());
+                                    // Only a validator present on both
+                                    // sides that disagrees proves the
+                                    // file changed: a validator missing
+                                    // on either side is unverifiable.
+                                    if let Some(saved) = &saved_metadata {
+                                        if resume_validators_conflict(
+                                            saved,
+                                            retry_etag,
+                                            retry_modified,
+                                        ) {
+                                            return Err(anyhow!("Remote file changed during download; resume or restart to fetch the updated file"));
+                                        }
+                                    }
                                     let range = retry_response
                                         .headers()
                                         .get(header::CONTENT_RANGE)
@@ -3254,10 +3305,56 @@ async fn download_sequential_resumable(
                                 StatusCode::RANGE_NOT_SATISFIABLE
                                     if total == Some(downloaded) =>
                                 {
-                                    // Nothing left to fetch: the part
-                                    // file is already complete; the empty
-                                    // body ends the stream and the
-                                    // completion check below passes.
+                                    // The match guard already ensures
+                                    // downloaded == total, so a 416
+                                    // without Content-Range still means
+                                    // "nothing left to fetch". Only a
+                                    // present Content-Range that
+                                    // disagrees, or validators present
+                                    // on both sides that disagree, turns
+                                    // this into an error.
+                                    let cr_ok = match retry_response
+                                        .headers()
+                                        .get(header::CONTENT_RANGE)
+                                        .and_then(|v| v.to_str().ok())
+                                    {
+                                        None => true,
+                                        Some(v) => {
+                                            let s = v.trim();
+                                            s.get(..8)
+                                                .filter(|p| {
+                                                    p.eq_ignore_ascii_case("bytes */")
+                                                })
+                                                .and_then(|_| {
+                                                    s[8..].trim().parse::<u64>().ok()
+                                                })
+                                                == Some(downloaded)
+                                        }
+                                    };
+                                    let retry_etag = retry_response
+                                        .headers()
+                                        .get(header::ETAG)
+                                        .and_then(|v| v.to_str().ok())
+                                        .filter(|v| {
+                                            !v.trim_start().starts_with("W/")
+                                        });
+                                    let retry_modified = retry_response
+                                        .headers()
+                                        .get(header::LAST_MODIFIED)
+                                        .and_then(|v| v.to_str().ok());
+                                    let id_ok = saved_metadata.as_ref().map_or(
+                                        true,
+                                        |saved| {
+                                            !resume_validators_conflict(
+                                                saved,
+                                                retry_etag,
+                                                retry_modified,
+                                            )
+                                        },
+                                    );
+                                    if !cr_ok || !id_ok {
+                                        return Err(anyhow!("Server returned HTTP 416 without matching file length/identity"));
+                                    }
                                     stream = retry_response.bytes_stream();
                                 }
                                 status => {
@@ -3739,6 +3836,276 @@ mod resumable_http_tests {
         assert!(
             bytes.iter().all(|byte| *byte == b'B'),
             "final file must be entirely the new version's bytes"
+        );
+        drop(control_tx);
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    /// A server whose retry 206 omits the ETag the opening 200 carried
+    /// (but sends a Last-Modified): the retry loop must still resume,
+    /// because a validator missing on one side is unverifiable.
+    fn spawn_etagless_retry_server() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        const SIZE: usize = 256 * 1024;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = shutdown.clone();
+        let gets = Arc::new(AtomicUsize::new(0));
+        let thread_gets = gets.clone();
+        // First half 'A', second half 'B', so the test can prove the
+        // resumed bytes joined onto the right prefix.
+        let body: Arc<Vec<u8>> = Arc::new(
+            (0..SIZE)
+                .map(|index| if index < SIZE / 2 { b'A' } else { b'B' })
+                .collect(),
+        );
+        let thread_body = body.clone();
+        let handle = thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => {
+                        let _ = connection.0.set_nonblocking(false);
+                        connection
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(3));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => {
+                            request.extend_from_slice(&buffer[..count]);
+                            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let is_head = request
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .starts_with("HEAD ");
+                if is_head {
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {SIZE}\r\nETag: \"v1\"\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(headers.as_bytes());
+                    continue;
+                }
+                let get_no = thread_gets.fetch_add(1, Ordering::Relaxed);
+                if get_no == 0 {
+                    // First GET: ETag "v1", first half, then drop the
+                    // socket — a mid-stream transport failure.
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {SIZE}\r\nETag: \"v1\"\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+                    );
+                    if stream.write_all(headers.as_bytes()).is_err() {
+                        continue;
+                    }
+                    let _ = stream.write_all(&thread_body[..SIZE / 2]);
+                    drop(stream);
+                    continue;
+                }
+                // Retry GET: 206 from the requested offset, with a
+                // Last-Modified but NO ETag.
+                let start = request
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Range: bytes="))
+                    .and_then(|rest| rest.split('-').next()?.parse::<usize>().ok())
+                    .unwrap_or(SIZE / 2);
+                let start = start.min(SIZE);
+                let headers = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nLast-Modified: Wed, 21 Oct 2015 07:28:00 GMT\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                    start,
+                    SIZE - 1,
+                    SIZE,
+                    SIZE - start
+                );
+                if stream.write_all(headers.as_bytes()).is_err() {
+                    continue;
+                }
+                let _ = stream.write_all(&thread_body[start..]);
+            }
+        });
+        (format!("http://{address}/download.bin"), shutdown, handle)
+    }
+
+    #[tokio::test]
+    async fn sequential_midstream_retry_resumes_when_retry_omits_etag() {
+        // Regression test for the over-strict resume-identity check:
+        // the opening 200 carried ETag "v1", the retry 206 omits it
+        // (sending only Last-Modified). A missing validator on one
+        // side is unverifiable, not a change — the run must resume
+        // and complete, not fail with "Remote file changed".
+        let (url, shutdown, server) = spawn_etagless_retry_server();
+        let directory = std::env::temp_dir().join(format!(
+            "thunderload-midstream-noetag-{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("resumed.bin"))
+            .await
+            .unwrap();
+        let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            download_url_resumable(
+                &url,
+                &target,
+                None,
+                control_rx,
+                Arc::new(GlobalRateLimiter::new()),
+                progress_tx,
+            ),
+        )
+        .await
+        .expect("run hung after the mid-stream failure")
+        .unwrap();
+        assert_eq!(outcome, DownloadOutcome::Completed);
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(bytes.len(), 256 * 1024, "final file length must equal the total");
+        assert!(
+            bytes[..128 * 1024].iter().all(|byte| *byte == b'A'),
+            "first half must be the opening response's bytes"
+        );
+        assert!(
+            bytes[128 * 1024..].iter().all(|byte| *byte == b'B'),
+            "second half must be the retry response's bytes"
+        );
+        drop(control_tx);
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    /// A server that delivers the whole file chunked, drops before the
+    /// terminal chunk (a mid-stream failure with everything already
+    /// written), then answers the retry with 416 and NO Content-Range:
+    /// the retry loop must accept it as complete, because the guard
+    /// already ensures downloaded == total.
+    fn spawn_416_no_content_range_retry_server() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        const SIZE: usize = 256 * 1024;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = shutdown.clone();
+        let gets = Arc::new(AtomicUsize::new(0));
+        let thread_gets = gets.clone();
+        let body: Arc<Vec<u8>> = Arc::new(vec![b'A'; SIZE]);
+        let thread_body = body.clone();
+        let handle = thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => {
+                        let _ = connection.0.set_nonblocking(false);
+                        connection
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(3));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => {
+                            request.extend_from_slice(&buffer[..count]);
+                            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let is_head = request
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .starts_with("HEAD ");
+                if is_head {
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {SIZE}\r\nETag: \"v1\"\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(headers.as_bytes());
+                    continue;
+                }
+                let get_no = thread_gets.fetch_add(1, Ordering::Relaxed);
+                if get_no == 0 {
+                    // First GET: the whole body in one chunk, then
+                    // drop without the terminal zero chunk.
+                    let headers = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nETag: \"v1\"\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n";
+                    if stream.write_all(headers.as_bytes()).is_err() {
+                        continue;
+                    }
+                    let chunk_header = format!("{:x}\r\n", SIZE);
+                    if stream.write_all(chunk_header.as_bytes()).is_err() {
+                        continue;
+                    }
+                    let _ = stream.write_all(&thread_body);
+                    let _ = stream.write_all(b"\r\n");
+                    drop(stream);
+                    continue;
+                }
+                // Retry GET: 416, no Content-Range, matching ETag.
+                let headers = "HTTP/1.1 416 Range Not Satisfiable\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(headers.as_bytes());
+            }
+        });
+        (format!("http://{address}/download.bin"), shutdown, handle)
+    }
+
+    #[tokio::test]
+    async fn sequential_midstream_retry_accepts_416_without_content_range_when_complete() {
+        // Regression test for the over-strict 416 arm: the retry 416
+        // carries no Content-Range, but downloaded already equals the
+        // total and the ETag still matches — the run must complete,
+        // not fail with "HTTP 416 without matching file length".
+        let (url, shutdown, server) = spawn_416_no_content_range_retry_server();
+        let directory = std::env::temp_dir().join(format!(
+            "thunderload-midstream-416-{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let target = reserve_download_path(&directory.join("complete.bin"))
+            .await
+            .unwrap();
+        let (control_tx, control_rx) = watch::channel(DownloadControl::Running);
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            download_url_resumable(
+                &url,
+                &target,
+                None,
+                control_rx,
+                Arc::new(GlobalRateLimiter::new()),
+                progress_tx,
+            ),
+        )
+        .await
+        .expect("run hung after the mid-stream failure")
+        .unwrap();
+        assert_eq!(outcome, DownloadOutcome::Completed);
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(bytes.len(), 256 * 1024, "final file length must equal the total");
+        assert!(
+            bytes.iter().all(|byte| *byte == b'A'),
+            "final file must be the server's bytes"
         );
         drop(control_tx);
         shutdown.store(true, Ordering::Relaxed);
@@ -4627,7 +4994,7 @@ mod rate_limit_tests {
 
 #[cfg(test)]
 mod resume_metadata_tests {
-    use super::{resume_identity_matches, ResumeMetadata};
+    use super::{resume_identity_matches, resume_validators_conflict, ResumeMetadata};
 
     #[test]
     fn resume_refuses_a_changed_url_or_etag() {
@@ -4661,6 +5028,58 @@ mod resume_metadata_tests {
         };
         assert!(resume_identity_matches(&saved, "https://example.test/file.bin", None, Some("Wed, 21 Oct 2015 07:28:00 GMT"), None));
         assert!(!resume_identity_matches(&saved, "https://example.test/file.bin", None, Some("Thu, 22 Oct 2015 07:28:00 GMT"), None));
+    }
+
+    #[test]
+    fn missing_validator_on_one_side_is_not_a_change() {
+        // The retry loop errors only when a validator present on BOTH
+        // sides disagrees. A validator missing on either side is
+        // unverifiable: servers routinely send ETag on the 200 but
+        // omit it on 206 range responses.
+        let saved = ResumeMetadata {
+            url: "https://example.test/file.bin".into(),
+            etag: Some("\"v1\"".into()),
+            last_modified: None,
+            total: Some(1000),
+            connections: None,
+            segments: None,
+            dynamic: None,
+            session: None,
+        };
+        // Saved ETag, retry omits ETag but sends Last-Modified.
+        assert!(!resume_validators_conflict(&saved, None, Some("Wed, 21 Oct 2015 07:28:00 GMT")));
+        // Saved ETag, retry sends the same ETag.
+        assert!(!resume_validators_conflict(&saved, Some("\"v1\""), None));
+        // Saved ETag, retry sends a different ETag.
+        assert!(resume_validators_conflict(&saved, Some("\"v2\""), None));
+        // Saved has no validators at all, retry sends one.
+        let bare = ResumeMetadata {
+            url: "https://example.test/file.bin".into(),
+            etag: None,
+            last_modified: None,
+            total: Some(1000),
+            connections: None,
+            segments: None,
+            dynamic: None,
+            session: None,
+        };
+        assert!(!resume_validators_conflict(&bare, Some("\"v1\""), None));
+        assert!(!resume_validators_conflict(&bare, None, Some("Wed, 21 Oct 2015 07:28:00 GMT")));
+        // Saved Last-Modified only: a different one conflicts, a
+        // missing one does not.
+        let dated = ResumeMetadata {
+            url: "https://example.test/file.bin".into(),
+            etag: None,
+            last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".into()),
+            total: None,
+            connections: None,
+            segments: None,
+            dynamic: None,
+            session: None,
+        };
+        assert!(!resume_validators_conflict(&dated, None, None));
+        assert!(resume_validators_conflict(&dated, None, Some("Thu, 22 Oct 2015 07:28:00 GMT")));
+        assert!(!resume_validators_conflict(&dated, None, Some("Wed, 21 Oct 2015 07:28:00 GMT")));
     }
 }
 
